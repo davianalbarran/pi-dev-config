@@ -1,0 +1,5 @@
+.env
+node_modules/
+agent/auth.json
+agent/sessions/
+agent/.playwright-cli

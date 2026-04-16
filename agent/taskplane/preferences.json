@@ -1,0 +1,18 @@
+{
+  "initAgentDefaults": {
+    "workerModel": "",
+    "reviewerModel": "",
+    "mergeModel": "",
+    "workerThinking": "high",
+    "reviewerThinking": "high",
+    "mergeThinking": "high"
+  },
+  "taskRunner": {
+    "reviewer": {
+      "model": "openai-codex/gpt-5.4"
+    },
+    "worker": {
+      "model": "anthropic/claude-sonnet-4-6"
+    }
+  }
+}
