@@ -23,6 +23,19 @@ import { type ExtensionAPI, type ExtensionContext, getMarkdownTheme, SessionMana
 import { Container, Markdown, Spacer, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { type AgentConfig, type AgentScope, type AgentSource, type AgentThinkingLevel, discoverAgents } from "./agents.ts";
+import {
+	bindFloatingMonitorWidget,
+	decorateWidgetLine,
+	getLatestFloatingMonitorId,
+	openFloatingMonitor,
+	removeFloatingMonitor,
+	shutdownFloatingMonitors,
+	type MonitorLine,
+	type MonitorPanel,
+	type MonitorSnapshot,
+	unbindFloatingMonitorWidget,
+	upsertFloatingMonitor,
+} from "./floating-monitor.ts";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
@@ -318,9 +331,26 @@ function joinAnsiLeftRight(left: string, right: string, width: number): string {
 	return fittedLeft + " ".repeat(gap) + fittedRight;
 }
 
-function renderSubagentWidgetCard(result: SingleResult, width: number, theme: any): string[] {
+function getWidgetStatePalette(state: "running" | "success" | "error"): {
+	background: string;
+	border: string;
+	status: string;
+	label: string;
+} {
+	switch (state) {
+		case "running":
+			return { background: "toolPendingBg", border: "borderAccent", status: "warning", label: "accent" };
+		case "error":
+			return { background: "toolErrorBg", border: "error", status: "error", label: "error" };
+		default:
+			return { background: "toolSuccessBg", border: "success", status: "success", label: "accent" };
+	}
+}
+
+function renderSubagentWidgetCard(result: SingleResult, width: number, theme: any, widgetKey?: string): string[] {
 	const innerWidth = Math.max(1, width - 2);
 	const state = getResultState(result);
+	const palette = getWidgetStatePalette(state);
 	const icon =
 		state === "running"
 			? theme.fg("warning", "⏳")
@@ -330,13 +360,13 @@ function renderSubagentWidgetCard(result: SingleResult, width: number, theme: an
 	const label = result.numericId ? `Subagent #${result.numericId}` : result.step ? `#${result.step} ${result.agent}` : result.agent;
 	const status =
 		state === "running"
-			? theme.fg("warning", "running")
+			? theme.fg(palette.status, "running")
 			: state === "error"
-				? theme.fg("error", "failed")
-				: theme.fg("success", "done");
+				? theme.fg(palette.status, "failed")
+				: theme.fg(palette.status, "done");
 	const taskPreview = normalizePreviewText(result.task) || "(no task)";
-	const topLeft = `${icon} ${theme.fg("accent", label)}${theme.fg("muted", " — ")}${theme.fg("warning", taskPreview)}`;
-	const topRight = `${status} ${theme.fg("dim", formatWidgetTokenUsage(result.usage))}`;
+	const topLeft = `${icon} ${theme.fg(palette.label, label)}${theme.fg("muted", " — ")}${theme.fg("toolOutput", taskPreview)}`;
+	const topRight = `${status} ${theme.fg("dim", formatWidgetTokenUsage(result.usage))}${theme.fg("muted", " · click↗")}`;
 
 	const metaParts: string[] = [];
 	if (result.agentSource !== "unknown") metaParts.push(theme.fg("dim", result.agentSource));
@@ -354,37 +384,141 @@ function renderSubagentWidgetCard(result: SingleResult, width: number, theme: an
 		preview = theme.fg("error", errorPreview);
 	} else {
 		const textPreview = getLatestTextPreview(result.messages);
-		if (textPreview) preview = theme.fg("toolOutput", textPreview);
-		else preview = getLatestToolCallPreview(result.messages, theme.fg.bind(theme)) ?? theme.fg("muted", state === "running" ? "(running...)" : "(no output)");
+		if (textPreview) preview = theme.fg("text", textPreview);
+		else {
+			preview =
+				getLatestToolCallPreview(result.messages, theme.fg.bind(theme)) ??
+				theme.fg(state === "running" ? "thinkingText" : "muted", state === "running" ? "(running...)" : "(no output)");
+		}
 	}
 
 	const meta = metaParts.join(theme.fg("muted", " · "));
 	const body = meta ? `${meta}${theme.fg("muted", " — ")}${preview}` : preview;
-	const border = (text: string) => theme.fg("warning", text);
+	const border = (text: string) => theme.fg(palette.border, text);
+	const fill = (text: string) => theme.bg(palette.background, text);
+	const topLine = fill(border("╭") + joinAnsiLeftRight(topLeft, topRight, innerWidth) + border("╮"));
 
 	return [
-		border("╭") + joinAnsiLeftRight(topLeft, topRight, innerWidth) + border("╮"),
-		border("│") + padAnsiLine(body, innerWidth) + border("│"),
-		border(`╰${"─".repeat(innerWidth)}╯`),
+		widgetKey ? decorateWidgetLine(widgetKey, topLine) : topLine,
+		fill(border("│") + padAnsiLine(body, innerWidth) + border("│")),
+		fill(border(`╰${"─".repeat(innerWidth)}╯`)),
 	];
 }
 
+function buildMonitorLines(result: SingleResult): MonitorLine[] {
+	const lines: MonitorLine[] = [];
+	const state = getResultState(result);
+	const displayItems = getDisplayItems(result.messages);
+
+	for (const item of displayItems) {
+		if (item.type === "toolCall") {
+			lines.push({ kind: "tool", text: `→ ${formatToolCall(item.name, item.args, (_color, text) => text)}` });
+			continue;
+		}
+		for (const rawLine of item.text.split("\n")) {
+			lines.push({ kind: "text", text: rawLine });
+		}
+	}
+
+	if (displayItems.length === 0) {
+		lines.push({ kind: state === "error" ? "error" : "meta", text: state === "running" ? "(running...)" : "(no output)" });
+	}
+
+	if (state === "error") {
+		const errorText =
+			result.errorMessage ||
+			normalizePreviewText(result.stderr) ||
+			normalizePreviewText(getFinalOutput(result.messages)) ||
+			"Subagent failed.";
+		lines.push({ kind: "blank", text: "" });
+		lines.push({ kind: "heading", text: "Error" });
+		for (const rawLine of errorText.split("\n")) lines.push({ kind: "error", text: rawLine });
+	}
+
+	const finalOutput = getFinalOutput(result.messages).trim();
+	const latestTextItem = [...displayItems].reverse().find((item) => item.type === "text");
+	if (finalOutput && (!latestTextItem || normalizePreviewText(latestTextItem.text) !== normalizePreviewText(finalOutput))) {
+		lines.push({ kind: "blank", text: "" });
+		lines.push({ kind: "heading", text: "Final output" });
+		for (const rawLine of finalOutput.split("\n")) lines.push({ kind: "text", text: rawLine });
+	}
+
+	return lines;
+}
+
+function getMonitorStatusText(details: SubagentDetails): string {
+	const running = details.results.filter((r) => getResultState(r) === "running").length;
+	const success = details.results.filter((r) => getResultState(r) === "success").length;
+	const failed = details.results.filter((r) => getResultState(r) === "error").length;
+	if (details.mode === "single") {
+		if (running > 0) return "1 running";
+		if (failed > 0) return "failed";
+		return "done";
+	}
+	if (running > 0) return `${success + failed}/${details.results.length} done · ${running} running`;
+	if (failed > 0) return `${success}/${details.results.length} succeeded · ${failed} failed`;
+	return `${success}/${details.results.length} done`;
+}
+
+function buildMonitorSnapshot(widgetKey: string, details: SubagentDetails): MonitorSnapshot {
+	const panels: MonitorPanel[] = details.results.map((result, index) => {
+		const status = getResultState(result);
+		const label = result.numericId
+			? `#${result.numericId}`
+			: result.step
+				? `${result.step}. ${result.agent}`
+				: details.mode === "single"
+					? result.agent
+					: `${index + 1}. ${result.agent}`;
+		const metaParts = [
+			result.agentSource !== "unknown" ? result.agentSource : undefined,
+			getThinkingLabel(result.thinkingLevel),
+			getShortModelName(result.model),
+		].filter(Boolean) as string[];
+		return {
+			id: `${widgetKey}:${index}`,
+			label,
+			status,
+			task: result.task,
+			meta: metaParts.join(" · ") || undefined,
+			usage: formatUsageStats(result.usage, result.model) || undefined,
+			lines: buildMonitorLines(result),
+		};
+	});
+
+	return {
+		id: widgetKey,
+		title: details.mode === "single" ? `subagent · ${details.results[0]?.agent ?? "monitor"}` : `subagent · ${details.mode}`,
+		mode: details.mode,
+		statusText: getMonitorStatusText(details),
+		updatedAt: Date.now(),
+		panels,
+	};
+}
+
 function setSubagentWidget(ctx: ExtensionContext, widgetKey: string, details: SubagentDetails): void {
+	upsertFloatingMonitor(ctx, buildMonitorSnapshot(widgetKey, details));
 	if (!ctx.hasUI) return;
 
 	ctx.ui.setWidget(
 		widgetKey,
-		(_tui, theme) => ({
-			invalidate() {},
-			render(width: number): string[] {
-				const lines: string[] = [];
-				for (let i = 0; i < details.results.length; i++) {
-					if (i > 0) lines.push("");
-					lines.push(...renderSubagentWidgetCard(details.results[i], width, theme));
-				}
-				return lines;
-			},
-		}),
+		(tui, theme) => {
+			bindFloatingMonitorWidget(tui, widgetKey);
+			return {
+				invalidate() {},
+				render(width: number): string[] {
+					const lines: string[] = [];
+					for (let i = 0; i < details.results.length; i++) {
+						if (i > 0) lines.push("");
+						lines.push(...renderSubagentWidgetCard(details.results[i], width, theme, widgetKey));
+					}
+					return lines;
+				},
+				dispose() {
+					unbindFloatingMonitorWidget(widgetKey);
+				},
+			};
+		},
 		{ placement: "aboveEditor" },
 	);
 }
@@ -1418,6 +1552,7 @@ export default function (pi: ExtensionAPI) {
 			managed.abortController.abort();
 			managedSubagents.delete(id);
 			clearManagedSubagentWidget(ctx, managed);
+			removeFloatingMonitor(managed.widgetKey);
 			notifyCommand(ctx, `Removed subagent #${id}`);
 		},
 	});
@@ -1452,5 +1587,37 @@ export default function (pi: ExtensionAPI) {
 			);
 			notifyCommand(ctx, `Continued subagent #${id} with new task`);
 		},
+	});
+
+	pi.registerCommand("subview", {
+		description: "Open floating monitor for latest subagent or /subview <id>",
+		handler: async (args, ctx) => {
+			const trimmed = args.trim();
+			const explicitId = trimmed ? parseInt(trimmed.replace(/^#/, ""), 10) : NaN;
+			const monitorId = !isNaN(explicitId) ? `managed-subagent-${explicitId}` : getLatestFloatingMonitorId();
+			if (!monitorId) {
+				notifyCommand(ctx, "No subagent monitor available", "error");
+				return;
+			}
+			const opened = await openFloatingMonitor(ctx, monitorId);
+			if (!opened) notifyCommand(ctx, "Failed to open subagent monitor", "error");
+		},
+	});
+
+	pi.registerShortcut("alt+shift+v", {
+		description: "Open latest subagent floating monitor",
+		handler: async (ctx) => {
+			const monitorId = getLatestFloatingMonitorId();
+			if (!monitorId) {
+				ctx.ui.notify("No subagent monitor available", "warning");
+				return;
+			}
+			const opened = await openFloatingMonitor(ctx, monitorId);
+			if (!opened) ctx.ui.notify("Failed to open subagent monitor", "error");
+		},
+	});
+
+	pi.on("session_shutdown", async () => {
+		shutdownFloatingMonitors();
 	});
 }
