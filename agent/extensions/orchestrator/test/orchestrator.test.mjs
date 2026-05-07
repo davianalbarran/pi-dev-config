@@ -99,6 +99,14 @@ test("server renders token-gated dashboard html", async () => {
 		assert.match(html, /Request Changes/);
 		assert.match(html, /Depends on issue/);
 		assert.match(html, /dependencyIssueId/);
+		const formElCapture = html.indexOf("const formEl = event.currentTarget;");
+		const createApiCall = html.indexOf('await api("/api/issues"');
+		assert.ok(formElCapture !== -1, "issue form submit handler captures currentTarget before async work");
+		assert.ok(createApiCall !== -1, "issue form submit handler creates issues through the API");
+		assert.ok(formElCapture < createApiCall, "issue form stores currentTarget before awaiting issue creation");
+		assert.match(html, /const form = new FormData\(formEl\);/);
+		assert.match(html, /formEl\.reset\(\);/);
+		assert.doesNotMatch(html, /event\.currentTarget\.reset\(\);/);
 	} finally {
 		await server.stop();
 	}
