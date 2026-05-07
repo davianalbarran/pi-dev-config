@@ -984,8 +984,8 @@ function api(path, options = {}) {
   });
 }
 
-function shareSvgUrl() {
-  return "/api/share.svg?token=" + encodeURIComponent(TOKEN);
+function shareSvgUrl(cacheKey = Date.now()) {
+  return "/api/share.svg?token=" + encodeURIComponent(TOKEN) + "&_=" + encodeURIComponent(cacheKey);
 }
 
 async function loadShareInfo() {
@@ -998,16 +998,31 @@ async function openShareDialog() {
   const shareUrl = document.getElementById("share-url");
   const warning = document.getElementById("share-warning");
   const qr = document.getElementById("share-qr");
+  const defaultWarning = warning.dataset.defaultText || warning.textContent;
+  warning.dataset.defaultText = defaultWarning;
   dialog.hidden = false;
   shareUrl.textContent = "Loading share URL…";
+  warning.textContent = defaultWarning;
   warning.hidden = true;
+  qr.onload = null;
+  qr.onerror = null;
+  qr.alt = "Loading dashboard QR code…";
   qr.removeAttribute("src");
   try {
     const info = await loadShareInfo();
     shareUrl.textContent = info.shareUrl || info.localUrl || "";
     warning.hidden = !!(info.lanEnabled && info.networkUrl);
-    qr.src = shareSvgUrl();
+    qr.onload = () => {
+      qr.alt = "QR code for dashboard URL";
+    };
+    qr.onerror = () => {
+      qr.alt = "QR code failed to load";
+      warning.textContent = "QR code failed to load. Use the URL above or refresh the dialog.";
+      warning.hidden = false;
+    };
+    qr.src = shareSvgUrl(Date.now());
   } catch (error) {
+    qr.alt = "QR code failed to load";
     shareUrl.textContent = error.message;
     warning.hidden = false;
   }
