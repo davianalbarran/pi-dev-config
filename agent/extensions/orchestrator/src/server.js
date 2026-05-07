@@ -5,30 +5,10 @@ import { URL } from "node:url";
 import { promisify } from "node:util";
 import { DEFAULT_CONFIG } from "./constants.js";
 import { getIssueDiffs } from "./diffs.js";
+import { renderQrSvg } from "./qr.js";
 import { renderDashboardHtml } from "./ui.js";
 
 const execFileAsync = promisify(execFile);
-let qrcodePromise = null;
-
-async function renderQrSvg(value) {
-	try {
-		qrcodePromise ||= import("qrcode");
-		const { default: QRCode } = await qrcodePromise;
-		return QRCode.toString(value, { type: "svg", margin: 1 });
-	} catch (error) {
-		qrcodePromise = null;
-		if (isMissingQrCodeDependency(error)) {
-			throw new Error('Missing dependency "qrcode"; run npm install in the orchestrator extension directory.');
-		}
-		throw error;
-	}
-}
-
-function isMissingQrCodeDependency(error) {
-	const code = error && typeof error === "object" ? error.code : null;
-	const message = error instanceof Error ? error.message : String(error);
-	return (code === "ERR_MODULE_NOT_FOUND" || code === "MODULE_NOT_FOUND") && message.includes("qrcode");
-}
 
 export function isAuthorized(reqUrl, headers, token) {
 	const url = new URL(reqUrl, "http://127.0.0.1");

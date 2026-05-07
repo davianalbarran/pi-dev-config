@@ -22,6 +22,7 @@ import {
 import { RpcAgentRunner } from "../src/rpc-runner.js";
 import { createOrchestratorRuntime, parseOrchestratorEnv } from "../src/runtime.js";
 import { OrchestratorScheduler } from "../src/scheduler.js";
+import { renderQrSvg } from "../src/qr.js";
 import {
 	OrchestratorServer,
 	directoryPickerCommandsForPlatform,
@@ -130,17 +131,32 @@ test("directory picker unavailable messages are clear", () => {
 	assert.match(directoryPickerUnavailableMessage("openbsd"), /Native directory picking is not supported on openbsd/);
 });
 
-test("server module imports before qrcode dependency is installed", async () => {
+test("server module imports without a qrcode package dependency", async () => {
 	const extensionRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 	const root = await tempDir();
 	const tempExtensionRoot = path.join(root, "orchestrator");
 	await fsp.cp(path.join(extensionRoot, "src"), path.join(tempExtensionRoot, "src"), { recursive: true });
 	await fsp.copyFile(path.join(extensionRoot, "package.json"), path.join(tempExtensionRoot, "package.json"));
 
+	const packageJson = JSON.parse(await fsp.readFile(path.join(tempExtensionRoot, "package.json"), "utf8"));
+	assert.equal(packageJson.dependencies?.qrcode, undefined);
+	assert.doesNotMatch(await fsp.readFile(path.join(tempExtensionRoot, "src", "server.js"), "utf8"), /import\(["']qrcode["']\)/);
+
 	const moduleUrl = pathToFileURL(path.join(tempExtensionRoot, "src", "server.js"));
 	const module = await import(`${moduleUrl.href}?cacheBust=${Date.now()}`);
 
 	assert.equal(typeof module.OrchestratorServer, "function");
+});
+
+test("local QR renderer returns an SVG for a LAN dashboard URL", () => {
+	const svg = renderQrSvg("http://192.168.1.23:8123/?token=0123456789abcdef0123456789abcdef0123456789abcdef");
+
+	assert.match(svg, /^<svg[^>]+xmlns="http:\/\/www\.w3\.org\/2000\/svg"/);
+	assert.match(svg, /viewBox="0 0 \d+ \d+"/);
+	assert.match(svg, /<rect width="100%" height="100%" fill="#fff"\/>/);
+	assert.match(svg, /<path fill="#000" d="M\d+,\d+h\d+v1h-\d+z/);
+	assert.throws(() => renderQrSvg(""), /must not be empty/);
+	assert.throws(() => renderQrSvg("x".repeat(214)), /too large/);
 });
 
 test("dashboard renderer injects runtime data", async () => {
@@ -168,6 +184,11 @@ test("dashboard renderer injects runtime data", async () => {
 	assert.match(html, /style\?\.display === "none"/);
 	assert.match(html, /\/api\/share/);
 	assert.match(html, /\/api\/share\.svg/);
+	assert.match(html, /function shareSvgUrl\(cacheKey = Date\.now\(\)\)/);
+	assert.match(html, /"&_=" \+ encodeURIComponent\(cacheKey\)/);
+	assert.match(html, /qr\.alt = "Loading dashboard QR code…";/);
+	assert.match(html, /qr\.onerror = \(\) => \{/);
+	assert.match(html, /QR code failed to load\. Use the URL above or refresh the dialog\./);
 	assert.match(html, /<div class="brand-mark" aria-label="Pi">π<\/div>/);
 	assert.doesNotMatch(html, /<div class="brand-mark">PI<\/div>/);
 	assert.match(html, /const minimizedIssueIds = new Set\(\);/);
@@ -343,7 +364,11 @@ test("server exposes authenticated share metadata and QR endpoints", async () =>
 		const svg = await fetch(`${base}/api/share.svg?token=share-token`);
 		assert.equal(svg.status, 200);
 		assert.match(svg.headers.get("content-type") || "", /image\/svg\+xml/);
-		assert.match(await svg.text(), /<svg[\s\S]*<path/);
+		const svgText = await svg.text();
+		assert.match(svgText, /^<svg[^>]+xmlns="http:\/\/www\.w3\.org\/2000\/svg"/);
+		assert.match(svgText, /viewBox="0 0 \d+ \d+"/);
+		assert.match(svgText, /<rect width="100%" height="100%" fill="#fff"\/>/);
+		assert.match(svgText, /<path fill="#000" d="M\d+,\d+h\d+v1h-\d+z/);
 	} finally {
 		await server.stop();
 	}
