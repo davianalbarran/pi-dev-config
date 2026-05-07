@@ -262,8 +262,25 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
   background: var(--surface-3);
   transform: translateY(-1px);
 }
+.issue-card.minimized {
+  min-height: 0;
+  padding: 8px 9px;
+}
+.issue-card.minimized:hover, .issue-card.minimized.selected {
+  transform: none;
+}
 .card-head { display: flex; align-items: start; justify-content: space-between; gap: 8px; }
 .card-title { font-size: 14px; font-weight: 800; line-height: 1.25; margin-bottom: 6px; overflow-wrap: anywhere; }
+.card-actions { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+.card-action {
+  display: inline-grid;
+  place-items: center;
+  min-width: 26px;
+  height: 24px;
+  padding: 0 7px;
+  line-height: 1;
+}
+.minimized .card-title { margin-bottom: 0; }
 .meta, .small { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
 .mono { font-family: "JetBrains Mono", "SFMono-Regular", ui-monospace, monospace; }
 .card-path { margin-top: 7px; color: var(--dim); font-size: 11px; overflow-wrap: anywhere; }
@@ -556,6 +573,7 @@ let state = { issues: [], lanes: {} };
 let selectedId = null;
 let detailTab = "report";
 let filters = { query: "", lane: "all", state: "all" };
+const minimizedIssueIds = new Set();
 
 function api(path, options = {}) {
   return fetch(path + (path.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(TOKEN), {
@@ -650,6 +668,11 @@ function shortId(value) {
   const text = String(value || "");
   if (text.length <= 32) return text;
   return text.slice(0, 14) + "..." + text.slice(-10);
+}
+
+function minimizedTitle(title) {
+  const words = String(title || "").trim().split(/\s+/).filter(Boolean).slice(0, 3);
+  return (words.length ? words.join(" ") : "Untitled") + "...";
 }
 
 function formatDate(value) {
@@ -767,24 +790,39 @@ function renderBoard() {
       card.tabIndex = 0;
       card.setAttribute("role", "button");
       card.dataset.id = id;
-      const err = issue.automation && issue.automation.error;
-      const attempts = (issue.automation?.planningAttempts || 0) + "p / " + (issue.automation?.implementationAttempts || 0) + "i";
-      const branch = issue.git ? issue.git.branchName : (issue.workspace?.kind || "pending workspace");
-      card.innerHTML =
-        "<div class='card-head'>" +
-          "<div class='card-title'>" + escapeHtml(issue.title) + "</div>" +
-          "<span class='badge " + badgeClass(issue) + "'>" + escapeHtml(stateLabel(issue)) + "</span>" +
-        "</div>" +
-        "<div class='meta mono'>" + escapeHtml(shortId(issue.id)) + "</div>" +
-        "<div class='card-path'>" + escapeHtml(compactPath(issue.linkedDirectory || "")) + "</div>" +
-        "<div class='card-badges'>" +
-          "<span class='badge'>" + escapeHtml(compactPath(branch)) + "</span>" +
-          "<span class='badge'>attempts " + escapeHtml(attempts) + "</span>" +
-          (getDependencyIssueId(issue) ? "<span class='badge " + (hasUnresolvedDependency(issue) ? "active" : "done") + "'>depends on " + escapeHtml(shortId(getDependencyIssueId(issue))) + "</span>" : "") +
-          (issue.approvals?.planApprovedAt ? "<span class='badge done'>plan approved</span>" : "") +
-          (err ? "<span class='badge error'>" + escapeHtml(err) + "</span>" : "") +
-        "</div>" +
-        "<div class='meta'>Updated " + escapeHtml(formatDate(issue.updatedAt)) + "</div>";
+      const minimized = minimizedIssueIds.has(id);
+      card.className += minimized ? " minimized" : "";
+      const toggleLabel = minimized ? "Restore ticket " + issue.title : "Minimize ticket " + issue.title;
+      const toggleButton = "<button type='button' class='secondary card-action minimize-ticket' data-minimize-toggle aria-label='" + escapeHtml(toggleLabel) + "' title='" + escapeHtml(minimized ? "Restore ticket" : "Minimize ticket") + "' aria-expanded='" + String(!minimized) + "'>" + (minimized ? "+" : "-") + "</button>";
+      if (minimized) {
+        card.innerHTML =
+          "<div class='card-head'>" +
+            "<div class='card-title'>" + escapeHtml(minimizedTitle(issue.title)) + "</div>" +
+            toggleButton +
+          "</div>";
+      } else {
+        const err = issue.automation && issue.automation.error;
+        const attempts = (issue.automation?.planningAttempts || 0) + "p / " + (issue.automation?.implementationAttempts || 0) + "i";
+        const branch = issue.git ? issue.git.branchName : (issue.workspace?.kind || "pending workspace");
+        card.innerHTML =
+          "<div class='card-head'>" +
+            "<div class='card-title'>" + escapeHtml(issue.title) + "</div>" +
+            "<div class='card-actions'>" +
+              toggleButton +
+              "<span class='badge " + badgeClass(issue) + "'>" + escapeHtml(stateLabel(issue)) + "</span>" +
+            "</div>" +
+          "</div>" +
+          "<div class='meta mono'>" + escapeHtml(shortId(issue.id)) + "</div>" +
+          "<div class='card-path'>" + escapeHtml(compactPath(issue.linkedDirectory || "")) + "</div>" +
+          "<div class='card-badges'>" +
+            "<span class='badge'>" + escapeHtml(compactPath(branch)) + "</span>" +
+            "<span class='badge'>attempts " + escapeHtml(attempts) + "</span>" +
+            (getDependencyIssueId(issue) ? "<span class='badge " + (hasUnresolvedDependency(issue) ? "active" : "done") + "'>depends on " + escapeHtml(shortId(getDependencyIssueId(issue))) + "</span>" : "") +
+            (issue.approvals?.planApprovedAt ? "<span class='badge done'>plan approved</span>" : "") +
+            (err ? "<span class='badge error'>" + escapeHtml(err) + "</span>" : "") +
+          "</div>" +
+          "<div class='meta'>Updated " + escapeHtml(formatDate(issue.updatedAt)) + "</div>";
+      }
       laneEl.appendChild(card);
     }
     board.appendChild(laneEl);
@@ -1108,6 +1146,17 @@ document.getElementById("state-filter").addEventListener("change", (event) => {
   renderBoard();
 });
 document.getElementById("board").addEventListener("click", (event) => {
+  const toggle = event.target.closest("[data-minimize-toggle]");
+  if (toggle) {
+    event.preventDefault();
+    event.stopPropagation();
+    const card = toggle.closest(".issue-card");
+    if (!card) return;
+    if (minimizedIssueIds.has(card.dataset.id)) minimizedIssueIds.delete(card.dataset.id);
+    else minimizedIssueIds.add(card.dataset.id);
+    renderBoard();
+    return;
+  }
   const card = event.target.closest(".issue-card");
   if (!card) return;
   selectedId = card.dataset.id;
@@ -1116,6 +1165,7 @@ document.getElementById("board").addEventListener("click", (event) => {
   renderDetail();
 });
 document.getElementById("board").addEventListener("keydown", (event) => {
+  if (event.target.closest("[data-minimize-toggle]")) return;
   if (event.key !== "Enter" && event.key !== " ") return;
   const card = event.target.closest(".issue-card");
   if (!card) return;
