@@ -733,6 +733,7 @@ let filters = { query: "", lane: "all", state: "all" };
 let createDrawerWidth = null;
 let detailPanelWidth = null;
 const minimizedIssueIds = new Set();
+let issueLaneById = new Map();
 let diffSectionCollapsed = false;
 let diffPayload = null;
 let diffLoading = false;
@@ -1236,8 +1237,8 @@ function renderBoard() {
           "<div class='card-head'>" +
             "<div class='card-title'>" + escapeHtml(issue.title) + "</div>" +
             "<div class='card-actions'>" +
-              toggleButton +
               "<span class='badge " + badgeClass(issue) + "'>" + escapeHtml(stateLabel(issue)) + "</span>" +
+              toggleButton +
             "</div>" +
           "</div>" +
           "<div class='meta mono'>" + escapeHtml(shortId(issue.id)) + "</div>" +
@@ -1697,8 +1698,29 @@ function renderMarkdown(input) {
   return html || "<p>No report content.</p>";
 }
 
+function syncCompletedTicketMinimization(nextState) {
+  const nextIssues = Array.isArray(nextState?.issues) ? nextState.issues : [];
+  const currentIssueIds = new Set();
+  const nextIssueLaneById = new Map();
+  for (const issue of nextIssues) {
+    if (!issue?.id) continue;
+    currentIssueIds.add(issue.id);
+    const previousLane = issueLaneById.get(issue.id);
+    nextIssueLaneById.set(issue.id, issue.lane);
+    if (issue.lane === LANE.COMPLETED && previousLane !== LANE.COMPLETED) {
+      minimizedIssueIds.add(issue.id);
+    }
+  }
+  for (const id of Array.from(minimizedIssueIds)) {
+    if (!currentIssueIds.has(id)) minimizedIssueIds.delete(id);
+  }
+  issueLaneById = nextIssueLaneById;
+}
+
 async function load() {
-  state = await api("/api/state");
+  const nextState = await api("/api/state");
+  syncCompletedTicketMinimization(nextState);
+  state = nextState;
   if (selectedId && !issueById(selectedId)) selectedId = null;
   populateDependencyOptions();
   renderBoard();
