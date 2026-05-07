@@ -56,11 +56,33 @@ export function normalizeMetadata(metadata) {
 		...createApprovalState(),
 		...(normalized.approvals || {}),
 	};
+	const dependencyIssueId = String(normalized.dependencies?.issueId || "").trim() || null;
+	normalized.dependencies = {
+		issueId: dependencyIssueId,
+		resolvedAt: normalized.dependencies?.resolvedAt || null,
+	};
 	normalized.git = normalized.git || null;
 	normalized.workspace = normalized.workspace || null;
 	normalized.agentSettings = normalizeAgentSettings(normalized.agentSettings);
 	normalized.updatedAt = normalized.updatedAt || normalized.createdAt || nowIso();
 	return normalized;
+}
+
+export function getDependencyIssueId(metadata) {
+	return String(metadata?.dependencies?.issueId || "").trim() || null;
+}
+
+export function isDependencyResolved(metadata) {
+	if (metadata?.lane !== LANE.COMPLETED) return false;
+	const isGitBacked = !!metadata.git || metadata.workspace?.kind === "git-worktree";
+	if (!isGitBacked) return true;
+	return !!(metadata.git?.mergedAt || metadata.git?.mergeCommitSha);
+}
+
+export function dependencyLabel(metadata) {
+	const id = getDependencyIssueId(metadata);
+	if (!id) return "no dependency";
+	return `dependency ${id}`;
 }
 
 export function canRequestPlanChanges(metadata) {

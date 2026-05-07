@@ -21,6 +21,10 @@ export function workspaceSummary(metadata) {
 		lines.push(`Issue branch: ${metadata.git.branchName}`);
 		lines.push(`Worktree: ${metadata.git.worktreePath}`);
 	}
+	if (metadata.dependencies?.issueId) {
+		lines.push(`Depends on issue: ${metadata.dependencies.issueId}`);
+		lines.push(`Dependency resolved at: ${metadata.dependencies.resolvedAt || "(unresolved)"}`);
+	}
 	if (metadata.workspace?.warning) lines.push(`Warning: ${metadata.workspace.warning}`);
 	return lines.join("\n");
 }

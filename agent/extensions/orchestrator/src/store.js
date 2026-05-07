@@ -14,7 +14,7 @@ import {
 	writeFileAtomic,
 	writeJsonAtomic,
 } from "./utils.js";
-import { createApprovalState, createAutomationState, normalizeMetadata } from "./workflow.js";
+import { createApprovalState, createAutomationState, isDependencyResolved, normalizeMetadata } from "./workflow.js";
 
 export class IssueStore {
 	constructor(options = {}) {
@@ -61,11 +61,24 @@ export class IssueStore {
 		}
 	}
 
-	async createIssue({ title, spec, linkedDirectory, agentSettings }) {
+	async createIssue({ title, spec, linkedDirectory, agentSettings, dependencyIssueId }) {
 		if (!title || !String(title).trim()) throw new Error("Title is required.");
 		if (!linkedDirectory || !String(linkedDirectory).trim()) throw new Error("Linked directory is required.");
 		const linkedPath = normalizePath(linkedDirectory);
 		const id = makeId(title);
+		const dependencyId = String(dependencyIssueId || "").trim() || null;
+		let dependency = null;
+		if (dependencyId) {
+			try {
+				await fsp.access(this.issuePath(dependencyId, "metadata.json"));
+				dependency = await this.loadIssue(dependencyId);
+			} catch {
+				throw new Error(`Dependency issue does not exist: ${dependencyId}`);
+			}
+			if (isDependencyResolved(dependency.metadata)) {
+				throw new Error(`Dependency issue is already resolved: ${dependencyId}`);
+			}
+		}
 		const createdAt = nowIso();
 		const metadata = normalizeMetadata({
 			id,
@@ -77,6 +90,7 @@ export class IssueStore {
 			automation: createAutomationState(),
 			approvals: createApprovalState(),
 			agentSettings,
+			dependencies: { issueId: dependencyId, resolvedAt: null },
 			workspace: null,
 			git: null,
 		});
@@ -88,7 +102,13 @@ export class IssueStore {
 		await writeFileAtomic(this.issuePath(id, "review-report.md"), "");
 		await writeFileAtomic(this.issuePath(id, "comments.jsonl"), "");
 		await writeFileAtomic(this.issuePath(id, "events.jsonl"), "");
-		await this.appendEvent(id, { type: "issue_created", title: metadata.title, linkedDirectory: linkedPath });
+		await this.appendEvent(id, {
+			type: "issue_created",
+			title: metadata.title,
+			linkedDirectory: linkedPath,
+			dependencyIssueId: dependencyId,
+			dependencyTitle: dependency?.metadata?.title || null,
+		});
 		this.emitChange({ type: "issue_created", id });
 		return this.loadIssue(id);
 	}

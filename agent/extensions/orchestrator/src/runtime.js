@@ -226,6 +226,7 @@ export class OrchestratorRuntime {
 					spec: body.spec,
 					linkedDirectory: body.linkedDirectory,
 					agentSettings: body.agentSettings,
+					dependencyIssueId: body.dependencyIssueId,
 				});
 				this.scheduler.queueTick();
 				return issue;

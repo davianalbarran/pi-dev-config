@@ -7,8 +7,9 @@ import {
 	parseFinalReviewerOutput,
 	parsePlannerOutput,
 } from "./prompts.js";
+import { nowIso } from "./utils.js";
 import { ensureIssueWorkspace } from "./workspace.js";
-import { parseDecision } from "./workflow.js";
+import { dependencyLabel, getDependencyIssueId, isDependencyResolved, parseDecision } from "./workflow.js";
 
 function buildPlanningExhaustedReport(issue, message) {
 	return [
@@ -112,14 +113,16 @@ export class OrchestratorScheduler {
 
 				if (
 					(metadata.lane === LANE.CREATED || metadata.lane === LANE.PLANNING) &&
-					this.countRunning("planning") < this.config.planningConcurrency
+					this.countRunning("planning") < this.config.planningConcurrency &&
+					(await this.ensureDependenciesResolved(issue))
 				) {
 					this.startIssueRun(metadata.id, "planning", (signal) => this.runPlanning(metadata.id, signal));
 				}
 
 				if (
 					metadata.lane === LANE.IN_PROGRESS &&
-					this.countRunning("implementation") < this.config.implementationConcurrency
+					this.countRunning("implementation") < this.config.implementationConcurrency &&
+					(await this.ensureDependenciesResolved(issue))
 				) {
 					this.startIssueRun(metadata.id, "implementation", (signal) => this.runImplementation(metadata.id, signal));
 				}
@@ -127,6 +130,38 @@ export class OrchestratorScheduler {
 		} finally {
 			this.ticking = false;
 		}
+	}
+
+	async ensureDependenciesResolved(issue) {
+		const dependencyIssueId = getDependencyIssueId(issue.metadata);
+		if (!dependencyIssueId || issue.metadata.dependencies?.resolvedAt) return true;
+		let dependency = null;
+		try {
+			dependency = await this.store.loadIssue(dependencyIssueId);
+		} catch {
+			return false;
+		}
+		if (dependency.metadata.id !== dependencyIssueId || !isDependencyResolved(dependency.metadata)) return false;
+
+		const resolvedAt = nowIso();
+		await this.store.updateMetadata(issue.metadata.id, (metadata) => {
+			if (metadata.dependencies?.resolvedAt) return metadata;
+			return {
+				...metadata,
+				dependencies: {
+					...metadata.dependencies,
+					issueId: dependencyIssueId,
+					resolvedAt,
+				},
+			};
+		});
+		await this.store.appendEvent(issue.metadata.id, {
+			type: "dependency_resolved",
+			dependencyIssueId,
+			dependencyTitle: dependency.metadata.title,
+			message: `${dependencyLabel(issue.metadata)} resolved.`,
+		});
+		return true;
 	}
 
 	startIssueRun(issueId, group, fn) {
@@ -232,6 +267,8 @@ export class OrchestratorScheduler {
 
 	async runPlanning(issueId, signal) {
 		let issue = await this.store.loadIssue(issueId);
+		if (!(await this.ensureDependenciesResolved(issue))) return;
+		issue = await this.store.loadIssue(issueId);
 		if ((issue.metadata.automation?.planningAttempts || 0) >= MAX_PLANNING_ATTEMPTS && issue.metadata.lane !== LANE.CREATED) {
 			const message = `Planning loop limit reached after ${MAX_PLANNING_ATTEMPTS} attempts.`;
 			await this.store.writePlanReport(issueId, buildPlanningExhaustedReport(issue, message));
@@ -291,9 +328,11 @@ export class OrchestratorScheduler {
 	}
 
 	async runImplementation(issueId, signal) {
+		let issue = await this.store.loadIssue(issueId);
+		if (!(await this.ensureDependenciesResolved(issue))) return;
 		let feedback = "";
 		while (true) {
-			let issue = await this.store.loadIssue(issueId);
+			issue = await this.store.loadIssue(issueId);
 			const nextAttempt = (issue.metadata.automation?.implementationAttempts || 0) + 1;
 			if (nextAttempt > MAX_IMPLEMENTATION_ATTEMPTS) {
 				await this.pauseImplementationExhausted(issueId, feedback);
