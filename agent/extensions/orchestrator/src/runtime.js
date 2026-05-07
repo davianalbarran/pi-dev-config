@@ -17,6 +17,21 @@ function errorMessage(error) {
 	return error instanceof Error ? error.message : String(error);
 }
 
+function mergeTargetKey(metadata) {
+	const repoRoot = String(metadata?.git?.repoRoot || "").trim();
+	const baseBranch = String(metadata?.git?.baseBranch || "").trim();
+	if (!repoRoot || !baseBranch) return null;
+	return JSON.stringify([repoRoot, baseBranch]);
+}
+
+function mergeTargetError(metadata) {
+	return new Error(`Another merge is already active for ${metadata.git.baseBranch} in ${metadata.git.repoRoot}.`);
+}
+
+function isActiveMerger(metadata) {
+	return metadata?.automation?.activeRole === "merger" && !!metadata?.automation?.activeRunId;
+}
+
 async function verifyIssueBranchMerged(metadata) {
 	if (!metadata.git?.repoRoot || !metadata.git?.branchName || !metadata.git?.baseBranch) return null;
 	const check = await execGit(["merge-base", "--is-ancestor", metadata.git.branchName, metadata.git.baseBranch], metadata.git.repoRoot, {
@@ -58,6 +73,7 @@ export class OrchestratorRuntime {
 		this.started = false;
 		this.issueCount = 0;
 		this.unsubscribe = null;
+		this.activeMergeKeys = new Set();
 	}
 
 	async start(ctx = null) {
@@ -119,31 +135,53 @@ export class OrchestratorRuntime {
 		}
 	}
 
+	async activeMergeForTarget(mergeKey, currentIssueId) {
+		const issues = await this.store.listIssues();
+		return issues.find(
+			(issue) =>
+				issue.metadata.id !== currentIssueId &&
+				mergeTargetKey(issue.metadata) === mergeKey &&
+				isActiveMerger(issue.metadata),
+		);
+	}
+
 	async approveReviewAndMerge(id) {
 		const issue = await this.store.loadIssue(id);
 		approveReview(issue.metadata);
 		if (!issue.metadata.git?.repoRoot || !issue.metadata.git?.branchName || !issue.metadata.git?.baseBranch) {
 			throw new Error("Approve and merge requires a git-backed issue worktree.");
 		}
-		await this.store.updateMetadata(id, (metadata) => ({
-			...metadata,
-			automation: {
-				...metadata.automation,
-				activeRunId: "starting",
-				activeRole: "merger",
-				paused: false,
-				error: null,
-			},
-		}));
-		await this.store.appendEvent(id, { type: "review_merge_requested" });
+		const mergeKey = mergeTargetKey(issue.metadata);
+		if ((await this.activeMergeForTarget(mergeKey, id)) || this.activeMergeKeys.has(mergeKey)) {
+			throw mergeTargetError(issue.metadata);
+		}
+		this.activeMergeKeys.add(mergeKey);
+		try {
+			await this.store.updateMetadata(id, (metadata) => ({
+				...metadata,
+				automation: {
+					...metadata.automation,
+					activeRunId: "starting",
+					activeRole: "merger",
+					paused: false,
+					error: null,
+				},
+			}));
+			await this.store.appendEvent(id, { type: "review_merge_requested" });
+		} catch (error) {
+			this.activeMergeKeys.delete(mergeKey);
+			throw error;
+		}
 		void this.runReviewMerge(id);
 		return this.store.loadIssue(id);
 	}
 
 	async runReviewMerge(id) {
 		let runId = null;
+		let mergeKey = null;
 		try {
 			let issue = await this.store.loadIssue(id);
+			mergeKey = mergeTargetKey(issue.metadata);
 			const result = await this.runner.run({
 				issueId: id,
 				role: "merger",
@@ -215,6 +253,8 @@ export class OrchestratorRuntime {
 				},
 			}));
 			await this.store.appendEvent(id, { type: "review_merge_failed", runId, error: message });
+		} finally {
+			if (mergeKey) this.activeMergeKeys.delete(mergeKey);
 		}
 	}
 
