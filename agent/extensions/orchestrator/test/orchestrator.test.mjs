@@ -3,6 +3,7 @@ import { execFile } from "node:child_process";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
 import { DEFAULT_PROFILE_ID, LANE, ROLE_DEFAULTS } from "../src/constants.js";
@@ -83,6 +84,19 @@ test("LAN address selection returns first external IPv4 address", () => {
 		"192.168.1.23",
 	);
 	assert.equal(selectLanIpv4Address({ en0: [{ address: "10.0.0.5", family: 4, internal: false }] }), "10.0.0.5");
+});
+
+test("server module imports before qrcode dependency is installed", async () => {
+	const extensionRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+	const root = await tempDir();
+	const tempExtensionRoot = path.join(root, "orchestrator");
+	await fsp.cp(path.join(extensionRoot, "src"), path.join(tempExtensionRoot, "src"), { recursive: true });
+	await fsp.copyFile(path.join(extensionRoot, "package.json"), path.join(tempExtensionRoot, "package.json"));
+
+	const moduleUrl = pathToFileURL(path.join(tempExtensionRoot, "src", "server.js"));
+	const module = await import(`${moduleUrl.href}?cacheBust=${Date.now()}`);
+
+	assert.equal(typeof module.OrchestratorServer, "function");
 });
 
 test("dashboard renderer injects runtime data", async () => {

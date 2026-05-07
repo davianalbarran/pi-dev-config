@@ -3,12 +3,32 @@ import * as os from "node:os";
 import { execFile } from "node:child_process";
 import { URL } from "node:url";
 import { promisify } from "node:util";
-import QRCode from "qrcode";
 import { DEFAULT_CONFIG } from "./constants.js";
 import { getIssueDiffs } from "./diffs.js";
 import { renderDashboardHtml } from "./ui.js";
 
 const execFileAsync = promisify(execFile);
+let qrcodePromise = null;
+
+async function renderQrSvg(value) {
+	try {
+		qrcodePromise ||= import("qrcode");
+		const { default: QRCode } = await qrcodePromise;
+		return QRCode.toString(value, { type: "svg", margin: 1 });
+	} catch (error) {
+		qrcodePromise = null;
+		if (isMissingQrCodeDependency(error)) {
+			throw new Error('Missing dependency "qrcode"; run npm install in the orchestrator extension directory.');
+		}
+		throw error;
+	}
+}
+
+function isMissingQrCodeDependency(error) {
+	const code = error && typeof error === "object" ? error.code : null;
+	const message = error instanceof Error ? error.message : String(error);
+	return (code === "ERR_MODULE_NOT_FOUND" || code === "MODULE_NOT_FOUND") && message.includes("qrcode");
+}
 
 export function isAuthorized(reqUrl, headers, token) {
 	const url = new URL(reqUrl, "http://127.0.0.1");
@@ -194,7 +214,7 @@ export class OrchestratorServer {
 		}
 
 		if (pathname === "/api/share.svg" && req.method === "GET") {
-			const svg = await QRCode.toString(this.getShareInfo().shareUrl, { type: "svg", margin: 1 });
+			const svg = await renderQrSvg(this.getShareInfo().shareUrl);
 			return sendText(res, 200, svg, "image/svg+xml; charset=utf-8");
 		}
 
