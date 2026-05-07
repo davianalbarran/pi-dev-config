@@ -485,6 +485,10 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
   border-radius: 5px;
   padding: 1px 4px;
 }
+.markdown :not(pre) > code {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
 .markdown pre, pre {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
