@@ -1,0 +1,4 @@
+interface:
+  display_name: "Diffs UI"
+  short_description: "Render attractive file diff interfaces"
+  default_prompt: "Use $diffs-ui to build a polished React UI for rendering file diffs."
