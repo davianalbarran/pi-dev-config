@@ -292,8 +292,8 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
 .issue-card.minimized:hover, .issue-card.minimized.selected {
   transform: none;
 }
-.card-head { display: flex; align-items: start; justify-content: space-between; gap: 8px; }
-.card-title { font-size: 14px; font-weight: 800; line-height: 1.25; margin-bottom: 6px; overflow-wrap: anywhere; }
+.card-head { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-bottom: 6px; min-width: 0; }
+.card-title { display: block; width: 100%; min-width: 0; font-size: 14px; font-weight: 800; line-height: 1.25; margin-bottom: 6px; overflow-wrap: anywhere; }
 .card-actions { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
 .card-action {
   display: inline-grid;
@@ -1444,21 +1444,21 @@ function renderBoard() {
       if (minimized) {
         card.innerHTML =
           "<div class='card-head'>" +
-            "<div class='card-title'>" + escapeHtml(minimizedTitle(issue.title)) + "</div>" +
             toggleButton +
-          "</div>";
+          "</div>" +
+          "<div class='card-title'>" + escapeHtml(minimizedTitle(issue.title)) + "</div>";
       } else {
         const err = issue.automation && issue.automation.error;
         const attempts = (issue.automation?.planningAttempts || 0) + "p / " + (issue.automation?.implementationAttempts || 0) + "i";
         const branch = issue.git ? issue.git.branchName : (issue.workspace?.kind || "pending workspace");
         card.innerHTML =
           "<div class='card-head'>" +
-            "<div class='card-title'>" + escapeHtml(issue.title) + "</div>" +
             "<div class='card-actions'>" +
               "<span class='badge " + badgeClass(issue) + "'>" + escapeHtml(stateLabel(issue)) + "</span>" +
               toggleButton +
             "</div>" +
           "</div>" +
+          "<div class='card-title'>" + escapeHtml(issue.title) + "</div>" +
           "<div class='meta mono'>" + escapeHtml(shortId(issue.id)) + "</div>" +
           "<div class='card-path'>" + escapeHtml(compactPath(issue.linkedDirectory || "")) + "</div>" +
           "<div class='card-badges'>" +
