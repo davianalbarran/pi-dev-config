@@ -1192,7 +1192,8 @@ document.getElementById("pick-directory").addEventListener("click", async () => 
 
 document.getElementById("issue-form").addEventListener("submit", async (event) => {
   event.preventDefault();
-  const form = new FormData(event.currentTarget);
+  const formEl = event.currentTarget;
+  const form = new FormData(formEl);
   try {
     const issue = await api("/api/issues", {
       method: "POST",
@@ -1204,7 +1205,7 @@ document.getElementById("issue-form").addEventListener("submit", async (event) =
       })
     });
     selectedId = issue.metadata.id;
-    event.currentTarget.reset();
+    formEl.reset();
     setDefaultAgentSettings();
     closeCreateDrawer();
     await load();
