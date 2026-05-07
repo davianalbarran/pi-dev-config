@@ -99,6 +99,7 @@ test("server renders token-gated dashboard html", async () => {
 		assert.match(html, /create-drawer/);
 		assert.match(html, /renderMarkdown/);
 		assert.match(html, /Plan Review Report/);
+		assert.match(html, /\.markdown :not\(pre\) > code \{[\s\S]*overflow-wrap: anywhere;[\s\S]*word-break: break-word;/);
 		assert.match(html, /\.app-shell \{[\s\S]*min-height: calc\(100vh - 64px\);/);
 		assert.match(html, /\.board \{[\s\S]*align-items: start;[\s\S]*overflow-x: auto;/);
 		assert.match(html, /\.lane \{[\s\S]*min-height: 430px;[\s\S]*height: fit-content;/);
