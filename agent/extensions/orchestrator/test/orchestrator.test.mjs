@@ -99,6 +99,10 @@ test("server renders token-gated dashboard html", async () => {
 		assert.match(html, /\.lane \{[\s\S]*min-height: 430px;[\s\S]*height: fit-content;/);
 		assert.equal(html.includes("body { overflow: hidden; }"), false);
 		assert.match(html, /Approve and merge/);
+		assert.match(html, /function mergeTargetKey\(issue\)/);
+		assert.match(html, /function activeMergeForIssue\(issue\)/);
+		assert.match(html, /Merge blocked by/);
+		assert.match(html, /until its active merge is done/);
 		assert.match(html, /Approve and leave in worktree/);
 		assert.match(html, /Request Changes/);
 		assert.match(html, /Depends on issue/);
@@ -429,6 +433,69 @@ test("approve and merge starts merger rpc role and completes after branch is mer
 	assert.match(completed.metadata.git.mergeCommitSha, /^[a-f0-9]{40}$/);
 	assert.equal(await fsp.readFile(path.join(repo, "README.md"), "utf-8"), "after\n");
 	assert.equal(completed.events.some((event) => event.type === "review_approved_and_merged"), true);
+});
+
+test("approve and merge rejects another active merge targeting the same repo and base branch", async () => {
+	const root = await tempDir();
+	const repo = await tempDir();
+	await git(["init"], repo);
+	await git(["config", "user.email", "test@example.local"], repo);
+	await git(["config", "user.name", "Test User"], repo);
+	await fsp.writeFile(path.join(repo, "README.md"), "before\n", "utf-8");
+	await git(["add", "README.md"], repo);
+	await git(["commit", "-m", "initial"], repo);
+	const baseBranch = (await git(["branch", "--show-current"], repo)).stdout.trim();
+
+	const runtime = createOrchestratorRuntime({ dataRoot: root });
+	await runtime.store.init();
+	const first = await runtime.store.createIssue({
+		title: "First merge",
+		spec: "Merge this first.",
+		linkedDirectory: repo,
+	});
+	const second = await runtime.store.createIssue({
+		title: "Second merge",
+		spec: "Do not merge while first is active.",
+		linkedDirectory: repo,
+	});
+	await ensureIssueWorkspace(runtime.store, first);
+	await ensureIssueWorkspace(runtime.store, second);
+	const firstPrepared = await runtime.store.loadIssue(first.metadata.id);
+	const repoRoot = firstPrepared.metadata.git.repoRoot;
+	await runtime.store.setLane(first.metadata.id, LANE.IN_REVIEW, "test");
+	await runtime.store.setLane(second.metadata.id, LANE.IN_REVIEW, "test");
+
+	let releaseMerge;
+	const mergeGate = new Promise((resolve) => {
+		releaseMerge = resolve;
+	});
+	const calls = [];
+	runtime.runner = {
+		run: async ({ role, onRunStarted }) => {
+			calls.push(role);
+			if (onRunStarted) await onRunStarted("merge-run-1");
+			await mergeGate;
+			return { runId: "merge-run-1", text: "MERGE_RESULT: BLOCKED\nStopped by test." };
+		},
+		stopAll: async () => {},
+	};
+
+	await runtime.createActions().approveReviewAndMerge(first.metadata.id);
+	await waitFor(
+		async () => (await runtime.store.loadIssue(first.metadata.id)).metadata.automation.activeRunId === "merge-run-1",
+	);
+
+	await assert.rejects(
+		() => runtime.createActions().approveReviewAndMerge(second.metadata.id),
+		new RegExp(`Another merge is already active for ${escapeRegExp(baseBranch)} in ${escapeRegExp(repoRoot)}`),
+	);
+	const unchanged = await runtime.store.loadIssue(second.metadata.id);
+	assert.equal(unchanged.metadata.lane, LANE.IN_REVIEW);
+	assert.equal(unchanged.metadata.automation.activeRunId, null);
+
+	releaseMerge();
+	await waitFor(async () => (await runtime.store.loadIssue(first.metadata.id)).metadata.automation.activeRunId === null);
+	assert.deepEqual(calls, ["merger"]);
 });
 
 test("rpc runner rejects a process that exits before agent_end", async () => {

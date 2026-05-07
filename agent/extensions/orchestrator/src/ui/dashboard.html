@@ -577,6 +577,25 @@ function issueById(id) {
   return state.issues.find((issue) => issue.id === id);
 }
 
+function mergeTargetKey(issue) {
+  const repoRoot = String(issue?.git?.repoRoot || "").trim();
+  const baseBranch = String(issue?.git?.baseBranch || "").trim();
+  if (!repoRoot || !baseBranch) return "";
+  return JSON.stringify([repoRoot, baseBranch]);
+}
+
+function activeMergeForIssue(issue) {
+  const key = mergeTargetKey(issue);
+  if (!key) return null;
+  return state.issues.find((candidate) =>
+    candidate &&
+    candidate.id !== issue.id &&
+    mergeTargetKey(candidate) === key &&
+    candidate.automation?.activeRole === "merger" &&
+    candidate.automation?.activeRunId
+  ) || null;
+}
+
 function getDependencyIssueId(issue) {
   return String(issue?.dependencies?.issueId || "").trim();
 }
@@ -810,13 +829,20 @@ function renderDetail() {
   }
   detail.classList.add("open");
   const activeRunId = issue.automation && issue.automation.activeRunId;
+  const activeMerge = activeMergeForIssue(issue);
+  const hasGitMetadata = !!(issue.git?.repoRoot && issue.git?.branchName && issue.git?.baseBranch);
   const actionButtons = [];
   if (issue.lane === LANE.PLAN_REVIEW) {
     actionButtons.push("<button id='approve-plan' " + (activeRunId ? "disabled" : "") + ">Approve Plan</button>");
     actionButtons.push("<button id='change-plan' class='warn'>Request Plan Changes</button>");
   }
   if (issue.lane === LANE.IN_REVIEW) {
-    actionButtons.push("<button id='approve-review-merge' " + (activeRunId || !issue.git ? "disabled" : "") + ">Approve and merge</button>");
+    const mergeDisabled = activeRunId || !hasGitMetadata || activeMerge;
+    let mergeDisabledTitle = "";
+    if (activeRunId) mergeDisabledTitle = "This issue already has an active run.";
+    else if (!hasGitMetadata) mergeDisabledTitle = "Approve and merge requires a git-backed issue worktree.";
+    else if (activeMerge) mergeDisabledTitle = "Merge blocked by " + shortId(activeMerge.id) + " until its active merge is done.";
+    actionButtons.push("<button id='approve-review-merge' " + (mergeDisabled ? "disabled" : "") + (mergeDisabledTitle ? " title='" + escapeHtml(mergeDisabledTitle) + "'" : "") + ">Approve and merge</button>");
     actionButtons.push("<button id='approve-review' class='secondary' " + (activeRunId ? "disabled" : "") + ">Approve and leave in worktree</button>");
     actionButtons.push("<button id='change-review' class='warn' " + (activeRunId ? "disabled" : "") + ">Request Changes</button>");
   }
@@ -832,6 +858,7 @@ function renderDetail() {
     "<div class='inspector-badges'>" +
       "<span class='badge " + badgeClass(issue) + "'>" + escapeHtml(stateLabel(issue)) + "</span>" +
       (issue.git ? "<span class='badge'>" + escapeHtml(compactPath(issue.git.branchName)) + "</span>" : "<span class='badge'>" + escapeHtml(issue.workspace?.kind || "workspace pending") + "</span>") +
+      (activeMerge ? "<span class='badge active'>Merge blocked by " + escapeHtml(shortId(activeMerge.id)) + "</span>" : "") +
       (getDependencyIssueId(issue) ? "<span class='badge " + (hasUnresolvedDependency(issue) ? "active" : "done") + "'>depends on " + escapeHtml(shortId(getDependencyIssueId(issue))) + "</span>" : "") +
     "</div>" +
     "<div class='status-grid'>" +
