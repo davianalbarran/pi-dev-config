@@ -112,6 +112,13 @@ test("dashboard renderer injects runtime data", async () => {
 	assert.match(html, /id="open-share"/);
 	assert.match(html, /id="share-dialog"/);
 	assert.match(html, /id="share-qr"/);
+	assert.match(html, /id="linkedDirectory" name="linkedDirectory" list="linkedDirectorySuggestions"/);
+	assert.match(html, /id="linkedDirectoryQuickSelect"/);
+	assert.match(html, /id="linkedDirectorySuggestions"/);
+	assert.match(html, /function linkedDirectoryChoices\(\)/);
+	assert.match(html, /function populateLinkedDirectoryOptions\(\)/);
+	assert.match(html, /linkedDirectory"\)\.addEventListener\("input"/);
+	assert.match(html, /linkedDirectoryQuickSelect"\)\.addEventListener\("change"/);
 	assert.match(html, /\/api\/share/);
 	assert.match(html, /\/api\/share\.svg/);
 	assert.match(html, /<div class="brand-mark" aria-label="Pi">π<\/div>/);
@@ -146,13 +153,18 @@ test("dashboard renderer injects runtime data", async () => {
 	assert.doesNotMatch(html, /__(TOKEN|LANES|LANE|ROLE_DEFAULTS|THINKING_LEVELS|DEFAULT_PROFILE_ID)_JSON__/);
 });
 
-test("dashboard css pins board to the top with compact padding", async () => {
+test("dashboard css keeps the desktop board compact and stacks it on mobile", async () => {
 	const html = await renderDashboardHtml("test-token");
 
-	assert.match(html, /\.app-shell \{[\s\S]*grid-template-rows: auto auto;[\s\S]*align-content: start;[\s\S]*min-height: calc\(100vh - 64px\);/);
+	assert.match(html, /body \{[^}]*min-width: 0;[^}]*overflow-x: hidden;/);
+	assert.doesNotMatch(html, /body \{[^}]*width: 100vw;/);
+	assert.match(html, /\.topbar \{[^}]*width: 100%;[^}]*min-width: 0;/);
+	assert.match(html, /\.top-actions \{[^}]*justify-content: flex-end;[^}]*min-width: 0;/);
+	assert.doesNotMatch(html, /\.top-actions \{[^}]*position: fixed;/);
+	assert.match(html, /\.app-shell \{[\s\S]*grid-template-rows: auto auto;[\s\S]*align-content: start;[\s\S]*min-height: calc\(100vh - 64px\);[\s\S]*width: 100%;/);
 	assert.doesNotMatch(html, /grid-template-rows: auto minmax\(0, auto\);/);
 	assert.match(html, /\.board \{[\s\S]*overflow-x: auto;[\s\S]*padding: 10px 18px 18px;/);
-	assert.match(html, /@media \(max-width: 640px\) \{[\s\S]*\.board \{ padding: 10px 12px 12px; grid-template-columns: repeat\(6, minmax\(250px, 86vw\)\); \}/);
+	assert.match(html, /@media \(max-width: 640px\) \{[\s\S]*\.board \{[\s\S]*grid-template-columns: 1fr;[\s\S]*overflow-x: visible;[\s\S]*\}[\s\S]*\.lane \{ min-height: 180px; \}/);
 });
 
 test("server renders token-gated dashboard html", async () => {
@@ -188,8 +200,9 @@ test("server renders token-gated dashboard html", async () => {
 		assert.match(html, /renderMarkdown/);
 		assert.match(html, /Plan Review Report/);
 		assert.match(html, /\.markdown :not\(pre\) > code \{[\s\S]*overflow-wrap: anywhere;[\s\S]*word-break: break-word;/);
-		assert.match(html, /\.app-shell \{[\s\S]*min-height: calc\(100vh - 64px\);/);
+		assert.match(html, /\.app-shell \{[\s\S]*min-height: calc\(100vh - 64px\);[\s\S]*width: 100%;/);
 		assert.match(html, /\.board \{[\s\S]*align-items: start;[\s\S]*overflow-x: auto;/);
+		assert.match(html, /@media \(max-width: 640px\) \{[\s\S]*\.board \{[\s\S]*grid-template-columns: 1fr;[\s\S]*overflow-x: visible;/);
 		assert.match(html, /\.lane \{[\s\S]*min-height: 430px;[\s\S]*height: fit-content;/);
 		assert.match(html, /\.panel-resize-handle/);
 		assert.match(html, /--create-drawer-default-width: 460px;/);
@@ -204,6 +217,10 @@ test("server renders token-gated dashboard html", async () => {
 		assert.match(html, /Request Changes/);
 		assert.match(html, /Depends on issue/);
 		assert.match(html, /dependencyIssueId/);
+		assert.match(html, /linkedDirectoryQuickSelect/);
+		assert.match(html, /linkedDirectorySuggestions/);
+		assert.match(html, /function linkedDirectoryChoices\(\)/);
+		assert.match(html, /populateLinkedDirectoryOptions\(\);/);
 		assert.match(html, /minimizedIssueIds\.has\(id\)/);
 		assert.match(html, /let issueLaneById = new Map\(\);/);
 		assert.match(html, /function syncCompletedTicketMinimization\(nextState\)/);
