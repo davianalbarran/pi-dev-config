@@ -2,7 +2,7 @@ import * as http from "node:http";
 import { execFile } from "node:child_process";
 import { URL } from "node:url";
 import { promisify } from "node:util";
-import { DEFAULT_CONFIG, LANE, LANES, ROLE_DEFAULTS, THINKING_LEVELS } from "./constants.js";
+import { DEFAULT_CONFIG, DEFAULT_PROFILE_ID, LANE, LANES, ROLE_DEFAULTS, THINKING_LEVELS } from "./constants.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -143,6 +143,15 @@ export class OrchestratorServer {
 			return;
 		}
 
+		if (pathname === "/api/profiles" && req.method === "GET") {
+			return sendJson(res, 200, { profiles: await this.store.listProfiles() });
+		}
+
+		if (pathname === "/api/profiles" && req.method === "POST") {
+			const body = await readJsonBody(req);
+			return sendJson(res, 200, await this.store.saveProfile(body));
+		}
+
 		if (pathname === "/api/pick-directory" && req.method === "POST") {
 			try {
 				return sendJson(res, 200, { linkedDirectory: await chooseDirectory() });
@@ -178,6 +187,7 @@ function renderHtml(token) {
 	const laneJson = JSON.stringify(LANE);
 	const roleDefaultsJson = JSON.stringify(ROLE_DEFAULTS);
 	const thinkingLevelsJson = JSON.stringify(THINKING_LEVELS);
+	const defaultProfileIdJson = JSON.stringify(DEFAULT_PROFILE_ID);
 	return `<!doctype html>
 <html lang="en">
 <head>
@@ -388,6 +398,18 @@ fieldset {
   margin: 14px 0 0;
 }
 legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
+.profile-row { display: grid; grid-template-columns: 1fr; gap: 6px; margin-bottom: 8px; }
+.profile-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 8px 0 2px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.profile-actions[hidden] { display: none; }
+.profile-actions button { padding: 6px 8px; font-size: 12px; }
 .role-grid { display: grid; grid-template-columns: 92px 1fr 112px; gap: 8px; align-items: end; margin-top: 8px; }
 .role-name { color: var(--muted); font-size: 12px; padding-bottom: 10px; }
 .board {
@@ -700,6 +722,15 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
       <textarea id="spec" name="spec" required></textarea>
       <fieldset>
         <legend>Agent settings</legend>
+        <div class="profile-row">
+          <label for="profileSelect">Profile</label>
+          <select id="profileSelect"></select>
+        </div>
+        <div class="profile-actions" id="profileActions" hidden>
+          <span>Settings differ from selected profile.</span>
+          <button type="button" class="secondary" id="saveSelectedProfile">Save to selected profile</button>
+          <button type="button" class="secondary" id="saveNewProfile">Save as new profile</button>
+        </div>
         <div class="role-grid">
           <div class="role-name">Planner</div>
           <div><label for="plannerModel">Model</label><input id="plannerModel" name="plannerModel" list="modelSuggestions"></div>
@@ -727,7 +758,11 @@ const LANES = ${lanesJson};
 const LANE = ${laneJson};
 const ROLE_DEFAULTS = ${roleDefaultsJson};
 const THINKING_LEVELS = ${thinkingLevelsJson};
+const DEFAULT_PROFILE_ID = ${defaultProfileIdJson};
+const PROFILE_ROLES = ["planner", "worker", "reviewer"];
 let state = { issues: [], lanes: {} };
+let profiles = [];
+let selectedProfileId = DEFAULT_PROFILE_ID;
 let selectedId = null;
 let detailTab = "report";
 let filters = { query: "", lane: "all", state: "all" };
@@ -841,17 +876,139 @@ function renderMetrics() {
   document.getElementById("status").textContent = issues.length + " issue" + (issues.length === 1 ? "" : "s");
 }
 
-function setDefaultAgentSettings() {
-  const suggestions = Array.from(new Set(Object.values(ROLE_DEFAULTS).map((config) => config.model).filter(Boolean)));
-  document.getElementById("modelSuggestions").innerHTML = suggestions.map((model) => "<option value='" + escapeHtml(model) + "'>").join("");
-  for (const role of ["planner", "worker", "reviewer"]) {
+function defaultProfileFromRoleDefaults() {
+  const agentSettings = {};
+  for (const role of PROFILE_ROLES) {
     const defaults = ROLE_DEFAULTS[role] || {};
-    const model = document.getElementById(role + "Model");
-    const thinking = document.getElementById(role + "Thinking");
-    model.value = defaults.model || "";
-    thinking.innerHTML = THINKING_LEVELS.map((level) => "<option value='" + escapeHtml(level) + "'>" + escapeHtml(level) + "</option>").join("");
-    thinking.value = defaults.thinking || "medium";
+    agentSettings[role] = { model: defaults.model || "", thinking: defaults.thinking || "medium" };
   }
+  return { id: DEFAULT_PROFILE_ID, name: "Default", agentSettings };
+}
+
+function normalizeAgentSettingsClient(settings = {}) {
+  const normalized = {};
+  for (const role of PROFILE_ROLES) {
+    const defaults = ROLE_DEFAULTS[role] || {};
+    const value = settings[role] || {};
+    const model = String(value.model || "").trim() || defaults.model || "";
+    const thinking = String(value.thinking || value.thinkingLevel || "").trim().toLowerCase();
+    normalized[role] = {
+      model,
+      thinking: THINKING_LEVELS.includes(thinking) ? thinking : (defaults.thinking || "medium")
+    };
+  }
+  return normalized;
+}
+
+function profileById(id) {
+  return profiles.find((profile) => profile.id === id) || profiles.find((profile) => profile.id === DEFAULT_PROFILE_ID) || defaultProfileFromRoleDefaults();
+}
+
+function hasProfile(id) {
+  return profiles.some((profile) => profile.id === id);
+}
+
+function settingsEqual(a, b) {
+  const left = normalizeAgentSettingsClient(a);
+  const right = normalizeAgentSettingsClient(b);
+  return PROFILE_ROLES.every((role) => left[role].model === right[role].model && left[role].thinking === right[role].thinking);
+}
+
+function currentAgentSettingsFromDom() {
+  const settings = {};
+  for (const role of PROFILE_ROLES) {
+    settings[role] = {
+      model: document.getElementById(role + "Model").value,
+      thinking: document.getElementById(role + "Thinking").value
+    };
+  }
+  return normalizeAgentSettingsClient(settings);
+}
+
+function applyAgentSettings(settings) {
+  const normalized = normalizeAgentSettingsClient(settings);
+  for (const role of PROFILE_ROLES) {
+    document.getElementById(role + "Model").value = normalized[role].model || "";
+    document.getElementById(role + "Thinking").value = normalized[role].thinking || (ROLE_DEFAULTS[role]?.thinking || "medium");
+  }
+  updateProfileDirtyState();
+}
+
+function renderProfileSelect() {
+  if (!profiles.length) profiles = [defaultProfileFromRoleDefaults()];
+  if (!hasProfile(selectedProfileId)) selectedProfileId = DEFAULT_PROFILE_ID;
+  const select = document.getElementById("profileSelect");
+  select.innerHTML = profiles.map((profile) => "<option value='" + escapeHtml(profile.id) + "'>" + escapeHtml(profile.name) + "</option>").join("");
+  select.value = selectedProfileId;
+}
+
+function renderAgentSettingsControls() {
+  const models = [];
+  for (const config of Object.values(ROLE_DEFAULTS)) {
+    if (config?.model) models.push(config.model);
+  }
+  for (const profile of profiles) {
+    for (const role of PROFILE_ROLES) {
+      const model = profile.agentSettings?.[role]?.model;
+      if (model) models.push(model);
+    }
+  }
+  const suggestions = Array.from(new Set(models));
+  document.getElementById("modelSuggestions").innerHTML = suggestions.map((model) => "<option value='" + escapeHtml(model) + "'>").join("");
+  for (const role of PROFILE_ROLES) {
+    document.getElementById(role + "Thinking").innerHTML = THINKING_LEVELS.map((level) => "<option value='" + escapeHtml(level) + "'>" + escapeHtml(level) + "</option>").join("");
+  }
+}
+
+function setDefaultAgentSettings() {
+  renderProfileSelect();
+  renderAgentSettingsControls();
+  applyAgentSettings(profileById(selectedProfileId).agentSettings);
+}
+
+async function loadProfiles() {
+  try {
+    const result = await api("/api/profiles");
+    profiles = (result.profiles && result.profiles.length ? result.profiles : [defaultProfileFromRoleDefaults()]).map((profile) => ({
+      id: profile.id,
+      name: profile.name,
+      agentSettings: normalizeAgentSettingsClient(profile.agentSettings)
+    }));
+  } catch (error) {
+    profiles = [defaultProfileFromRoleDefaults()];
+    document.getElementById("status").textContent = "Profiles unavailable: " + error.message;
+  }
+  if (!hasProfile(selectedProfileId)) selectedProfileId = DEFAULT_PROFILE_ID;
+  setDefaultAgentSettings();
+}
+
+function updateProfileDirtyState() {
+  const actions = document.getElementById("profileActions");
+  const profile = profileById(selectedProfileId);
+  actions.hidden = settingsEqual(currentAgentSettingsFromDom(), profile.agentSettings);
+}
+
+async function saveSelectedProfile() {
+  const profile = profileById(selectedProfileId);
+  const result = await api("/api/profiles", {
+    method: "POST",
+    body: JSON.stringify({ id: profile.id, name: profile.name, agentSettings: currentAgentSettingsFromDom() })
+  });
+  profiles = result.profiles || profiles;
+  selectedProfileId = result.profile?.id || profile.id;
+  setDefaultAgentSettings();
+}
+
+async function saveNewProfile() {
+  const name = prompt("Profile name");
+  if (!name || !name.trim()) return;
+  const result = await api("/api/profiles", {
+    method: "POST",
+    body: JSON.stringify({ name: name.trim(), agentSettings: currentAgentSettingsFromDom() })
+  });
+  profiles = result.profiles || profiles;
+  selectedProfileId = result.profile?.id || selectedProfileId;
+  setDefaultAgentSettings();
 }
 
 function readAgentSettings(form) {
@@ -863,6 +1020,7 @@ function readAgentSettings(form) {
 }
 
 function openCreateDrawer() {
+  setDefaultAgentSettings();
   const drawer = document.getElementById("create-drawer");
   drawer.classList.add("open");
   drawer.setAttribute("aria-hidden", "false");
@@ -1228,6 +1386,21 @@ document.getElementById("state-filter").addEventListener("change", (event) => {
   filters.state = event.target.value;
   renderBoard();
 });
+document.getElementById("profileSelect").addEventListener("change", (event) => {
+  selectedProfileId = event.target.value || DEFAULT_PROFILE_ID;
+  applyAgentSettings(profileById(selectedProfileId).agentSettings);
+});
+for (const role of PROFILE_ROLES) {
+  document.getElementById(role + "Model").addEventListener("input", updateProfileDirtyState);
+  document.getElementById(role + "Model").addEventListener("change", updateProfileDirtyState);
+  document.getElementById(role + "Thinking").addEventListener("change", updateProfileDirtyState);
+}
+document.getElementById("saveSelectedProfile").addEventListener("click", () => {
+  saveSelectedProfile().catch((error) => alert(error.message));
+});
+document.getElementById("saveNewProfile").addEventListener("click", () => {
+  saveNewProfile().catch((error) => alert(error.message));
+});
 document.getElementById("board").addEventListener("click", (event) => {
   const card = event.target.closest(".issue-card");
   if (!card) return;
@@ -1266,8 +1439,9 @@ events.onmessage = () => load().catch(() => {});
 events.addEventListener("ready", () => load().catch(() => {}));
 events.onerror = () => { document.getElementById("status").textContent = "Event stream disconnected"; };
 populateLaneFilter();
-setDefaultAgentSettings();
-load().catch((error) => { document.getElementById("status").textContent = error.message; });
+loadProfiles()
+  .catch((error) => { document.getElementById("status").textContent = error.message; })
+  .then(() => load().catch((error) => { document.getElementById("status").textContent = error.message; }));
 </script>
 </body>
 </html>`;

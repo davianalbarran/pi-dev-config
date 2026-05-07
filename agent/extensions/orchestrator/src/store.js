@@ -1,20 +1,21 @@
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
-import { DEFAULT_DATA_ROOT, LANE, LANES } from "./constants.js";
+import { DEFAULT_DATA_ROOT, DEFAULT_PROFILE_ID, LANE, LANES } from "./constants.js";
 import {
 	appendJsonLine,
 	debounce,
 	ensureDir,
 	makeId,
 	normalizePath,
+	slugify,
 	nowIso,
 	readJson,
 	readJsonLines,
 	writeFileAtomic,
 	writeJsonAtomic,
 } from "./utils.js";
-import { createApprovalState, createAutomationState, normalizeMetadata } from "./workflow.js";
+import { createApprovalState, createAutomationState, normalizeAgentSettings, normalizeMetadata } from "./workflow.js";
 
 export class IssueStore {
 	constructor(options = {}) {
@@ -22,6 +23,7 @@ export class IssueStore {
 		this.issuesRoot = path.join(this.dataRoot, "issues");
 		this.worktreesRoot = path.join(this.dataRoot, "worktrees");
 		this.sessionsRoot = path.join(this.dataRoot, "sessions");
+		this.profilesPath = path.join(this.dataRoot, "profiles.json");
 		this.listeners = new Set();
 		this.watchHandle = null;
 		this.pollTimer = null;
@@ -32,6 +34,75 @@ export class IssueStore {
 		await ensureDir(this.issuesRoot);
 		await ensureDir(this.worktreesRoot);
 		await ensureDir(this.sessionsRoot);
+	}
+
+	defaultProfile() {
+		return {
+			id: DEFAULT_PROFILE_ID,
+			name: "Default",
+			agentSettings: normalizeAgentSettings({}),
+		};
+	}
+
+	normalizeProfile(profile = {}) {
+		const id = String(profile.id || "").trim();
+		const name = String(profile.name || "").trim();
+		return {
+			id: id || DEFAULT_PROFILE_ID,
+			name: name || (id === DEFAULT_PROFILE_ID ? "Default" : "Untitled Profile"),
+			agentSettings: normalizeAgentSettings(profile.agentSettings || {}),
+		};
+	}
+
+	async listProfiles() {
+		await this.init();
+		const raw = await readJson(this.profilesPath, []);
+		const input = Array.isArray(raw) ? raw : Array.isArray(raw?.profiles) ? raw.profiles : [];
+		const profiles = [];
+		const seen = new Set();
+		for (const item of input) {
+			const profile = this.normalizeProfile(item);
+			if (!profile.id || seen.has(profile.id)) continue;
+			seen.add(profile.id);
+			profiles.push(profile);
+		}
+		if (!seen.has(DEFAULT_PROFILE_ID)) profiles.unshift(this.defaultProfile());
+		return profiles.sort((a, b) => {
+			if (a.id === DEFAULT_PROFILE_ID) return -1;
+			if (b.id === DEFAULT_PROFILE_ID) return 1;
+			return a.name.localeCompare(b.name);
+		});
+	}
+
+	async saveProfile({ id, name, agentSettings } = {}) {
+		await this.init();
+		const profiles = await this.listProfiles();
+		const requestedId = String(id || "").trim();
+		const profileName = String(name || "").trim();
+		if (!requestedId && !profileName) throw new Error("Profile name is required.");
+		let nextId = requestedId || slugify(profileName, "profile");
+		if (requestedId) {
+			nextId = requestedId;
+		} else {
+			const used = new Set(profiles.map((profile) => profile.id));
+			let suffix = 2;
+			const baseId = nextId;
+			while (used.has(nextId)) nextId = `${baseId}-${suffix++}`;
+		}
+		const existing = profiles.find((profile) => profile.id === nextId);
+		const saved = this.normalizeProfile({
+			id: nextId,
+			name: profileName || existing?.name || (nextId === DEFAULT_PROFILE_ID ? "Default" : "Untitled Profile"),
+			agentSettings,
+		});
+		const nextProfiles = [saved, ...profiles.filter((profile) => profile.id !== saved.id)].sort((a, b) => {
+			if (a.id === DEFAULT_PROFILE_ID) return -1;
+			if (b.id === DEFAULT_PROFILE_ID) return 1;
+			return a.name.localeCompare(b.name);
+		});
+		await writeJsonAtomic(this.profilesPath, nextProfiles);
+		this.emitChange({ type: "profiles_updated", id: saved.id });
+		return { profile: saved, profiles: nextProfiles };
 	}
 
 	issueDir(id) {
