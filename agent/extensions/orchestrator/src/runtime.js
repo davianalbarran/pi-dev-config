@@ -13,6 +13,25 @@ export function createOrchestratorRuntime(options = {}) {
 	return new OrchestratorRuntime(options);
 }
 
+function isTruthyEnv(value) {
+	return /^(1|true|yes)$/i.test(String(value || "").trim());
+}
+
+export function parseOrchestratorEnv(env = process.env) {
+	const config = {};
+	if (isTruthyEnv(env.PI_ORCHESTRATOR_BIND_LAN)) config.host = "0.0.0.0";
+	const host = String(env.PI_ORCHESTRATOR_HOST || "").trim();
+	if (host) config.host = host;
+	if (!config.host) config.host = DEFAULT_CONFIG.host;
+
+	const portRaw = String(env.PI_ORCHESTRATOR_PORT || "").trim();
+	if (portRaw) {
+		const port = Number(portRaw);
+		if (Number.isInteger(port) && port >= 0 && port <= 65535) config.port = port;
+	}
+	return config;
+}
+
 function errorMessage(error) {
 	return error instanceof Error ? error.message : String(error);
 }
@@ -70,6 +89,7 @@ export class OrchestratorRuntime {
 		this.server = null;
 		this.token = options.token || crypto.randomBytes(24).toString("hex");
 		this.url = null;
+		this.shareInfo = null;
 		this.started = false;
 		this.issueCount = 0;
 		this.unsubscribe = null;
@@ -91,16 +111,18 @@ export class OrchestratorRuntime {
 			actions: this.createActions(),
 		});
 		this.url = await this.server.start();
+		this.shareInfo = this.server.getShareInfo();
 		this.store.startWatcher();
 		this.scheduler.start();
 		this.started = true;
 
 		if (ctx?.hasUI) {
-			ctx.ui.notify(`Pi orchestrator board: ${this.url}`, "info");
+			const lines = this.statusLines();
+			ctx.ui.notify(`Pi orchestrator board: ${this.url}${this.shareInfo?.networkUrl ? `\nNetwork: ${this.shareInfo.networkUrl}` : ""}`, "info");
 			ctx.ui.setStatus("pi-orchestrator", "orchestrator running");
 			ctx.ui.setWidget("pi-orchestrator", [
 				"Pi orchestrator",
-				`Board: ${this.url}`,
+				...lines,
 				`Data: ${this.store.dataRoot}`,
 			]);
 		}
@@ -115,6 +137,7 @@ export class OrchestratorRuntime {
 		if (this.unsubscribe) this.unsubscribe();
 		this.unsubscribe = null;
 		this.server = null;
+		this.shareInfo = null;
 		this.started = false;
 	}
 
@@ -122,9 +145,18 @@ export class OrchestratorRuntime {
 		return {
 			started: this.started,
 			url: this.url,
+			localUrl: this.shareInfo?.localUrl || this.url,
+			networkUrl: this.shareInfo?.networkUrl || null,
+			shareUrl: this.shareInfo?.shareUrl || this.url,
 			dataRoot: this.store.dataRoot,
 			issueCount: this.issueCount,
 		};
+	}
+
+	statusLines() {
+		const lines = [`Local: ${this.shareInfo?.localUrl || this.url}`];
+		if (this.shareInfo?.networkUrl) lines.push(`Network: ${this.shareInfo.networkUrl}`);
+		return lines;
 	}
 
 	async refreshIssueCount() {

@@ -19,9 +19,9 @@ import {
 	parsePlannerOutput,
 } from "../src/prompts.js";
 import { RpcAgentRunner } from "../src/rpc-runner.js";
-import { createOrchestratorRuntime } from "../src/runtime.js";
+import { createOrchestratorRuntime, parseOrchestratorEnv } from "../src/runtime.js";
 import { OrchestratorScheduler } from "../src/scheduler.js";
-import { OrchestratorServer, isAuthorized } from "../src/server.js";
+import { OrchestratorServer, isAuthorized, selectLanIpv4Address } from "../src/server.js";
 import { IssueStore } from "../src/store.js";
 import { renderDashboardHtml } from "../src/ui.js";
 import { branchNameForIssue, commitIssueWorktree, ensureIssueWorkspace } from "../src/workspace.js";
@@ -51,6 +51,40 @@ test("token authorization accepts query, header, and bearer token", () => {
 	assert.equal(isAuthorized("/?token=wrong", {}, "abc"), false);
 });
 
+test("orchestrator env config defaults to localhost", () => {
+	assert.deepEqual(parseOrchestratorEnv({}), { host: "127.0.0.1" });
+});
+
+test("orchestrator env config supports LAN binding shorthand", () => {
+	assert.equal(parseOrchestratorEnv({ PI_ORCHESTRATOR_BIND_LAN: "true" }).host, "0.0.0.0");
+	assert.equal(parseOrchestratorEnv({ PI_ORCHESTRATOR_BIND_LAN: "yes" }).host, "0.0.0.0");
+	assert.equal(parseOrchestratorEnv({ PI_ORCHESTRATOR_BIND_LAN: "1" }).host, "0.0.0.0");
+});
+
+test("orchestrator env config host overrides LAN binding", () => {
+	assert.equal(
+		parseOrchestratorEnv({ PI_ORCHESTRATOR_BIND_LAN: "true", PI_ORCHESTRATOR_HOST: "192.168.1.50" }).host,
+		"192.168.1.50",
+	);
+});
+
+test("orchestrator env config parses a valid port", () => {
+	assert.deepEqual(parseOrchestratorEnv({ PI_ORCHESTRATOR_PORT: "8123" }), { host: "127.0.0.1", port: 8123 });
+});
+
+test("LAN address selection returns first external IPv4 address", () => {
+	assert.equal(
+		selectLanIpv4Address({
+			lo0: [{ address: "127.0.0.1", family: "IPv4", internal: true }],
+			utun: [{ address: "fd00::1", family: "IPv6", internal: false }],
+			en0: [{ address: "192.168.1.23", family: "IPv4", internal: false }],
+			en1: [{ address: "10.0.0.5", family: "IPv4", internal: false }],
+		}),
+		"192.168.1.23",
+	);
+	assert.equal(selectLanIpv4Address({ en0: [{ address: "10.0.0.5", family: 4, internal: false }] }), "10.0.0.5");
+});
+
 test("dashboard renderer injects runtime data", async () => {
 	const html = await renderDashboardHtml("test-token");
 
@@ -61,6 +95,11 @@ test("dashboard renderer injects runtime data", async () => {
 	assert.match(html, /const THINKING_LEVELS = \["low","medium","high","xhigh"\];/);
 	assert.match(html, /const DEFAULT_PROFILE_ID = "default";/);
 	assert.match(html, /id="create-drawer"/);
+	assert.match(html, /id="open-share"/);
+	assert.match(html, /id="share-dialog"/);
+	assert.match(html, /id="share-qr"/);
+	assert.match(html, /\/api\/share/);
+	assert.match(html, /\/api\/share\.svg/);
 	assert.match(html, /<div class="brand-mark" aria-label="Pi">π<\/div>/);
 	assert.doesNotMatch(html, /<div class="brand-mark">PI<\/div>/);
 	assert.match(html, /const minimizedIssueIds = new Set\(\);/);
@@ -174,6 +213,56 @@ test("server renders token-gated dashboard html", async () => {
 		assert.match(html, /Diffs appear once work reaches In Progress/);
 		assert.match(html, /\/api\/issues\/" \+ encodeURIComponent\(issue\.id\) \+ "\/diffs/);
 		assert.match(html, /diff-file-toggle/);
+	} finally {
+		await server.stop();
+	}
+});
+
+test("server exposes authenticated share metadata and QR endpoints", async () => {
+	const root = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const reject = async () => {
+		throw new Error("not used");
+	};
+	const server = new OrchestratorServer({
+		store,
+		token: "share-token",
+		config: { host: "0.0.0.0", port: 0 },
+		actions: {
+			createIssue: reject,
+			comment: reject,
+			approvePlan: reject,
+			requestPlanChanges: reject,
+			approveReview: reject,
+			approveReviewAndMerge: reject,
+			requestReviewChanges: reject,
+		},
+	});
+	const url = await server.start();
+	const base = url.split("?")[0].replace(/\/$/, "");
+	try {
+		const deniedShare = await fetch(`${base}/api/share`);
+		assert.equal(deniedShare.status, 401);
+
+		const share = await fetch(`${base}/api/share?token=share-token`);
+		assert.equal(share.status, 200);
+		const body = await share.json();
+		assert.equal(body.host, "0.0.0.0");
+		assert.equal(body.lanEnabled, true);
+		assert.equal(body.port > 0, true);
+		assert.match(body.localUrl, /^http:\/\/127\.0\.0\.1:\d+\/\?token=share-token$/);
+		assert.equal(body.localUrl.includes("0.0.0.0"), false);
+		assert.equal(body.shareUrl.includes("0.0.0.0"), false);
+		if (body.networkUrl) assert.equal(body.networkUrl.includes("0.0.0.0"), false);
+
+		const deniedSvg = await fetch(`${base}/api/share.svg`);
+		assert.equal(deniedSvg.status, 401);
+
+		const svg = await fetch(`${base}/api/share.svg?token=share-token`);
+		assert.equal(svg.status, 200);
+		assert.match(svg.headers.get("content-type") || "", /image\/svg\+xml/);
+		assert.match(await svg.text(), /<svg[\s\S]*<path/);
 	} finally {
 		await server.stop();
 	}

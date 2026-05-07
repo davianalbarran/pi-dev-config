@@ -27,6 +27,8 @@ export const ISSUE_AGENT_ROLES = Object.freeze(["planner", "worker", "reviewer"]
 export const THINKING_LEVELS = Object.freeze(["low", "medium", "high", "xhigh"]);
 
 export const DEFAULT_CONFIG = Object.freeze({
+	// Keep the dashboard loopback-only by default. Use PI_ORCHESTRATOR_BIND_LAN=1
+	// or host: "0.0.0.0" to opt in to local-network access.
 	host: "127.0.0.1",
 	port: 0,
 	planningConcurrency: 1,
