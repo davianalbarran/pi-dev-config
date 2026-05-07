@@ -28,6 +28,9 @@
   --ok-bg: #263319;
   --shadow: rgba(0, 0, 0, .42);
   --radius: 8px;
+  --create-drawer-default-width: 460px;
+  --detail-panel-default-width: 520px;
+  --resize-handle-size: 12px;
 }
 @media (prefers-color-scheme: light) {
   :root {
@@ -67,6 +70,11 @@ body {
   background-size: 28px 28px;
   color: var(--text);
   overflow-x: hidden;
+}
+body.resizing-panel,
+body.resizing-panel * {
+  cursor: ew-resize !important;
+  user-select: none;
 }
 button, input, textarea, select {
   font: inherit;
@@ -316,7 +324,7 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
   top: 64px;
   right: 0;
   bottom: 0;
-  width: min(520px, 100vw);
+  width: min(var(--detail-panel-default-width), 100vw);
   border-left: 1px solid var(--line);
   background: var(--surface);
   box-shadow: -22px 0 44px var(--shadow);
@@ -327,6 +335,45 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
   padding: 16px;
 }
 .inspector.open { transform: translateX(0); }
+.panel-resize-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: var(--resize-handle-size);
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  cursor: ew-resize;
+  z-index: 5;
+  touch-action: none;
+}
+.panel-resize-handle::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 2px;
+  height: 48px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--line-strong) 65%, transparent);
+  opacity: .55;
+  transform: translate(-50%, -50%);
+  transition: background .12s ease, opacity .12s ease, width .12s ease;
+}
+.panel-resize-handle:hover::after,
+.panel-resize-handle:focus-visible::after {
+  width: 3px;
+  background: var(--warn);
+  opacity: 1;
+}
+.panel-resize-handle:focus-visible {
+  outline: 2px solid var(--warn);
+  outline-offset: -2px;
+}
+.panel-resize-handle-left { left: 0; }
+.panel-resize-handle-right { right: 0; }
 .detail-header { display: flex; align-items: start; justify-content: space-between; gap: 12px; }
 .detail-header h2 { margin: 0 0 6px; overflow-wrap: anywhere; line-height: 1.12; }
 .status-grid {
@@ -532,7 +579,7 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
   top: 0;
   left: 0;
   bottom: 0;
-  width: min(460px, 100vw);
+  width: min(var(--create-drawer-default-width), 100vw);
   z-index: 41;
   overflow: auto;
   border-right: 1px solid var(--line);
@@ -575,6 +622,8 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
   .command-bar { padding: 12px; }
   .board { padding: 10px 12px 12px; grid-template-columns: repeat(6, minmax(250px, 86vw)); }
   .inspector { top: 0; width: 100vw; z-index: 50; }
+  .drawer-panel { width: 100vw; }
+  .panel-resize-handle { display: none; }
 }
 </style>
 </head>
@@ -615,6 +664,7 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
 <div class="drawer" id="create-drawer" aria-hidden="true">
   <button type="button" class="drawer-backdrop" id="drawer-backdrop" aria-label="Close create issue"></button>
   <section class="drawer-panel" aria-label="Create issue">
+    <button type="button" class="panel-resize-handle panel-resize-handle-right" aria-label="Resize create issue panel" data-resize-panel="create"></button>
     <div class="drawer-head">
       <h2>Create Issue</h2>
       <button type="button" class="secondary" id="close-create">Close</button>
@@ -680,6 +730,8 @@ let selectedProfileId = DEFAULT_PROFILE_ID;
 let selectedId = null;
 let detailTab = "report";
 let filters = { query: "", lane: "all", state: "all" };
+let createDrawerWidth = null;
+let detailPanelWidth = null;
 const minimizedIssueIds = new Set();
 let diffSectionCollapsed = false;
 let diffPayload = null;
@@ -687,6 +739,126 @@ let diffLoading = false;
 let diffError = "";
 let diffLoadedKey = "";
 const expandedDiffFiles = new Set();
+
+function cssPixelValue(name, fallback) {
+  const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function defaultCreateDrawerWidth() {
+  return cssPixelValue("--create-drawer-default-width", 460);
+}
+
+function defaultDetailPanelWidth() {
+  return cssPixelValue("--detail-panel-default-width", 520);
+}
+
+function isMobilePanelViewport() {
+  return window.matchMedia && window.matchMedia("(max-width: 640px)").matches;
+}
+
+function clampPanelWidth(width, minWidth) {
+  const maxWidth = Math.max(0, window.innerWidth || document.documentElement.clientWidth || minWidth);
+  const safeMin = Math.min(minWidth, maxWidth);
+  const numericWidth = Number.isFinite(width) ? width : safeMin;
+  return Math.min(maxWidth, Math.max(safeMin, numericWidth));
+}
+
+function currentPanelWidth(selector, fallback) {
+  const panel = document.querySelector(selector);
+  return panel ? panel.getBoundingClientRect().width : fallback;
+}
+
+function applyCreateDrawerWidth() {
+  const panel = document.querySelector(".drawer-panel");
+  if (!panel) return;
+  if (isMobilePanelViewport()) {
+    panel.style.width = "";
+    return;
+  }
+  const minWidth = Math.min(defaultCreateDrawerWidth(), window.innerWidth);
+  const width = clampPanelWidth(createDrawerWidth ?? defaultCreateDrawerWidth(), minWidth);
+  panel.style.width = width + "px";
+}
+
+function applyDetailPanelWidth() {
+  const panel = document.getElementById("detail");
+  if (!panel) return;
+  if (isMobilePanelViewport()) {
+    panel.style.width = "";
+    return;
+  }
+  const minWidth = Math.min(defaultDetailPanelWidth(), window.innerWidth);
+  const width = clampPanelWidth(detailPanelWidth ?? defaultDetailPanelWidth(), minWidth);
+  panel.style.width = width + "px";
+}
+
+function setPanelWidth(panelName, width) {
+  if (panelName === "create") {
+    createDrawerWidth = clampPanelWidth(width, Math.min(defaultCreateDrawerWidth(), window.innerWidth));
+    applyCreateDrawerWidth();
+  } else if (panelName === "detail") {
+    detailPanelWidth = clampPanelWidth(width, Math.min(defaultDetailPanelWidth(), window.innerWidth));
+    applyDetailPanelWidth();
+  }
+}
+
+function panelWidthFromPointer(panelName, clientX) {
+  return panelName === "detail" ? window.innerWidth - clientX : clientX;
+}
+
+function beginPanelResize(event, handle) {
+  const panelName = handle.dataset.resizePanel;
+  if (panelName !== "create" && panelName !== "detail") return;
+  event.preventDefault();
+  handle.setPointerCapture?.(event.pointerId);
+  document.body.classList.add("resizing-panel");
+  setPanelWidth(panelName, panelWidthFromPointer(panelName, event.clientX));
+
+  const onPointerMove = (moveEvent) => {
+    moveEvent.preventDefault();
+    setPanelWidth(panelName, panelWidthFromPointer(panelName, moveEvent.clientX));
+  };
+  const onPointerUp = (upEvent) => {
+    upEvent.preventDefault();
+    handle.releasePointerCapture?.(upEvent.pointerId);
+    document.body.classList.remove("resizing-panel");
+    document.removeEventListener("pointermove", onPointerMove);
+    document.removeEventListener("pointerup", onPointerUp);
+    document.removeEventListener("pointercancel", onPointerUp);
+  };
+
+  document.addEventListener("pointermove", onPointerMove);
+  document.addEventListener("pointerup", onPointerUp);
+  document.addEventListener("pointercancel", onPointerUp);
+}
+
+function resizePanelWithKeyboard(event, handle) {
+  if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+  const panelName = handle.dataset.resizePanel;
+  const step = 24;
+  let currentWidth;
+  let direction;
+  if (panelName === "create") {
+    currentWidth = createDrawerWidth ?? currentPanelWidth(".drawer-panel", defaultCreateDrawerWidth());
+    direction = event.key === "ArrowRight" ? 1 : -1;
+  } else if (panelName === "detail") {
+    currentWidth = detailPanelWidth ?? currentPanelWidth("#detail", defaultDetailPanelWidth());
+    direction = event.key === "ArrowLeft" ? 1 : -1;
+  } else {
+    return;
+  }
+  event.preventDefault();
+  setPanelWidth(panelName, currentWidth + (direction * step));
+}
+
+function reclampPanelWidths() {
+  if (createDrawerWidth !== null) createDrawerWidth = clampPanelWidth(createDrawerWidth, Math.min(defaultCreateDrawerWidth(), window.innerWidth));
+  if (detailPanelWidth !== null) detailPanelWidth = clampPanelWidth(detailPanelWidth, Math.min(defaultDetailPanelWidth(), window.innerWidth));
+  applyCreateDrawerWidth();
+  applyDetailPanelWidth();
+}
 
 function api(path, options = {}) {
   return fetch(path + (path.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(TOKEN), {
@@ -1015,6 +1187,7 @@ function openCreateDrawer() {
   const drawer = document.getElementById("create-drawer");
   drawer.classList.add("open");
   drawer.setAttribute("aria-hidden", "false");
+  applyCreateDrawerWidth();
   setTimeout(() => document.getElementById("title").focus(), 0);
 }
 
@@ -1301,6 +1474,7 @@ function renderDetail() {
   const tabs = ["report", "plan", "spec", "workspace", "comments", "timeline"];
   if (!tabs.includes(detailTab)) detailTab = "report";
   detail.innerHTML =
+    '<button type="button" class="panel-resize-handle panel-resize-handle-left" aria-label="Resize ticket inspector panel" data-resize-panel="detail"></button>' +
     "<div class='detail-header'>" +
       "<div><h2>" + escapeHtml(issue.title) + "</h2>" +
       "<p class='meta mono'>" + escapeHtml(issue.id) + "</p>" +
@@ -1328,6 +1502,7 @@ function renderDetail() {
     renderDiffsSection(issue) +
     "<div class='tabs'>" + tabs.map((tab) => "<button type='button' class='tab " + (detailTab === tab ? "active" : "") + "' data-tab='" + tab + "'>" + escapeHtml(tabLabel(tab)) + "</button>").join("") + "</div>" +
     "<div class='tab-panel'>" + renderTabContent(issue) + "</div>";
+  applyDetailPanelWidth();
   bindDetailActions(issue);
   bindDiffActions(issue);
   void loadDiffsForSelectedIssue(issue);
@@ -1639,6 +1814,17 @@ document.getElementById("detail").addEventListener("click", (event) => {
   detailTab = tab.dataset.tab;
   renderDetail();
 });
+document.addEventListener("pointerdown", (event) => {
+  const handle = event.target.closest?.("[data-resize-panel]");
+  if (!handle) return;
+  beginPanelResize(event, handle);
+});
+document.addEventListener("keydown", (event) => {
+  const handle = event.target.closest?.("[data-resize-panel]");
+  if (!handle) return;
+  resizePanelWithKeyboard(event, handle);
+});
+window.addEventListener("resize", reclampPanelWidths);
 document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
   if (document.getElementById("create-drawer").classList.contains("open")) closeCreateDrawer();

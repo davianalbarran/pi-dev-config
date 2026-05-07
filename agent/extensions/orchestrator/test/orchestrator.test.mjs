@@ -70,6 +70,10 @@ test("dashboard renderer injects runtime data", async () => {
 	assert.match(html, /data-diff-section-toggle/);
 	assert.match(html, /data-diff-file/);
 	assert.match(html, /renderUnifiedDiff/);
+	assert.match(html, /data-resize-panel="create"/);
+	assert.match(html, /data-resize-panel="detail"/);
+	assert.match(html, /function applyCreateDrawerWidth\(\)/);
+	assert.match(html, /function applyDetailPanelWidth\(\)/);
 	assert.doesNotMatch(html, /__(TOKEN|LANES|LANE|ROLE_DEFAULTS|THINKING_LEVELS|DEFAULT_PROFILE_ID)_JSON__/);
 });
 
@@ -118,6 +122,9 @@ test("server renders token-gated dashboard html", async () => {
 		assert.match(html, /\.app-shell \{[\s\S]*min-height: calc\(100vh - 64px\);/);
 		assert.match(html, /\.board \{[\s\S]*align-items: start;[\s\S]*overflow-x: auto;/);
 		assert.match(html, /\.lane \{[\s\S]*min-height: 430px;[\s\S]*height: fit-content;/);
+		assert.match(html, /\.panel-resize-handle/);
+		assert.match(html, /--create-drawer-default-width: 460px;/);
+		assert.match(html, /--detail-panel-default-width: 520px;/);
 		assert.equal(html.includes("body { overflow: hidden; }"), false);
 		assert.match(html, /Approve and merge/);
 		assert.match(html, /function mergeTargetKey\(issue\)/);
