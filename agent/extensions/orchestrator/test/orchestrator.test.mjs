@@ -67,6 +67,15 @@ test("dashboard renderer injects runtime data", async () => {
 	assert.doesNotMatch(html, /__(TOKEN|LANES|LANE|ROLE_DEFAULTS|THINKING_LEVELS|DEFAULT_PROFILE_ID)_JSON__/);
 });
 
+test("dashboard css pins board to the top with compact padding", async () => {
+	const html = await renderDashboardHtml("test-token");
+
+	assert.match(html, /\.app-shell \{[\s\S]*grid-template-rows: auto auto;[\s\S]*align-content: start;[\s\S]*min-height: calc\(100vh - 64px\);/);
+	assert.doesNotMatch(html, /grid-template-rows: auto minmax\(0, auto\);/);
+	assert.match(html, /\.board \{[\s\S]*overflow-x: auto;[\s\S]*padding: 10px 18px 18px;/);
+	assert.match(html, /@media \(max-width: 640px\) \{[\s\S]*\.board \{ padding: 10px 12px 12px; grid-template-columns: repeat\(6, minmax\(250px, 86vw\)\); \}/);
+});
+
 test("server renders token-gated dashboard html", async () => {
 	const root = await tempDir();
 	const store = new IssueStore({ dataRoot: root });
