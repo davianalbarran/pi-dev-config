@@ -595,6 +595,67 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
   margin-bottom: 8px;
 }
 .drawer-head h2 { margin: 0; }
+.share-dialog[hidden] { display: none; }
+.share-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  border: 0;
+  border-radius: 0;
+  background: rgba(0, 0, 0, .5);
+  cursor: default;
+}
+.share-panel {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 61;
+  display: grid;
+  gap: 12px;
+  width: min(420px, calc(100vw - 32px));
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: 0 22px 54px var(--shadow);
+  padding: 16px;
+}
+.share-head {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.share-head h2 { margin: 0; }
+.share-qr {
+  display: grid;
+  place-items: center;
+  min-height: 220px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #fff;
+  padding: 12px;
+}
+.share-qr img { display: block; width: min(260px, 100%); height: auto; }
+.share-url {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--field);
+  color: var(--text-soft);
+  font-family: "JetBrains Mono", "SFMono-Regular", ui-monospace, monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  padding: 9px 10px;
+}
+.share-warning {
+  border: 1px solid color-mix(in srgb, var(--warn) 60%, var(--line));
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
+  color: var(--text-soft);
+  font-size: 12px;
+  padding: 8px 10px;
+}
+.share-warning[hidden] { display: none; }
 .empty-state {
   border: 1px dashed var(--line);
   border-radius: var(--radius);
@@ -623,6 +684,8 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
   .board { padding: 10px 12px 12px; grid-template-columns: repeat(6, minmax(250px, 86vw)); }
   .inspector { top: 0; width: 100vw; z-index: 50; }
   .drawer-panel { width: 100vw; }
+  .share-panel { width: calc(100vw - 24px); padding: 14px; }
+  .share-qr { min-height: 180px; }
   .panel-resize-handle { display: none; }
 }
 </style>
@@ -637,6 +700,7 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
     </div>
   </div>
   <div class="top-actions">
+    <button type="button" id="open-share" class="secondary">Share QR</button>
     <button type="button" id="open-create">New Issue</button>
   </div>
 </header>
@@ -716,6 +780,22 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
     </form>
   </section>
 </div>
+<div class="share-dialog" id="share-dialog" role="dialog" aria-modal="true" aria-labelledby="share-title" hidden>
+  <button type="button" class="share-backdrop" id="share-backdrop" aria-label="Close share dialog"></button>
+  <section class="share-panel">
+    <div class="share-head">
+      <div>
+        <h2 id="share-title">Share dashboard</h2>
+        <div class="small">Scan the QR code from a trusted device to open this tokenized board URL.</div>
+      </div>
+      <button type="button" class="secondary" id="close-share">Close</button>
+    </div>
+    <div class="share-qr" aria-label="Dashboard QR code"><img id="share-qr" alt="QR code for dashboard URL"></div>
+    <div class="share-url" id="share-url">Loading share URL…</div>
+    <div class="share-warning" id="share-warning" hidden>LAN sharing is not enabled or no LAN address was detected. This QR code may open the localhost dashboard on this computer only. Restart with PI_ORCHESTRATOR_BIND_LAN=true to share on your local network.</div>
+    <div class="actions"><button type="button" id="copy-share" class="secondary">Copy URL</button></div>
+  </section>
+</div>
 <script>
 const TOKEN = __TOKEN_JSON__;
 const LANES = __LANES_JSON__;
@@ -739,6 +819,7 @@ let diffPayload = null;
 let diffLoading = false;
 let diffError = "";
 let diffLoadedKey = "";
+let shareInfo = null;
 const expandedDiffFiles = new Set();
 
 function cssPixelValue(name, fallback) {
@@ -875,6 +956,56 @@ function api(path, options = {}) {
     if (!res.ok) throw new Error(data.error || res.statusText);
     return data;
   });
+}
+
+function shareSvgUrl() {
+  return "/api/share.svg?token=" + encodeURIComponent(TOKEN);
+}
+
+async function loadShareInfo() {
+  shareInfo = await api("/api/share");
+  return shareInfo;
+}
+
+async function openShareDialog() {
+  const dialog = document.getElementById("share-dialog");
+  const shareUrl = document.getElementById("share-url");
+  const warning = document.getElementById("share-warning");
+  const qr = document.getElementById("share-qr");
+  dialog.hidden = false;
+  shareUrl.textContent = "Loading share URL…";
+  warning.hidden = true;
+  qr.removeAttribute("src");
+  try {
+    const info = await loadShareInfo();
+    shareUrl.textContent = info.shareUrl || info.localUrl || "";
+    warning.hidden = !!(info.lanEnabled && info.networkUrl);
+    qr.src = shareSvgUrl();
+  } catch (error) {
+    shareUrl.textContent = error.message;
+    warning.hidden = false;
+  }
+}
+
+function closeShareDialog() {
+  document.getElementById("share-dialog").hidden = true;
+}
+
+async function copyShareUrl() {
+  const url = shareInfo?.shareUrl || document.getElementById("share-url").textContent;
+  if (!url) return;
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(url);
+  } else {
+    const input = document.createElement("textarea");
+    input.value = url;
+    document.body.appendChild(input);
+    input.select();
+    document.execCommand("copy");
+    input.remove();
+  }
+  document.getElementById("copy-share").textContent = "Copied";
+  setTimeout(() => { document.getElementById("copy-share").textContent = "Copy URL"; }, 1200);
 }
 
 function issueById(id) {
@@ -1771,6 +1902,10 @@ document.getElementById("issue-form").addEventListener("submit", async (event) =
   }
 });
 
+document.getElementById("open-share").addEventListener("click", () => openShareDialog().catch((error) => alert(error.message)));
+document.getElementById("close-share").addEventListener("click", closeShareDialog);
+document.getElementById("share-backdrop").addEventListener("click", closeShareDialog);
+document.getElementById("copy-share").addEventListener("click", () => copyShareUrl().catch((error) => alert(error.message)));
 document.getElementById("open-create").addEventListener("click", openCreateDrawer);
 document.getElementById("close-create").addEventListener("click", closeCreateDrawer);
 document.getElementById("drawer-backdrop").addEventListener("click", closeCreateDrawer);
@@ -1849,7 +1984,8 @@ document.addEventListener("keydown", (event) => {
 window.addEventListener("resize", reclampPanelWidths);
 document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
-  if (document.getElementById("create-drawer").classList.contains("open")) closeCreateDrawer();
+  if (!document.getElementById("share-dialog").hidden) closeShareDialog();
+  else if (document.getElementById("create-drawer").classList.contains("open")) closeCreateDrawer();
   else if (selectedId) {
     selectedId = null;
     renderBoard();

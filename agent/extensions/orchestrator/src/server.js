@@ -1,7 +1,9 @@
 import * as http from "node:http";
+import * as os from "node:os";
 import { execFile } from "node:child_process";
 import { URL } from "node:url";
 import { promisify } from "node:util";
+import QRCode from "qrcode";
 import { DEFAULT_CONFIG } from "./constants.js";
 import { getIssueDiffs } from "./diffs.js";
 import { renderDashboardHtml } from "./ui.js";
@@ -15,6 +17,53 @@ export function isAuthorized(reqUrl, headers, token) {
 		headers["x-orchestrator-token"] === token ||
 		headers.authorization === `Bearer ${token}`
 	);
+}
+
+export function selectLanIpv4Address(interfaces = os.networkInterfaces()) {
+	for (const entries of Object.values(interfaces || {})) {
+		for (const entry of entries || []) {
+			const family = typeof entry.family === "string" ? entry.family : String(entry.family);
+			if ((family === "IPv4" || family === "4") && !entry.internal && entry.address) return entry.address;
+		}
+	}
+	return null;
+}
+
+function isWildcardHost(host) {
+	return host === "0.0.0.0" || host === "::" || host === "";
+}
+
+function isLoopbackHost(host) {
+	const normalized = String(host || "").toLowerCase().replace(/^\[|\]$/g, "");
+	return normalized === "localhost" || normalized === "::1" || normalized.startsWith("127.");
+}
+
+function hostForUrl(host) {
+	const normalized = String(host || "127.0.0.1").replace(/^\[|\]$/g, "");
+	return normalized.includes(":") ? `[${normalized}]` : normalized;
+}
+
+function dashboardUrl(host, port, token) {
+	return `http://${hostForUrl(host)}:${port}/?token=${encodeURIComponent(token)}`;
+}
+
+function buildShareInfo({ host, port, token, lanAddress = selectLanIpv4Address() }) {
+	const listenHost = String(host || DEFAULT_CONFIG.host).trim();
+	const localHost = isWildcardHost(listenHost) ? "127.0.0.1" : listenHost;
+	const localUrl = dashboardUrl(localHost, port, token);
+	const lanEnabled = isWildcardHost(listenHost) || !isLoopbackHost(listenHost);
+	let networkHost = null;
+	if (isWildcardHost(listenHost)) networkHost = lanAddress;
+	else if (!isLoopbackHost(listenHost)) networkHost = listenHost;
+	const networkUrl = networkHost ? dashboardUrl(networkHost, port, token) : null;
+	return {
+		localUrl,
+		networkUrl,
+		shareUrl: networkUrl || localUrl,
+		host: listenHost,
+		port,
+		lanEnabled,
+	};
 }
 
 async function readJsonBody(req) {
@@ -71,6 +120,7 @@ export class OrchestratorServer {
 		this.config = { ...DEFAULT_CONFIG, ...config };
 		this.server = null;
 		this.url = null;
+		this.shareInfo = null;
 		this.clients = new Set();
 		this.unsubscribe = null;
 	}
@@ -92,8 +142,13 @@ export class OrchestratorServer {
 		});
 		const address = this.server.address();
 		const port = typeof address === "object" && address ? address.port : this.config.port;
-		this.url = `http://${this.config.host}:${port}/?token=${encodeURIComponent(this.token)}`;
+		this.shareInfo = buildShareInfo({ host: this.config.host, port, token: this.token });
+		this.url = this.shareInfo.localUrl;
 		return this.url;
+	}
+
+	getShareInfo() {
+		return this.shareInfo ? { ...this.shareInfo } : null;
 	}
 
 	async stop() {
@@ -104,6 +159,7 @@ export class OrchestratorServer {
 		if (!this.server) return;
 		await new Promise((resolve) => this.server.close(resolve));
 		this.server = null;
+		this.shareInfo = null;
 	}
 
 	broadcast(event) {
@@ -131,6 +187,15 @@ export class OrchestratorServer {
 
 		if (pathname === "/api/state" && req.method === "GET") {
 			return sendJson(res, 200, await this.store.getBoardState());
+		}
+
+		if (pathname === "/api/share" && req.method === "GET") {
+			return sendJson(res, 200, this.getShareInfo());
+		}
+
+		if (pathname === "/api/share.svg" && req.method === "GET") {
+			const svg = await QRCode.toString(this.getShareInfo().shareUrl, { type: "svg", margin: 1 });
+			return sendText(res, 200, svg, "image/svg+xml; charset=utf-8");
 		}
 
 		if (pathname === "/api/events" && req.method === "GET") {
