@@ -6,6 +6,7 @@ import * as path from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 import { DEFAULT_PROFILE_ID, LANE, ROLE_DEFAULTS } from "../src/constants.js";
+import { getIssueDiffs } from "../src/diffs.js";
 import {
 	PLAN_END,
 	PLAN_REPORT_END,
@@ -64,6 +65,11 @@ test("dashboard renderer injects runtime data", async () => {
 	assert.match(html, /function minimizedTitle\(title\)/);
 	assert.match(html, /data-minimize-toggle/);
 	assert.match(html, /aria-expanded='/);
+	assert.match(html, /diffs-section/);
+	assert.match(html, /function loadDiffsForSelectedIssue\(issue = issueById\(selectedId\), options = \{\}\)/);
+	assert.match(html, /data-diff-section-toggle/);
+	assert.match(html, /data-diff-file/);
+	assert.match(html, /renderUnifiedDiff/);
 	assert.doesNotMatch(html, /__(TOKEN|LANES|LANE|ROLE_DEFAULTS|THINKING_LEVELS|DEFAULT_PROFILE_ID)_JSON__/);
 });
 
@@ -129,6 +135,9 @@ test("server renders token-gated dashboard html", async () => {
 		assert.match(html, /Settings differ from selected profile/);
 		assert.match(html, /Save to selected profile/);
 		assert.match(html, /Save as new profile/);
+		assert.match(html, /Diffs appear once work reaches In Progress/);
+		assert.match(html, /\/api\/issues\/" \+ encodeURIComponent\(issue\.id\) \+ "\/diffs/);
+		assert.match(html, /diff-file-toggle/);
 	} finally {
 		await server.stop();
 	}
@@ -186,6 +195,113 @@ test("server exposes authenticated profile API", async () => {
 		const second = await fetch(`${base}/api/profiles?token=profile-token`);
 		const secondBody = await second.json();
 		assert.equal(secondBody.profiles.some((profile) => profile.id === createdBody.profile.id), true);
+	} finally {
+		await server.stop();
+	}
+});
+
+test("diff helper reports tracked, renamed, and untracked worktree changes", async () => {
+	const repo = await tempDir();
+	await git(["init"], repo);
+	await git(["config", "user.email", "test@example.local"], repo);
+	await git(["config", "user.name", "Test User"], repo);
+	await fsp.writeFile(path.join(repo, "README.md"), "before\n", "utf-8");
+	await fsp.writeFile(path.join(repo, "deleted.txt"), "remove me\n", "utf-8");
+	await fsp.writeFile(path.join(repo, "old-name.txt"), "rename me\n", "utf-8");
+	await git(["add", "."], repo);
+	await git(["commit", "-m", "initial"], repo);
+	const baseSha = (await git(["rev-parse", "HEAD"], repo)).stdout.trim();
+
+	await fsp.writeFile(path.join(repo, "README.md"), "before\nafter\n", "utf-8");
+	await fsp.writeFile(path.join(repo, "added.txt"), "tracked add\n", "utf-8");
+	await git(["add", "added.txt"], repo);
+	await git(["rm", "deleted.txt"], repo);
+	await git(["mv", "old-name.txt", "renamed.txt"], repo);
+	await fsp.writeFile(path.join(repo, "untracked.txt"), "untracked add\n", "utf-8");
+
+	const diffs = await getIssueDiffs({
+		metadata: {
+			id: "PI-diff-test",
+			workspace: { kind: "git-worktree", path: repo },
+			git: { baseSha },
+		},
+	});
+
+	assert.equal(diffs.available, true);
+	assert.equal(diffs.reason, null);
+	assert.equal(diffs.baseSha, baseSha);
+	assert.match(diffs.generatedAt, /^\d{4}-\d{2}-\d{2}T/);
+	const byPath = new Map(diffs.files.map((file) => [file.path, file]));
+	assert.equal(byPath.get("README.md").status, "modified");
+	assert.equal(byPath.get("README.md").additions, 1);
+	assert.match(byPath.get("README.md").patch, /\+after/);
+	assert.equal(byPath.get("added.txt").status, "added");
+	assert.equal(byPath.get("deleted.txt").status, "deleted");
+	assert.equal(byPath.get("renamed.txt").status, "renamed");
+	assert.equal(byPath.get("renamed.txt").oldPath, "old-name.txt");
+	assert.equal(byPath.get("untracked.txt").status, "untracked");
+	assert.match(byPath.get("untracked.txt").patch, /new file mode/);
+});
+
+test("diff helper returns unavailable payload for non-git issues", async () => {
+	const diffs = await getIssueDiffs({ metadata: { id: "PI-no-git", workspace: { kind: "directory", path: "/tmp" }, git: null } });
+
+	assert.equal(diffs.available, false);
+	assert.equal(diffs.reason, "not_git_backed");
+	assert.deepEqual(diffs.files, []);
+});
+
+test("server exposes authenticated issue diffs API", async () => {
+	const root = await tempDir();
+	const repo = await tempDir();
+	await git(["init"], repo);
+	await git(["config", "user.email", "test@example.local"], repo);
+	await git(["config", "user.name", "Test User"], repo);
+	await fsp.writeFile(path.join(repo, "README.md"), "before\n", "utf-8");
+	await git(["add", "README.md"], repo);
+	await git(["commit", "-m", "initial"], repo);
+	const baseSha = (await git(["rev-parse", "HEAD"], repo)).stdout.trim();
+
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const issue = await store.createIssue({ title: "Diff endpoint", spec: "Expose diffs.", linkedDirectory: repo });
+	await store.updateMetadata(issue.metadata.id, (metadata) => ({
+		...metadata,
+		lane: LANE.IN_PROGRESS,
+		workspace: { kind: "git-worktree", path: repo },
+		git: { baseSha, repoRoot: repo, baseBranch: "main", branchName: "test" },
+	}));
+	await fsp.writeFile(path.join(repo, "README.md"), "before\nafter\n", "utf-8");
+
+	const reject = async () => {
+		throw new Error("not used");
+	};
+	const server = new OrchestratorServer({
+		store,
+		token: "diff-token",
+		config: { host: "127.0.0.1", port: 0 },
+		actions: {
+			createIssue: reject,
+			comment: reject,
+			approvePlan: reject,
+			requestPlanChanges: reject,
+			approveReview: reject,
+			approveReviewAndMerge: reject,
+			requestReviewChanges: reject,
+		},
+	});
+	const url = await server.start();
+	const base = url.split("?")[0].replace(/\/$/, "");
+	try {
+		const denied = await fetch(`${base}/api/issues/${encodeURIComponent(issue.metadata.id)}/diffs`);
+		assert.equal(denied.status, 401);
+
+		const allowed = await fetch(`${base}/api/issues/${encodeURIComponent(issue.metadata.id)}/diffs?token=diff-token`);
+		assert.equal(allowed.status, 200);
+		const body = await allowed.json();
+		assert.equal(body.issueId, issue.metadata.id);
+		assert.equal(body.available, true);
+		assert.equal(body.files.some((file) => file.path === "README.md" && file.status === "modified"), true);
 	} finally {
 		await server.stop();
 	}

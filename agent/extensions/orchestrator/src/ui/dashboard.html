@@ -344,6 +344,83 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
 .status-cell span { display: block; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
 .status-cell strong { display: block; margin-top: 4px; color: var(--text); overflow-wrap: anywhere; }
 .actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+.diffs-section {
+  margin: 14px 0 4px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--warn) 8%, transparent), transparent 36%),
+    var(--surface-2);
+  overflow: hidden;
+}
+.diffs-head {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 11px 12px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+}
+.diffs-title { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.diffs-kicker {
+  color: var(--warn);
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+}
+.diffs-summary { color: var(--muted); font-size: 12px; font-weight: 600; overflow-wrap: anywhere; }
+.diffs-chevron { color: var(--warn); font-family: "JetBrains Mono", "SFMono-Regular", ui-monospace, monospace; }
+.diffs-body { border-top: 1px solid var(--line); padding: 12px; }
+.diffs-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
+.diffs-meta { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.diff-files { display: grid; gap: 8px; }
+.diff-file {
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--field) 70%, transparent);
+  overflow: hidden;
+}
+.diff-file-toggle {
+  width: 100%;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 10px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-soft);
+  text-align: left;
+}
+.diff-file-toggle:hover { background: color-mix(in srgb, var(--warn) 8%, transparent); }
+.diff-file-path { min-width: 0; font-family: "JetBrains Mono", "SFMono-Regular", ui-monospace, monospace; font-size: 12px; overflow-wrap: anywhere; }
+.diff-file-old { color: var(--dim); font-size: 11px; margin-top: 2px; }
+.diff-stat { display: flex; gap: 6px; align-items: center; white-space: nowrap; font-family: "JetBrains Mono", "SFMono-Regular", ui-monospace, monospace; font-size: 11px; }
+.diff-add { color: var(--accent); }
+.diff-del { color: var(--bad); }
+.diff-body { border-top: 1px solid var(--line); overflow-x: auto; }
+.diff-code { min-width: max-content; padding: 8px 0; font-family: "JetBrains Mono", "SFMono-Regular", ui-monospace, monospace; font-size: 12px; line-height: 1.45; }
+.diff-line { display: grid; grid-template-columns: 48px 48px minmax(420px, 1fr); }
+.diff-line.add { background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.diff-line.del { background: color-mix(in srgb, var(--bad) 15%, transparent); }
+.diff-line.hunk { background: color-mix(in srgb, var(--blue) 14%, transparent); color: var(--blue); }
+.diff-line.meta { color: var(--dim); }
+.diff-gutter { user-select: none; color: var(--dim); text-align: right; padding: 0 8px; border-right: 1px solid color-mix(in srgb, var(--line) 70%, transparent); }
+.diff-text { white-space: pre; padding: 0 10px; }
+.diff-note { padding: 14px; color: var(--muted); }
+@media (max-width: 640px) {
+  .diffs-toolbar { align-items: stretch; flex-direction: column; }
+  .diff-file-toggle { grid-template-columns: auto minmax(0, 1fr); }
+  .diff-stat { grid-column: 2; }
+  .diff-line { grid-template-columns: 38px 38px minmax(320px, 1fr); }
+}
 .tabs {
   display: flex;
   gap: 6px;
@@ -599,6 +676,12 @@ let selectedId = null;
 let detailTab = "report";
 let filters = { query: "", lane: "all", state: "all" };
 const minimizedIssueIds = new Set();
+let diffSectionCollapsed = false;
+let diffPayload = null;
+let diffLoading = false;
+let diffError = "";
+let diffLoadedKey = "";
+const expandedDiffFiles = new Set();
 
 function api(path, options = {}) {
   return fetch(path + (path.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(TOKEN), {
@@ -1005,6 +1088,184 @@ function badgeClass(issue) {
   return "";
 }
 
+function isDiffLane(issue) {
+  return issue?.lane === LANE.IN_PROGRESS || issue?.lane === LANE.IN_REVIEW || issue?.lane === LANE.COMPLETED;
+}
+
+function hasDiffMetadata(issue) {
+  return !!(issue?.workspace?.path && issue?.git?.baseSha && (issue.workspace.kind === "git-worktree" || issue.git));
+}
+
+function diffEligibility(issue) {
+  if (!isDiffLane(issue)) return { eligible: false, reason: "Diffs appear once work reaches In Progress." };
+  if (!hasDiffMetadata(issue)) return { eligible: false, reason: "Git worktree diff metadata is not available for this ticket yet." };
+  return { eligible: true, reason: "" };
+}
+
+function diffUpdateKey(issue) {
+  const events = issue?.recentEvents || [];
+  const lastEvent = events[events.length - 1] || {};
+  return [
+    issue?.id || "",
+    issue?.updatedAt || "",
+    issue?.lane || "",
+    issue?.automation?.activeRunId || "",
+    issue?.automation?.activeRole || "",
+    lastEvent.at || "",
+    lastEvent.type || ""
+  ].join("|");
+}
+
+function currentDiffPayload(issue) {
+  return diffPayload && diffPayload.issueId === issue?.id ? diffPayload : null;
+}
+
+function renderDiffsSection(issue) {
+  const payload = currentDiffPayload(issue);
+  const eligibility = diffEligibility(issue);
+  const count = payload?.files?.length || 0;
+  const summary = !eligibility.eligible ? eligibility.reason : diffLoading ? "Loading latest worktree changes…" : diffError ? "Unable to load diffs" : count === 1 ? "1 changed file" : count + " changed files";
+  return "<section class='diffs-section' id='diffs-section' aria-label='Issue diffs'>" +
+    "<button type='button' class='diffs-head' data-diff-section-toggle aria-expanded='" + String(!diffSectionCollapsed) + "'>" +
+      "<span class='diffs-title'><span class='diffs-kicker'>Diffs</span><span class='diffs-summary'>" + escapeHtml(summary) + "</span></span>" +
+      "<span class='diffs-chevron' aria-hidden='true'>" + (diffSectionCollapsed ? "+" : "−") + "</span>" +
+    "</button>" +
+    (diffSectionCollapsed ? "" : "<div class='diffs-body'>" + renderDiffsBody(issue, eligibility, payload) + "</div>") +
+  "</section>";
+}
+
+function renderDiffsBody(issue, eligibility, payload) {
+  if (!eligibility.eligible) return "<div class='empty-state'>" + escapeHtml(eligibility.reason) + "</div>";
+  const meta = payload?.generatedAt ? "Generated " + formatDate(payload.generatedAt) + " from base " + shortId(payload.baseSha || issue.git?.baseSha || "") : "Base " + shortId(issue.git?.baseSha || "unknown");
+  let body = "<div class='diffs-toolbar'><div class='diffs-meta mono'>" + escapeHtml(meta) + "</div><button type='button' class='secondary' data-diff-refresh " + (diffLoading ? "disabled" : "") + ">" + (diffLoading ? "Refreshing…" : "Refresh") + "</button></div>";
+  if (diffError) return body + "<div class='empty-state'>" + escapeHtml(diffError) + "</div>";
+  if (!payload && diffLoading) return body + "<div class='empty-state'>Loading changed files…</div>";
+  if (!payload) return body + "<div class='empty-state'>Diffs are ready to load.</div>";
+  if (!payload.available) return body + "<div class='empty-state'>" + escapeHtml(diffReasonLabel(payload.reason)) + "</div>";
+  if (!payload.files || payload.files.length === 0) return body + "<div class='empty-state'>No changes relative to this ticket's base SHA.</div>";
+  return body + "<div class='diff-files'>" + payload.files.map(renderDiffFile).join("") + "</div>";
+}
+
+function diffReasonLabel(reason) {
+  const labels = {
+    not_git_backed: "Diffs are only available for git-backed worktrees.",
+    missing_base_sha: "This ticket does not have a recorded git base SHA yet.",
+    missing_workspace_path: "This ticket does not have a prepared workspace path yet."
+  };
+  return labels[reason] || String(reason || "Diffs are unavailable.");
+}
+
+function renderDiffFile(file) {
+  const key = file.path || file.oldPath || "";
+  const open = expandedDiffFiles.has(key);
+  const oldPath = file.oldPath && file.oldPath !== file.path ? "<div class='diff-file-old'>from " + escapeHtml(file.oldPath) + "</div>" : "";
+  return "<article class='diff-file'>" +
+    "<button type='button' class='diff-file-toggle' data-diff-file='" + escapeHtml(key) + "' aria-expanded='" + String(open) + "'>" +
+      "<span class='diffs-chevron' aria-hidden='true'>" + (open ? "−" : "+") + "</span>" +
+      "<span class='diff-file-path'>" + escapeHtml(file.path || key) + oldPath + "</span>" +
+      "<span class='diff-stat'><span class='badge'>" + escapeHtml(file.status || "changed") + "</span><span class='diff-add'>+" + escapeHtml(file.additions || 0) + "</span><span class='diff-del'>−" + escapeHtml(file.deletions || 0) + "</span></span>" +
+    "</button>" +
+    (open ? "<div class='diff-body'>" + renderDiffPatch(file) + "</div>" : "") +
+  "</article>";
+}
+
+function renderDiffPatch(file) {
+  if (file.binary) return "<div class='diff-note'>Binary file changed; unified text diff is not available." + (file.truncated ? " Diff output was truncated." : "") + "</div>";
+  if (!file.patch) return "<div class='diff-note'>No patch body for this file." + (file.truncated ? " Diff output was truncated." : "") + "</div>";
+  const note = file.truncated ? "<div class='diff-note'>Diff output truncated for performance.</div>" : "";
+  return note + "<div class='diff-code' role='table' aria-label='Unified diff for " + escapeHtml(file.path || "file") + "'>" + renderUnifiedDiff(file.patch) + "</div>";
+}
+
+function renderUnifiedDiff(patch) {
+  const lines = String(patch || "").replace(/\r\n/g, "\n").split("\n");
+  let oldLine = null;
+  let newLine = null;
+  return lines.map((line) => {
+    let className = "ctx";
+    let oldCell = "";
+    let newCell = "";
+    const hunk = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    if (hunk) {
+      className = "hunk";
+      oldLine = Number(hunk[1]);
+      newLine = Number(hunk[2]);
+    } else if (line.startsWith("diff --git") || line.startsWith("index ") || line.startsWith("--- ") || line.startsWith("+++ ") || line.startsWith("rename ") || line.startsWith("similarity ") || line.startsWith("new file") || line.startsWith("deleted file")) {
+      className = "meta";
+    } else if (line.startsWith("+")) {
+      className = "add";
+      newCell = newLine == null ? "" : String(newLine++);
+    } else if (line.startsWith("-")) {
+      className = "del";
+      oldCell = oldLine == null ? "" : String(oldLine++);
+    } else if (line.startsWith("\\")) {
+      className = "meta";
+    } else {
+      if (oldLine != null && newLine != null) {
+        oldCell = String(oldLine++);
+        newCell = String(newLine++);
+      }
+    }
+    return "<div class='diff-line " + className + "' role='row'><span class='diff-gutter' role='cell'>" + escapeHtml(oldCell) + "</span><span class='diff-gutter' role='cell'>" + escapeHtml(newCell) + "</span><span class='diff-text' role='cell'>" + escapeHtml(line || " ") + "</span></div>";
+  }).join("");
+}
+
+function updateDiffsSection(issue = issueById(selectedId)) {
+  const section = document.getElementById("diffs-section");
+  if (!section || !issue) return;
+  section.outerHTML = renderDiffsSection(issue);
+  bindDiffActions(issue);
+}
+
+async function loadDiffsForSelectedIssue(issue = issueById(selectedId), options = {}) {
+  if (!issue) return;
+  const eligibility = diffEligibility(issue);
+  const key = diffUpdateKey(issue);
+  if (!eligibility.eligible) {
+    if (diffPayload?.issueId === issue.id || diffLoadedKey.startsWith(issue.id + "|")) {
+      diffPayload = null;
+      diffError = "";
+      diffLoading = false;
+      diffLoadedKey = "";
+      updateDiffsSection(issue);
+    }
+    return;
+  }
+  if (!options.force && diffLoadedKey === key && (diffPayload || diffLoading || diffError)) return;
+  diffLoading = true;
+  diffError = "";
+  diffPayload = null;
+  diffLoadedKey = key;
+  updateDiffsSection(issue);
+  try {
+    const payload = await api("/api/issues/" + encodeURIComponent(issue.id) + "/diffs");
+    if (selectedId !== issue.id || diffLoadedKey !== key) return;
+    diffPayload = payload;
+  } catch (error) {
+    if (selectedId !== issue.id || diffLoadedKey !== key) return;
+    diffError = error.message;
+  } finally {
+    if (selectedId === issue.id && diffLoadedKey === key) {
+      diffLoading = false;
+      updateDiffsSection(issueById(issue.id) || issue);
+    }
+  }
+}
+
+function bindDiffActions(issue) {
+  const sectionToggle = document.querySelector("#diffs-section [data-diff-section-toggle]");
+  if (sectionToggle) sectionToggle.onclick = () => { diffSectionCollapsed = !diffSectionCollapsed; updateDiffsSection(issue); };
+  const refresh = document.querySelector("#diffs-section [data-diff-refresh]");
+  if (refresh) refresh.onclick = () => loadDiffsForSelectedIssue(issue, { force: true });
+  for (const button of document.querySelectorAll("#diffs-section [data-diff-file]")) {
+    button.onclick = () => {
+      const key = button.dataset.diffFile || "";
+      if (expandedDiffFiles.has(key)) expandedDiffFiles.delete(key);
+      else expandedDiffFiles.add(key);
+      updateDiffsSection(issue);
+    };
+  }
+}
+
 function renderDetail() {
   const detail = document.getElementById("detail");
   const issue = issueById(selectedId);
@@ -1059,9 +1320,12 @@ function renderDetail() {
     "</div>" +
     "<label>Feedback</label><textarea id='feedback' placeholder='Write feedback before requesting changes or adding a comment'></textarea>" +
     "<div class='actions'><button id='add-comment' class='secondary'>Add Comment</button></div>" +
+    renderDiffsSection(issue) +
     "<div class='tabs'>" + tabs.map((tab) => "<button type='button' class='tab " + (detailTab === tab ? "active" : "") + "' data-tab='" + tab + "'>" + escapeHtml(tabLabel(tab)) + "</button>").join("") + "</div>" +
     "<div class='tab-panel'>" + renderTabContent(issue) + "</div>";
   bindDetailActions(issue);
+  bindDiffActions(issue);
+  void loadDiffsForSelectedIssue(issue);
 }
 
 function statusCell(label, value) {

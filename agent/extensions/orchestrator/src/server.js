@@ -3,6 +3,7 @@ import { execFile } from "node:child_process";
 import { URL } from "node:url";
 import { promisify } from "node:util";
 import { DEFAULT_CONFIG } from "./constants.js";
+import { getIssueDiffs } from "./diffs.js";
 import { renderDashboardHtml } from "./ui.js";
 
 const execFileAsync = promisify(execFile);
@@ -165,6 +166,12 @@ export class OrchestratorServer {
 			const body = await readJsonBody(req);
 			const issue = await this.actions.createIssue(body);
 			return sendJson(res, 201, issue);
+		}
+
+		const diffMatch = pathname.match(/^\/api\/issues\/([^/]+)\/diffs$/);
+		if (diffMatch && req.method === "GET") {
+			const issue = await this.store.loadIssue(decodeURIComponent(diffMatch[1]));
+			return sendJson(res, 200, await getIssueDiffs(issue));
 		}
 
 		const match = pathname.match(/^\/api\/issues\/([^/]+)\/([^/]+)$/);
