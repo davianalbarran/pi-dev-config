@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
-import { LANE, ROLE_DEFAULTS } from "../src/constants.js";
+import { DEFAULT_PROFILE_ID, LANE, ROLE_DEFAULTS } from "../src/constants.js";
 import {
 	PLAN_END,
 	PLAN_REPORT_END,
@@ -58,8 +58,9 @@ test("dashboard renderer injects runtime data", async () => {
 	assert.match(html, /const LANE = \{"CREATED":"Created"/);
 	assert.match(html, /const ROLE_DEFAULTS = \{"planner":/);
 	assert.match(html, /const THINKING_LEVELS = \["low","medium","high","xhigh"\];/);
+	assert.match(html, /const DEFAULT_PROFILE_ID = "default";/);
 	assert.match(html, /id="create-drawer"/);
-	assert.doesNotMatch(html, /__(TOKEN|LANES|LANE|ROLE_DEFAULTS|THINKING_LEVELS)_JSON__/);
+	assert.doesNotMatch(html, /__(TOKEN|LANES|LANE|ROLE_DEFAULTS|THINKING_LEVELS|DEFAULT_PROFILE_ID)_JSON__/);
 });
 
 test("server renders token-gated dashboard html", async () => {
@@ -111,6 +112,67 @@ test("server renders token-gated dashboard html", async () => {
 		assert.match(html, /const form = new FormData\(formEl\);/);
 		assert.match(html, /formEl\.reset\(\);/);
 		assert.doesNotMatch(html, /event\.currentTarget\.reset\(\);/);
+		assert.match(html, /profileSelect/);
+		assert.match(html, /Settings differ from selected profile/);
+		assert.match(html, /Save to selected profile/);
+		assert.match(html, /Save as new profile/);
+	} finally {
+		await server.stop();
+	}
+});
+
+test("server exposes authenticated profile API", async () => {
+	const root = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const reject = async () => {
+		throw new Error("not used");
+	};
+	const server = new OrchestratorServer({
+		store,
+		token: "profile-token",
+		config: { host: "127.0.0.1", port: 0 },
+		actions: {
+			createIssue: reject,
+			comment: reject,
+			approvePlan: reject,
+			requestPlanChanges: reject,
+			approveReview: reject,
+			approveReviewAndMerge: reject,
+			requestReviewChanges: reject,
+		},
+	});
+	const url = await server.start();
+	const base = url.split("?")[0].replace(/\/$/, "");
+	try {
+		const denied = await fetch(`${base}/api/profiles`);
+		assert.equal(denied.status, 401);
+
+		const first = await fetch(`${base}/api/profiles?token=profile-token`);
+		assert.equal(first.status, 200);
+		const firstBody = await first.json();
+		assert.equal(firstBody.profiles[0].id, DEFAULT_PROFILE_ID);
+
+		const created = await fetch(`${base}/api/profiles?token=profile-token`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				name: "Deep worker",
+				agentSettings: {
+					planner: { model: "planner-deep", thinking: "high" },
+					worker: { model: "worker-deep", thinking: "xhigh" },
+					reviewer: { model: "reviewer-deep", thinking: "low" },
+				},
+			}),
+		});
+		assert.equal(created.status, 200);
+		const createdBody = await created.json();
+		assert.equal(createdBody.profile.name, "Deep worker");
+		assert.equal(createdBody.profile.agentSettings.worker.thinking, "xhigh");
+
+		const second = await fetch(`${base}/api/profiles?token=profile-token`);
+		const secondBody = await second.json();
+		assert.equal(secondBody.profiles.some((profile) => profile.id === createdBody.profile.id), true);
 	} finally {
 		await server.stop();
 	}
@@ -258,6 +320,49 @@ test("issue store rejects an already resolved non-git dependency issue", async (
 			}),
 		/Dependency issue is already resolved/,
 	);
+});
+
+test("issue store lists a built-in default profile when profiles file is absent", async () => {
+	const root = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+
+	const profiles = await store.listProfiles();
+
+	assert.equal(profiles.length, 1);
+	assert.equal(profiles[0].id, DEFAULT_PROFILE_ID);
+	assert.equal(profiles[0].name, "Default");
+	assert.deepEqual(profiles[0].agentSettings, {
+		planner: ROLE_DEFAULTS.planner,
+		worker: ROLE_DEFAULTS.worker,
+		reviewer: ROLE_DEFAULTS.reviewer,
+	});
+});
+
+test("issue store saves named profiles and normalizes invalid thinking values", async () => {
+	const root = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+
+	const result = await store.saveProfile({
+		name: "Fast review",
+		agentSettings: {
+			planner: { model: "planner-fast", thinking: "invalid" },
+			worker: { model: "worker-fast", thinking: "low" },
+			reviewer: { model: "reviewer-fast", thinking: "nope" },
+		},
+	});
+
+	assert.equal(result.profile.name, "Fast review");
+	assert.equal(result.profile.agentSettings.planner.thinking, ROLE_DEFAULTS.planner.thinking);
+	assert.equal(result.profile.agentSettings.worker.thinking, "low");
+	assert.equal(result.profile.agentSettings.reviewer.thinking, ROLE_DEFAULTS.reviewer.thinking);
+	assert.equal(await exists(path.join(root, "profiles.json")), true);
+
+	const reloadedStore = new IssueStore({ dataRoot: root });
+	const profiles = await reloadedStore.listProfiles();
+	assert.equal(profiles.some((profile) => profile.id === DEFAULT_PROFILE_ID), true);
+	assert.deepEqual(profiles.find((profile) => profile.id === result.profile.id), result.profile);
 });
 
 test("workflow transitions enforce plan approval and planning loop limit", () => {

@@ -144,6 +144,15 @@ export class OrchestratorServer {
 			return;
 		}
 
+		if (pathname === "/api/profiles" && req.method === "GET") {
+			return sendJson(res, 200, { profiles: await this.store.listProfiles() });
+		}
+
+		if (pathname === "/api/profiles" && req.method === "POST") {
+			const body = await readJsonBody(req);
+			return sendJson(res, 200, await this.store.saveProfile(body));
+		}
+
 		if (pathname === "/api/pick-directory" && req.method === "POST") {
 			try {
 				return sendJson(res, 200, { linkedDirectory: await chooseDirectory() });

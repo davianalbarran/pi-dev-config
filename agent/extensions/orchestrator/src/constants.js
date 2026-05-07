@@ -20,6 +20,7 @@ export const LANE = Object.freeze({
 });
 
 export const DEFAULT_DATA_ROOT = path.join(os.homedir(), ".pi", "agent", "orchestrator");
+export const DEFAULT_PROFILE_ID = "default";
 export const MAX_PLANNING_ATTEMPTS = 3;
 export const MAX_IMPLEMENTATION_ATTEMPTS = 3;
 export const ISSUE_AGENT_ROLES = Object.freeze(["planner", "worker", "reviewer"]);
