@@ -23,7 +23,14 @@ import { OrchestratorScheduler } from "../src/scheduler.js";
 import { OrchestratorServer, isAuthorized } from "../src/server.js";
 import { IssueStore } from "../src/store.js";
 import { branchNameForIssue, commitIssueWorktree, ensureIssueWorkspace } from "../src/workspace.js";
-import { approvePlan, approveReview, requestPlanChanges, requestReviewChanges } from "../src/workflow.js";
+import {
+	approvePlan,
+	approveReview,
+	isDependencyResolved,
+	normalizeMetadata,
+	requestPlanChanges,
+	requestReviewChanges,
+} from "../src/workflow.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -76,6 +83,8 @@ test("server renders token-gated dashboard html", async () => {
 		assert.match(html, /Approve and merge/);
 		assert.match(html, /Approve and leave in worktree/);
 		assert.match(html, /Request Changes/);
+		assert.match(html, /Depends on issue/);
+		assert.match(html, /dependencyIssueId/);
 	} finally {
 		await server.stop();
 	}
@@ -99,6 +108,7 @@ test("issue store creates folder-per-issue artifacts and board state", async () 
 
 	const id = issue.metadata.id;
 	assert.equal(issue.metadata.lane, LANE.CREATED);
+	assert.deepEqual(issue.metadata.dependencies, { issueId: null, resolvedAt: null });
 	assert.deepEqual(issue.metadata.agentSettings.planner, { model: "planner-model", thinking: "xhigh" });
 	assert.deepEqual(issue.metadata.agentSettings.worker, { model: "worker-model", thinking: "low" });
 	assert.deepEqual(issue.metadata.agentSettings.reviewer, { model: "reviewer-model", thinking: ROLE_DEFAULTS.reviewer.thinking });
@@ -164,6 +174,66 @@ test("issue store defaults new issue agent models to gpt-5.5", async () => {
 	}
 });
 
+test("issue store persists dependency metadata and creation event", async () => {
+	const root = await tempDir();
+	const linked = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const dependency = await store.createIssue({ title: "Base issue", spec: "Do this first.", linkedDirectory: linked });
+	const issue = await store.createIssue({
+		title: "Dependent issue",
+		spec: "Wait for base issue.",
+		linkedDirectory: linked,
+		dependencyIssueId: dependency.metadata.id,
+	});
+
+	assert.deepEqual(issue.metadata.dependencies, { issueId: dependency.metadata.id, resolvedAt: null });
+	assert.equal(issue.events[0].type, "issue_created");
+	assert.equal(issue.events[0].dependencyIssueId, dependency.metadata.id);
+	assert.equal(issue.events[0].dependencyTitle, dependency.metadata.title);
+
+	const state = await store.getBoardState();
+	assert.equal(state.issues.find((entry) => entry.id === issue.metadata.id).dependencies.issueId, dependency.metadata.id);
+});
+
+test("issue store rejects a missing dependency issue", async () => {
+	const root = await tempDir();
+	const linked = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+
+	await assert.rejects(
+		() =>
+			store.createIssue({
+				title: "Blocked on missing",
+				spec: "This should fail.",
+				linkedDirectory: linked,
+				dependencyIssueId: "PI-missing",
+			}),
+		/Dependency issue does not exist: PI-missing/,
+	);
+});
+
+test("issue store rejects an already resolved non-git dependency issue", async () => {
+	const root = await tempDir();
+	const linked = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const dependency = await store.createIssue({ title: "Finished first", spec: "Already done.", linkedDirectory: linked });
+	await store.setLane(dependency.metadata.id, LANE.COMPLETED, "test");
+
+	await assert.rejects(
+		() =>
+			store.createIssue({
+				title: "Too late",
+				spec: "Cannot depend on done work.",
+				linkedDirectory: linked,
+				dependencyIssueId: dependency.metadata.id,
+			}),
+		/Dependency issue is already resolved/,
+	);
+});
+
 test("workflow transitions enforce plan approval and planning loop limit", () => {
 	const base = {
 		id: "PI-1",
@@ -211,6 +281,39 @@ test("review change requests restart implementation after loop exhaustion", () =
 	assert.equal(changed.automation.activeRunId, null);
 	assert.equal(changed.automation.activeRole, null);
 	assert.equal(changed.approvals.reviewApprovedAt, null);
+});
+
+test("workflow dependency resolution handles non-git and git completion rules", () => {
+	assert.equal(isDependencyResolved(normalizeMetadata({ lane: LANE.IN_REVIEW })), false);
+	assert.equal(isDependencyResolved(normalizeMetadata({ lane: LANE.COMPLETED, git: null })), true);
+	assert.equal(
+		isDependencyResolved(
+			normalizeMetadata({
+				lane: LANE.COMPLETED,
+				workspace: { kind: "git-worktree" },
+				git: { finalCommitSha: "abc" },
+			}),
+		),
+		false,
+	);
+	assert.equal(
+		isDependencyResolved(
+			normalizeMetadata({
+				lane: LANE.COMPLETED,
+				git: { finalCommitSha: "abc", mergeCommitSha: "def" },
+			}),
+		),
+		true,
+	);
+	assert.equal(
+		isDependencyResolved(
+			normalizeMetadata({
+				lane: LANE.COMPLETED,
+				git: { mergedAt: "2026-01-01T00:00:00.000Z" },
+			}),
+		),
+		true,
+	);
 });
 
 test("branch name helper uses orchestrator namespace", () => {
@@ -397,23 +500,7 @@ test("scheduler writes parsed plan and plan review report after planning", async
 		spec: "Create a plan and report.",
 		linkedDirectory: linked,
 	});
-	const runner = {
-		run: async ({ onRunStarted }) => {
-			if (onRunStarted) await onRunStarted("planner-run");
-			return {
-				runId: "planner-run",
-				text: [
-					PLAN_START,
-					"## Goal\nImplement the feature.",
-					PLAN_END,
-					PLAN_REPORT_START,
-					"# Plan Review\nThis plan is ready for human approval.",
-					PLAN_REPORT_END,
-				].join("\n"),
-			};
-		},
-		stopAll: async () => {},
-	};
+	const runner = planningRunner();
 	const scheduler = new OrchestratorScheduler({ store, runner });
 	await scheduler.runPlanning(issue.metadata.id, new AbortController().signal);
 
@@ -421,6 +508,103 @@ test("scheduler writes parsed plan and plan review report after planning", async
 	assert.equal(planned.metadata.lane, LANE.PLAN_REVIEW);
 	assert.equal(planned.plan.trim(), "## Goal\nImplement the feature.");
 	assert.equal(planned.planReport.trim(), "# Plan Review\nThis plan is ready for human approval.");
+});
+
+test("scheduler does not start planning while dependency is unresolved", async () => {
+	const root = await tempDir();
+	const linked = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const dependency = await store.createIssue({ title: "Dependency work", spec: "Finish me first.", linkedDirectory: linked });
+	await store.setLane(dependency.metadata.id, LANE.IN_REVIEW, "test");
+	const issue = await store.createIssue({
+		title: "Blocked planning",
+		spec: "Wait before planning.",
+		linkedDirectory: linked,
+		dependencyIssueId: dependency.metadata.id,
+	});
+	let calls = 0;
+	const scheduler = new OrchestratorScheduler({
+		store,
+		runner: {
+			run: async () => {
+				calls += 1;
+				return { runId: "planner-run", text: "should not run" };
+			},
+			stopAll: async () => {},
+		},
+	});
+
+	await scheduler.tick();
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	const blocked = await store.loadIssue(issue.metadata.id);
+	assert.equal(calls, 0);
+	assert.equal(blocked.metadata.lane, LANE.CREATED);
+	assert.equal(blocked.metadata.dependencies.resolvedAt, null);
+	assert.equal(blocked.metadata.automation.paused, false);
+});
+
+test("scheduler starts planning once a non-git dependency is completed", async () => {
+	const root = await tempDir();
+	const linked = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const dependency = await store.createIssue({ title: "Non git dependency", spec: "Finish me first.", linkedDirectory: linked });
+	const issue = await store.createIssue({
+		title: "Unblocked planning",
+		spec: "Start after dependency.",
+		linkedDirectory: linked,
+		dependencyIssueId: dependency.metadata.id,
+	});
+	const runner = planningRunner();
+	const scheduler = new OrchestratorScheduler({ store, runner });
+
+	await store.setLane(dependency.metadata.id, LANE.COMPLETED, "test");
+	await scheduler.tick();
+	await waitFor(async () => (await store.loadIssue(issue.metadata.id)).metadata.lane === LANE.PLAN_REVIEW);
+
+	const planned = await store.loadIssue(issue.metadata.id);
+	assert.equal(runner.calls.length, 1);
+	assert.match(planned.metadata.dependencies.resolvedAt, /^\d{4}-\d{2}-\d{2}T/);
+	assert.equal(planned.events.some((event) => event.type === "dependency_resolved"), true);
+});
+
+test("scheduler requires git dependencies to be completed and merged before planning", async () => {
+	const root = await tempDir();
+	const repo = await tempDir();
+	await git(["init"], repo);
+	await git(["config", "user.email", "test@example.local"], repo);
+	await git(["config", "user.name", "Test User"], repo);
+	await fsp.writeFile(path.join(repo, "README.md"), "before\n", "utf-8");
+	await git(["add", "README.md"], repo);
+	await git(["commit", "-m", "initial"], repo);
+
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const dependency = await store.createIssue({ title: "Git dependency", spec: "Finish and merge me.", linkedDirectory: repo });
+	await ensureIssueWorkspace(store, dependency);
+	await store.setLane(dependency.metadata.id, LANE.COMPLETED, "approved without merge");
+	const issue = await store.createIssue({
+		title: "Git blocked planning",
+		spec: "Wait for merge.",
+		linkedDirectory: repo,
+		dependencyIssueId: dependency.metadata.id,
+	});
+	const runner = planningRunner();
+	const scheduler = new OrchestratorScheduler({ store, runner });
+
+	await scheduler.tick();
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	assert.equal(runner.calls.length, 0);
+	assert.equal((await store.loadIssue(issue.metadata.id)).metadata.lane, LANE.CREATED);
+
+	await store.updateMetadata(dependency.metadata.id, (metadata) => ({
+		...metadata,
+		git: { ...metadata.git, mergeCommitSha: "abc123", mergedAt: "2026-01-01T00:00:00.000Z" },
+	}));
+	await scheduler.tick();
+	await waitFor(async () => (await store.loadIssue(issue.metadata.id)).metadata.lane === LANE.PLAN_REVIEW);
+	assert.equal(runner.calls.length, 1);
 });
 
 test("scheduler writes fallback review report when implementation loop is exhausted", async () => {
@@ -445,6 +629,29 @@ test("scheduler writes fallback review report when implementation loop is exhaus
 	assert.match(review.reviewReport, /Implementation Review Requires Human Attention/);
 	assert.match(review.reviewReport, /Reviewer said tests are missing/);
 });
+
+function planningRunner() {
+	const calls = [];
+	return {
+		calls,
+		run: async ({ onRunStarted, role, prompt }) => {
+			calls.push({ role, prompt });
+			if (onRunStarted) await onRunStarted("planner-run");
+			return {
+				runId: "planner-run",
+				text: [
+					PLAN_START,
+					"## Goal\nImplement the feature.",
+					PLAN_END,
+					PLAN_REPORT_START,
+					"# Plan Review\nThis plan is ready for human approval.",
+					PLAN_REPORT_END,
+				].join("\n"),
+			};
+		},
+		stopAll: async () => {},
+	};
+}
 
 async function exists(filePath) {
 	try {

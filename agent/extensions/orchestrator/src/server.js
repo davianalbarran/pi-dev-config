@@ -698,6 +698,11 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
       </div>
       <label for="spec">Spec</label>
       <textarea id="spec" name="spec" required></textarea>
+      <label for="dependencyIssueId">Depends on issue</label>
+      <select id="dependencyIssueId" name="dependencyIssueId">
+        <option value="">No dependency</option>
+      </select>
+      <div class="small">Optional: wait for another unresolved issue to finish before this one starts.</div>
       <fieldset>
         <legend>Agent settings</legend>
         <div class="role-grid">
@@ -752,12 +757,43 @@ function issueById(id) {
   return state.issues.find((issue) => issue.id === id);
 }
 
+function getDependencyIssueId(issue) {
+  return String(issue?.dependencies?.issueId || "").trim();
+}
+
+function isIssueResolvedForDependency(issue) {
+  if (!issue || issue.lane !== LANE.COMPLETED) return false;
+  if (issue.git || issue.workspace?.kind === "git-worktree") return !!(issue.git?.mergedAt || issue.git?.mergeCommitSha);
+  return true;
+}
+
+function getDependencyIssue(issue) {
+  const dependencyIssueId = getDependencyIssueId(issue);
+  return dependencyIssueId ? issueById(dependencyIssueId) : null;
+}
+
+function hasUnresolvedDependency(issue) {
+  const dependencyIssueId = getDependencyIssueId(issue);
+  if (!dependencyIssueId || issue.dependencies?.resolvedAt) return false;
+  const dependency = issueById(dependencyIssueId);
+  return !dependency || !isIssueResolvedForDependency(dependency);
+}
+
+function dependencyDisplay(issue) {
+  const dependencyIssueId = getDependencyIssueId(issue);
+  if (!dependencyIssueId) return "none";
+  const dependency = issueById(dependencyIssueId);
+  const title = dependency?.title ? " — " + dependency.title : "";
+  const status = issue.dependencies?.resolvedAt || (dependency && isIssueResolvedForDependency(dependency)) ? "resolved" : "waiting";
+  return dependencyIssueId + title + " (" + status + ")";
+}
+
 function isActive(issue) {
   return !!(issue.automation && (issue.automation.activeRole || issue.automation.activeRunId));
 }
 
 function isBlocked(issue) {
-  return !!(issue.automation && (issue.automation.paused || issue.automation.error));
+  return hasUnresolvedDependency(issue) || !!(issue.automation && (issue.automation.paused || issue.automation.error));
 }
 
 function needsReview(issue) {
@@ -773,6 +809,7 @@ function issueState(issue) {
 }
 
 function stateLabel(issue) {
+  if (hasUnresolvedDependency(issue)) return "waiting on dependency";
   const stateName = issueState(issue);
   if (stateName === "active") return "active " + (issue.automation.activeRole || "run");
   if (stateName === "blocked") return "blocked";
@@ -816,6 +853,8 @@ function matchingIssuesForLane(lane) {
       issue.git && issue.git.branchName,
       issue.workspace && issue.workspace.path,
       issue.automation && issue.automation.error,
+      getDependencyIssueId(issue),
+      getDependencyIssue(issue)?.title,
     ].filter(Boolean).join(" ").toLowerCase();
     return haystack.includes(query);
   });
@@ -841,6 +880,17 @@ function renderMetrics() {
   document.getElementById("status").textContent = issues.length + " issue" + (issues.length === 1 ? "" : "s");
 }
 
+function populateDependencyOptions() {
+  const select = document.getElementById("dependencyIssueId");
+  if (!select) return;
+  const selected = select.value;
+  const options = (state.issues || []).filter((issue) => !isIssueResolvedForDependency(issue));
+  select.innerHTML = "<option value=''>No dependency</option>" + options.map((issue) =>
+    "<option value='" + escapeHtml(issue.id) + "'>" + escapeHtml(shortId(issue.id) + " — " + issue.title) + "</option>"
+  ).join("");
+  if (options.some((issue) => issue.id === selected)) select.value = selected;
+}
+
 function setDefaultAgentSettings() {
   const suggestions = Array.from(new Set(Object.values(ROLE_DEFAULTS).map((config) => config.model).filter(Boolean)));
   document.getElementById("modelSuggestions").innerHTML = suggestions.map((model) => "<option value='" + escapeHtml(model) + "'>").join("");
@@ -863,6 +913,7 @@ function readAgentSettings(form) {
 }
 
 function openCreateDrawer() {
+  populateDependencyOptions();
   const drawer = document.getElementById("create-drawer");
   drawer.classList.add("open");
   drawer.setAttribute("aria-hidden", "false");
@@ -909,6 +960,7 @@ function renderBoard() {
         "<div class='card-badges'>" +
           "<span class='badge'>" + escapeHtml(compactPath(branch)) + "</span>" +
           "<span class='badge'>attempts " + escapeHtml(attempts) + "</span>" +
+          (getDependencyIssueId(issue) ? "<span class='badge " + (hasUnresolvedDependency(issue) ? "active" : "done") + "'>depends on " + escapeHtml(shortId(getDependencyIssueId(issue))) + "</span>" : "") +
           (issue.approvals?.planApprovedAt ? "<span class='badge done'>plan approved</span>" : "") +
           (err ? "<span class='badge error'>" + escapeHtml(err) + "</span>" : "") +
         "</div>" +
@@ -960,12 +1012,14 @@ function renderDetail() {
     "<div class='inspector-badges'>" +
       "<span class='badge " + badgeClass(issue) + "'>" + escapeHtml(stateLabel(issue)) + "</span>" +
       (issue.git ? "<span class='badge'>" + escapeHtml(compactPath(issue.git.branchName)) + "</span>" : "<span class='badge'>" + escapeHtml(issue.workspace?.kind || "workspace pending") + "</span>") +
+      (getDependencyIssueId(issue) ? "<span class='badge " + (hasUnresolvedDependency(issue) ? "active" : "done") + "'>depends on " + escapeHtml(shortId(getDependencyIssueId(issue))) + "</span>" : "") +
     "</div>" +
     "<div class='status-grid'>" +
       statusCell("Lane", issue.lane) +
       statusCell("Updated", formatDate(issue.updatedAt)) +
       statusCell("Active", issue.automation?.activeRole ? issue.automation.activeRole + " " + (issue.automation.activeRunId || "") : "none") +
       statusCell("Attempts", (issue.automation?.planningAttempts || 0) + " planning / " + (issue.automation?.implementationAttempts || 0) + " implementation") +
+      statusCell("Dependency", dependencyDisplay(issue)) +
     "</div>" +
     "<div class='actions'>" +
       actionButtons.join("") +
@@ -990,7 +1044,7 @@ function renderTabContent(issue) {
   if (detailTab === "plan") return "<pre>" + escapeHtml(issue.plan || "(no plan)") + "</pre>";
   if (detailTab === "spec") return "<pre>" + escapeHtml(issue.spec || "(no spec)") + "</pre>";
   if (detailTab === "workspace") {
-    return "<pre>" + escapeHtml(JSON.stringify({ workspace: issue.workspace, git: issue.git, agentSettings: issue.agentSettings }, null, 2)) + "</pre>";
+    return "<pre>" + escapeHtml(JSON.stringify({ workspace: issue.workspace, git: issue.git, dependencies: issue.dependencies, agentSettings: issue.agentSettings }, null, 2)) + "</pre>";
   }
   if (detailTab === "comments") return renderComments(issue.comments || []);
   if (detailTab === "timeline") return renderTimeline(issue.recentEvents || []);
@@ -1020,6 +1074,7 @@ function renderReport(issue) {
       "- Status: " + stateLabel(issue),
       "- Linked directory: " + (issue.linkedDirectory || "unknown"),
       "- Workspace: " + (issue.workspace?.path || "not prepared"),
+      "- Dependency: " + dependencyDisplay(issue),
     ].join("\\n");
   }
   return "<section class='report-shell'><div class='report-kicker'>" + escapeHtml(title) + "</div><div class='markdown'>" + renderMarkdown(report) + "</div></section>";
@@ -1168,6 +1223,7 @@ function renderMarkdown(input) {
 async function load() {
   state = await api("/api/state");
   if (selectedId && !issueById(selectedId)) selectedId = null;
+  populateDependencyOptions();
   renderBoard();
   renderDetail();
 }
@@ -1200,12 +1256,14 @@ document.getElementById("issue-form").addEventListener("submit", async (event) =
         title: form.get("title"),
         linkedDirectory: form.get("linkedDirectory"),
         spec: form.get("spec"),
+        dependencyIssueId: form.get("dependencyIssueId") || null,
         agentSettings: readAgentSettings(form)
       })
     });
     selectedId = issue.metadata.id;
     event.currentTarget.reset();
     setDefaultAgentSettings();
+    populateDependencyOptions();
     closeCreateDrawer();
     await load();
   } catch (error) {
