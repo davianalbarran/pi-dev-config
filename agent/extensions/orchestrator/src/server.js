@@ -246,7 +246,7 @@ body {
     var(--bg);
   background-size: 28px 28px;
   color: var(--text);
-  overflow: hidden;
+  overflow-x: hidden;
 }
 button, input, textarea, select {
   font: inherit;
@@ -317,11 +317,10 @@ h1 { margin: 0; font-size: 20px; letter-spacing: 0; line-height: 1; }
 }
 .app-shell {
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
-  height: calc(100vh - 64px);
+  grid-template-rows: auto minmax(0, auto);
+  min-height: calc(100vh - 64px);
   width: 100vw;
   min-width: 0;
-  overflow: hidden;
 }
 .command-bar {
   display: grid;
@@ -393,8 +392,10 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
 .board {
   display: grid;
   grid-template-columns: repeat(6, minmax(200px, 1fr));
+  align-items: start;
   gap: 12px;
-  overflow: auto;
+  overflow-x: auto;
+  overflow-y: visible;
   padding: 14px 18px 18px;
   min-height: 0;
 }
@@ -403,6 +404,7 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
   border: 1px solid var(--line);
   border-radius: var(--radius);
   min-height: 430px;
+  height: fit-content;
   padding: 10px;
   box-shadow: 0 16px 30px rgba(0, 0, 0, .12);
 }
@@ -624,7 +626,6 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
   text-align: center;
 }
 @media (max-width: 1100px) {
-  body { overflow: hidden; }
   .command-bar { grid-template-columns: 1fr; }
   .filters { grid-template-columns: 1fr; }
   .board { grid-template-columns: repeat(6, minmax(230px, 78vw)); }

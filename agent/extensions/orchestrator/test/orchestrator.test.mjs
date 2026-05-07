@@ -73,6 +73,10 @@ test("server renders token-gated dashboard html", async () => {
 		assert.match(html, /create-drawer/);
 		assert.match(html, /renderMarkdown/);
 		assert.match(html, /Plan Review Report/);
+		assert.match(html, /\.app-shell \{[\s\S]*min-height: calc\(100vh - 64px\);/);
+		assert.match(html, /\.board \{[\s\S]*align-items: start;[\s\S]*overflow-x: auto;/);
+		assert.match(html, /\.lane \{[\s\S]*min-height: 430px;[\s\S]*height: fit-content;/);
+		assert.equal(html.includes("body { overflow: hidden; }"), false);
 		assert.match(html, /Approve and merge/);
 		assert.match(html, /Approve and leave in worktree/);
 		assert.match(html, /Request Changes/);
