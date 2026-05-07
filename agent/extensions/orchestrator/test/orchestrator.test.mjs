@@ -61,6 +61,8 @@ test("dashboard renderer injects runtime data", async () => {
 	assert.match(html, /const THINKING_LEVELS = \["low","medium","high","xhigh"\];/);
 	assert.match(html, /const DEFAULT_PROFILE_ID = "default";/);
 	assert.match(html, /id="create-drawer"/);
+	assert.match(html, /<div class="brand-mark" aria-label="Pi">π<\/div>/);
+	assert.doesNotMatch(html, /<div class="brand-mark">PI<\/div>/);
 	assert.match(html, /const minimizedIssueIds = new Set\(\);/);
 	assert.match(html, /function minimizedTitle\(title\)/);
 	assert.match(html, /data-minimize-toggle/);
