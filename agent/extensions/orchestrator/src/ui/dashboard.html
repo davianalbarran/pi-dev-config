@@ -694,6 +694,7 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
   .metrics { display: grid; grid-template-columns: 1fr; }
   .metric { min-width: 0; }
   .filters, .picker-row, .role-grid, .profile-row { grid-template-columns: 1fr; }
+  .desktop-directory-picker { display: none; }
   .profile-actions, .actions, .detail-header, .share-head { align-items: stretch; flex-direction: column; }
   .profile-actions button, .actions button { width: 100%; }
   .board {
@@ -709,6 +710,9 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
   .share-panel { width: calc(100% - 24px); padding: 14px; }
   .share-qr { min-height: 180px; }
   .panel-resize-handle { display: none; }
+}
+@media (hover: none) and (pointer: coarse) {
+  .desktop-directory-picker { display: none; }
 }
 </style>
 </head>
@@ -764,7 +768,7 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
         <select id="linkedDirectoryQuickSelect" aria-label="Use linked directory from an existing ticket">
           <option value="">Use existing directory…</option>
         </select>
-        <button type="button" class="secondary" id="pick-directory">Choose</button>
+        <button type="button" class="secondary desktop-directory-picker" id="pick-directory">Choose</button>
       </div>
       <datalist id="linkedDirectorySuggestions"></datalist>
       <label for="spec">Spec</label>
@@ -1942,8 +1946,11 @@ document.getElementById("linkedDirectoryQuickSelect").addEventListener("change",
   document.getElementById("linkedDirectory").value = event.target.value || "";
 });
 
-document.getElementById("pick-directory").addEventListener("click", async () => {
-  const button = document.getElementById("pick-directory");
+const pickDirectoryButton = document.getElementById("pick-directory");
+if (pickDirectoryButton) pickDirectoryButton.addEventListener("click", async () => {
+  const button = pickDirectoryButton;
+  const style = window.getComputedStyle ? window.getComputedStyle(button) : null;
+  if (button.hidden || style?.display === "none" || style?.visibility === "hidden") return;
   button.disabled = true;
   try {
     const result = await api("/api/pick-directory", { method: "POST", body: "{}" });

@@ -22,7 +22,14 @@ import {
 import { RpcAgentRunner } from "../src/rpc-runner.js";
 import { createOrchestratorRuntime, parseOrchestratorEnv } from "../src/runtime.js";
 import { OrchestratorScheduler } from "../src/scheduler.js";
-import { OrchestratorServer, isAuthorized, selectLanIpv4Address } from "../src/server.js";
+import {
+	OrchestratorServer,
+	directoryPickerCommandsForPlatform,
+	directoryPickerUnavailableMessage,
+	isAuthorized,
+	normalizePickedDirectory,
+	selectLanIpv4Address,
+} from "../src/server.js";
 import { IssueStore } from "../src/store.js";
 import { renderDashboardHtml } from "../src/ui.js";
 import { branchNameForIssue, commitIssueWorktree, ensureIssueWorkspace } from "../src/workspace.js";
@@ -86,6 +93,43 @@ test("LAN address selection returns first external IPv4 address", () => {
 	assert.equal(selectLanIpv4Address({ en0: [{ address: "10.0.0.5", family: 4, internal: false }] }), "10.0.0.5");
 });
 
+test("directory picker command selection supports desktop platforms", () => {
+	const macos = directoryPickerCommandsForPlatform("darwin");
+	assert.equal(macos.length, 1);
+	assert.equal(macos[0].command, "osascript");
+	assert.match(macos[0].args.join(" "), /choose folder/);
+
+	const windows = directoryPickerCommandsForPlatform("win32");
+	assert.equal(windows.length, 1);
+	assert.equal(windows[0].command, "powershell.exe");
+	assert.ok(windows[0].args.includes("-STA"));
+	assert.match(windows[0].args.join(" "), /FolderBrowserDialog/);
+	assert.deepEqual(windows[0].cancelExitCodes, [1223]);
+
+	const linux = directoryPickerCommandsForPlatform("linux");
+	assert.deepEqual(linux.map((command) => command.command), ["zenity", "kdialog"]);
+	assert.deepEqual(linux[0].args.slice(0, 2), ["--file-selection", "--directory"]);
+	assert.deepEqual(linux[1].args.slice(0, 2), ["--getexistingdirectory", "."]);
+	assert.deepEqual(linux.map((command) => command.cancelExitCodes), [[1], [1]]);
+
+	assert.deepEqual(directoryPickerCommandsForPlatform("freebsd"), []);
+});
+
+test("directory picker normalization trims output and preserves filesystem roots", () => {
+	assert.equal(normalizePickedDirectory("/tmp/project/\n"), "/tmp/project");
+	assert.equal(normalizePickedDirectory("/"), "/");
+	assert.equal(normalizePickedDirectory("C:\\Users\\me\\"), "C:\\Users\\me");
+	assert.equal(normalizePickedDirectory("C:\\"), "C:\\");
+	assert.equal(normalizePickedDirectory("\\\\server\\share\\"), "\\\\server\\share\\");
+	assert.equal(normalizePickedDirectory("\\\\server\\share\\project\\"), "\\\\server\\share\\project");
+	assert.throws(() => normalizePickedDirectory("  \n"), /Directory selection cancelled\./);
+});
+
+test("directory picker unavailable messages are clear", () => {
+	assert.match(directoryPickerUnavailableMessage("linux"), /No supported Linux directory picker was found \(tried zenity or kdialog\)/);
+	assert.match(directoryPickerUnavailableMessage("openbsd"), /Native directory picking is not supported on openbsd/);
+});
+
 test("server module imports before qrcode dependency is installed", async () => {
 	const extensionRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 	const root = await tempDir();
@@ -114,11 +158,14 @@ test("dashboard renderer injects runtime data", async () => {
 	assert.match(html, /id="share-qr"/);
 	assert.match(html, /id="linkedDirectory" name="linkedDirectory" list="linkedDirectorySuggestions"/);
 	assert.match(html, /id="linkedDirectoryQuickSelect"/);
+	assert.match(html, /class="secondary desktop-directory-picker" id="pick-directory"/);
 	assert.match(html, /id="linkedDirectorySuggestions"/);
 	assert.match(html, /function linkedDirectoryChoices\(\)/);
 	assert.match(html, /function populateLinkedDirectoryOptions\(\)/);
 	assert.match(html, /linkedDirectory"\)\.addEventListener\("input"/);
 	assert.match(html, /linkedDirectoryQuickSelect"\)\.addEventListener\("change"/);
+	assert.match(html, /const pickDirectoryButton = document\.getElementById\("pick-directory"\);/);
+	assert.match(html, /style\?\.display === "none"/);
 	assert.match(html, /\/api\/share/);
 	assert.match(html, /\/api\/share\.svg/);
 	assert.match(html, /<div class="brand-mark" aria-label="Pi">π<\/div>/);
@@ -164,7 +211,8 @@ test("dashboard css keeps the desktop board compact and stacks it on mobile", as
 	assert.match(html, /\.app-shell \{[\s\S]*grid-template-rows: auto auto;[\s\S]*align-content: start;[\s\S]*min-height: calc\(100vh - 64px\);[\s\S]*width: 100%;/);
 	assert.doesNotMatch(html, /grid-template-rows: auto minmax\(0, auto\);/);
 	assert.match(html, /\.board \{[\s\S]*overflow-x: auto;[\s\S]*padding: 10px 18px 18px;/);
-	assert.match(html, /@media \(max-width: 640px\) \{[\s\S]*\.board \{[\s\S]*grid-template-columns: 1fr;[\s\S]*overflow-x: visible;[\s\S]*\}[\s\S]*\.lane \{ min-height: 180px; \}/);
+	assert.match(html, /@media \(max-width: 640px\) \{[\s\S]*\.desktop-directory-picker \{ display: none; \}[\s\S]*\.board \{[\s\S]*grid-template-columns: 1fr;[\s\S]*overflow-x: visible;[\s\S]*\}[\s\S]*\.lane \{ min-height: 180px; \}/);
+	assert.match(html, /@media \(hover: none\) and \(pointer: coarse\) \{\s*\.desktop-directory-picker \{ display: none; \}\s*\}/);
 });
 
 test("server renders token-gated dashboard html", async () => {
@@ -202,7 +250,8 @@ test("server renders token-gated dashboard html", async () => {
 		assert.match(html, /\.markdown :not\(pre\) > code \{[\s\S]*overflow-wrap: anywhere;[\s\S]*word-break: break-word;/);
 		assert.match(html, /\.app-shell \{[\s\S]*min-height: calc\(100vh - 64px\);[\s\S]*width: 100%;/);
 		assert.match(html, /\.board \{[\s\S]*align-items: start;[\s\S]*overflow-x: auto;/);
-		assert.match(html, /@media \(max-width: 640px\) \{[\s\S]*\.board \{[\s\S]*grid-template-columns: 1fr;[\s\S]*overflow-x: visible;/);
+		assert.match(html, /@media \(max-width: 640px\) \{[\s\S]*\.desktop-directory-picker \{ display: none; \}[\s\S]*\.board \{[\s\S]*grid-template-columns: 1fr;[\s\S]*overflow-x: visible;/);
+		assert.match(html, /@media \(hover: none\) and \(pointer: coarse\) \{\s*\.desktop-directory-picker \{ display: none; \}\s*\}/);
 		assert.match(html, /\.lane \{[\s\S]*min-height: 430px;[\s\S]*height: fit-content;/);
 		assert.match(html, /\.panel-resize-handle/);
 		assert.match(html, /--create-drawer-default-width: 460px;/);
@@ -218,6 +267,7 @@ test("server renders token-gated dashboard html", async () => {
 		assert.match(html, /Depends on issue/);
 		assert.match(html, /dependencyIssueId/);
 		assert.match(html, /linkedDirectoryQuickSelect/);
+		assert.match(html, /class="secondary desktop-directory-picker" id="pick-directory"/);
 		assert.match(html, /linkedDirectorySuggestions/);
 		assert.match(html, /function linkedDirectoryChoices\(\)/);
 		assert.match(html, /populateLinkedDirectoryOptions\(\);/);

@@ -96,24 +96,124 @@ async function readJsonBody(req) {
 	return JSON.parse(raw);
 }
 
+const DIRECTORY_PICKER_TITLE = "Choose linked directory for Pi Orchestrator";
+const DIRECTORY_PICKER_TIMEOUT_MS = 5 * 60 * 1000;
+const DIRECTORY_PICKER_MAX_BUFFER = 64 * 1024;
+
+const MACOS_DIRECTORY_PICKER_SCRIPT = `POSIX path of (choose folder with prompt "${DIRECTORY_PICKER_TITLE}")`;
+const WINDOWS_DIRECTORY_PICKER_SCRIPT = [
+	"Add-Type -AssemblyName System.Windows.Forms",
+	"$dialog = New-Object System.Windows.Forms.FolderBrowserDialog",
+	`$dialog.Description = '${DIRECTORY_PICKER_TITLE.replaceAll("'", "''")}'`,
+	"$dialog.ShowNewFolderButton = $true",
+	"$result = $dialog.ShowDialog()",
+	"if ($result -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.WriteLine($dialog.SelectedPath) } else { exit 1223 }",
+].join("; ");
+
+function isFilesystemRoot(value) {
+	if (/^[\\/]+$/.test(value)) return true;
+	if (/^[A-Za-z]:[\\/]$/.test(value)) return true;
+	return /^[\\/]{2}[^\\/]+[\\/]+[^\\/]+[\\/]?$/.test(value);
+}
+
+export function normalizePickedDirectory(value) {
+	let selected = String(value || "").trim();
+	if (!selected) throw new Error("Directory selection cancelled.");
+	while (/[\\/]$/.test(selected) && !isFilesystemRoot(selected)) {
+		selected = selected.slice(0, -1);
+	}
+	return selected;
+}
+
+export function directoryPickerCommandsForPlatform(platform) {
+	if (platform === "darwin") {
+		return [
+			{
+				id: "macos-osascript",
+				command: "osascript",
+				args: ["-e", MACOS_DIRECTORY_PICKER_SCRIPT],
+				cancelMessagePattern: /User canceled/i,
+			},
+		];
+	}
+	if (platform === "win32") {
+		return [
+			{
+				id: "windows-powershell",
+				command: "powershell.exe",
+				args: ["-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-Command", WINDOWS_DIRECTORY_PICKER_SCRIPT],
+				cancelExitCodes: [1223],
+			},
+		];
+	}
+	if (platform === "linux") {
+		return [
+			{
+				id: "linux-zenity",
+				command: "zenity",
+				args: ["--file-selection", "--directory", `--title=${DIRECTORY_PICKER_TITLE}`],
+				cancelExitCodes: [1],
+			},
+			{
+				id: "linux-kdialog",
+				command: "kdialog",
+				args: ["--getexistingdirectory", ".", DIRECTORY_PICKER_TITLE],
+				cancelExitCodes: [1],
+			},
+		];
+	}
+	return [];
+}
+
+export function directoryPickerUnavailableMessage(platform, commands = directoryPickerCommandsForPlatform(platform)) {
+	if (platform === "linux") {
+		const toolNames = commands.length ? commands.map((command) => command.command).join(" or ") : "zenity or kdialog";
+		return `No supported Linux directory picker was found (tried ${toolNames}). Paste an absolute path instead.`;
+	}
+	if (commands.length) {
+		const toolNames = commands.map((command) => command.command).join(" or ");
+		return `No supported directory picker command was found for ${platform} (tried ${toolNames}). Paste an absolute path instead.`;
+	}
+	return `Native directory picking is not supported on ${platform}. Paste an absolute path instead.`;
+}
+
+function isMissingDirectoryPickerCommand(error) {
+	return error && typeof error === "object" && error.code === "ENOENT";
+}
+
+function isDirectoryPickerCancel(error, command) {
+	if (error instanceof Error && error.message === "Directory selection cancelled.") return true;
+	const exitCode = error && typeof error === "object" ? error.code : null;
+	if (command.cancelExitCodes?.includes(exitCode)) return true;
+	const message = error instanceof Error ? error.message : String(error);
+	return !!command.cancelMessagePattern?.test(message);
+}
+
 async function chooseDirectory() {
-	if (process.platform !== "darwin") {
-		throw new Error("Native directory picking currently requires macOS. Paste an absolute path instead.");
+	const platform = process.platform;
+	const commands = directoryPickerCommandsForPlatform(platform);
+	if (!commands.length) throw new Error(directoryPickerUnavailableMessage(platform, commands));
+
+	let missingCommandCount = 0;
+	for (const command of commands) {
+		try {
+			const { stdout } = await execFileAsync(command.command, command.args, {
+				timeout: DIRECTORY_PICKER_TIMEOUT_MS,
+				maxBuffer: DIRECTORY_PICKER_MAX_BUFFER,
+			});
+			return normalizePickedDirectory(stdout);
+		} catch (error) {
+			if (isMissingDirectoryPickerCommand(error)) {
+				missingCommandCount += 1;
+				continue;
+			}
+			if (isDirectoryPickerCancel(error, command)) throw new Error("Directory selection cancelled.");
+			throw error;
+		}
 	}
-	const script = 'POSIX path of (choose folder with prompt "Choose linked directory for Pi Orchestrator")';
-	try {
-		const { stdout } = await execFileAsync("osascript", ["-e", script], {
-			timeout: 5 * 60 * 1000,
-			maxBuffer: 64 * 1024,
-		});
-		const selected = stdout.trim();
-		if (!selected) throw new Error("No directory selected.");
-		return selected.length > 1 && selected.endsWith("/") ? selected.slice(0, -1) : selected;
-	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		if (/User canceled/i.test(message)) throw new Error("Directory selection cancelled.");
-		throw error;
-	}
+
+	if (missingCommandCount === commands.length) throw new Error(directoryPickerUnavailableMessage(platform, commands));
+	throw new Error("Directory picker failed. Paste an absolute path instead.");
 }
 
 function sendJson(res, status, body) {
