@@ -60,6 +60,10 @@ test("dashboard renderer injects runtime data", async () => {
 	assert.match(html, /const THINKING_LEVELS = \["low","medium","high","xhigh"\];/);
 	assert.match(html, /const DEFAULT_PROFILE_ID = "default";/);
 	assert.match(html, /id="create-drawer"/);
+	assert.match(html, /const minimizedIssueIds = new Set\(\);/);
+	assert.match(html, /function minimizedTitle\(title\)/);
+	assert.match(html, /data-minimize-toggle/);
+	assert.match(html, /aria-expanded='/);
 	assert.doesNotMatch(html, /__(TOKEN|LANES|LANE|ROLE_DEFAULTS|THINKING_LEVELS|DEFAULT_PROFILE_ID)_JSON__/);
 });
 
@@ -108,6 +112,11 @@ test("server renders token-gated dashboard html", async () => {
 		assert.match(html, /Request Changes/);
 		assert.match(html, /Depends on issue/);
 		assert.match(html, /dependencyIssueId/);
+		assert.match(html, /minimizedIssueIds\.has\(id\)/);
+		assert.match(html, /escapeHtml\(minimizedTitle\(issue\.title\)\)/);
+		assert.match(html, /event\.target\.closest\("\[data-minimize-toggle\]"\)/);
+		assert.match(html, /Minimize ticket/);
+		assert.match(html, /Restore ticket/);
 		const formElCapture = html.indexOf("const formEl = event.currentTarget;");
 		const createApiCall = html.indexOf('await api("/api/issues"');
 		assert.ok(formElCapture !== -1, "issue form submit handler captures currentTarget before async work");
