@@ -22,6 +22,22 @@ function getLastAssistantTextFromMessages(messages) {
 	return "";
 }
 
+const STREAMING_EVENT_TYPES = new Set(["message_update", "tool_execution_update"]);
+const MAX_RUN_EVENT_BYTES = 64 * 1024;
+
+function serializeRunEvent(event) {
+	if (STREAMING_EVENT_TYPES.has(event?.type)) return null;
+	const payload = { ...event, at: nowIso() };
+	const serialized = JSON.stringify(payload);
+	if (Buffer.byteLength(serialized, "utf8") <= MAX_RUN_EVENT_BYTES) return `${serialized}\n`;
+	return `${JSON.stringify({
+		type: payload.type || "oversized_event",
+		at: payload.at,
+		truncated: true,
+		originalBytes: Buffer.byteLength(serialized, "utf8"),
+	})}\n`;
+}
+
 export class RpcAgentRunner {
 	constructor({ store, command = "pi", timeoutMs = 60 * 60 * 1000, idleTimeoutMs = 10 * 60 * 1000 } = {}) {
 		this.store = store;
@@ -85,7 +101,8 @@ export class RpcAgentRunner {
 		const pending = new Map();
 
 		const appendRaw = async (event) => {
-			await fsp.appendFile(runLogPath, `${JSON.stringify({ ...event, at: nowIso() })}\n`, "utf-8");
+			const line = serializeRunEvent(event);
+			if (line) await fsp.appendFile(runLogPath, line, "utf-8");
 		};
 
 		const send = (command) => {

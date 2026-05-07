@@ -933,6 +933,59 @@ test("rpc runner rejects a process that exits before agent_end", async () => {
 	assert.match(log, /"type":"process_exit"/);
 });
 
+test("rpc runner does not persist streaming message deltas", async () => {
+	const root = await tempDir();
+	const linked = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const issue = await store.createIssue({
+		title: "Compact run log",
+		spec: "Avoid large stream logs.",
+		linkedDirectory: linked,
+	});
+	const fakeRpc = path.join(root, "fake-rpc.mjs");
+	await fsp.writeFile(
+		fakeRpc,
+		[
+			"#!/usr/bin/env node",
+			"let buffer = '';",
+			"const emit = (event) => new Promise((resolve) => process.stdout.write(JSON.stringify(event) + '\\n', resolve));",
+			"process.stdin.setEncoding('utf8');",
+			"process.stdin.on('data', async (chunk) => {",
+			"  buffer += chunk;",
+			"  const index = buffer.indexOf('\\n');",
+			"  if (index === -1) return;",
+			"  const command = JSON.parse(buffer.slice(0, index));",
+			"  await emit({ id: command.id, type: 'response', command: command.type, success: true });",
+			"  await emit({ type: 'message_update', assistantMessageEvent: { type: 'thinking_delta', delta: 'x'.repeat(1024 * 1024) } });",
+			"  const message = { role: 'assistant', content: [{ type: 'text', text: 'finished' }] };",
+			"  await emit({ type: 'message_end', message });",
+			"  await emit({ type: 'agent_end', messages: [message] });",
+			"  process.exit(0);",
+			"});",
+			"",
+		].join("\n"),
+		"utf-8",
+	);
+	await fsp.chmod(fakeRpc, 0o755);
+
+	const runner = new RpcAgentRunner({ store, command: fakeRpc, timeoutMs: 2000, idleTimeoutMs: 0 });
+	const result = await runner.run({
+		issueId: issue.metadata.id,
+		role: "worker",
+		cwd: linked,
+		prompt: "hello",
+	});
+
+	const runs = await fsp.readdir(path.join(root, "issues", issue.metadata.id, "runs"));
+	const logPath = path.join(root, "issues", issue.metadata.id, "runs", runs[0]);
+	const log = await fsp.readFile(logPath, "utf-8");
+	const stats = await fsp.stat(logPath);
+	assert.equal(result.text, "finished");
+	assert.doesNotMatch(log, /message_update/);
+	assert.ok(stats.size < 16 * 1024, `run log should stay compact, got ${stats.size} bytes`);
+});
+
 test("scheduler startup recovers interrupted active runs", async () => {
 	const root = await tempDir();
 	const linked = await tempDir();
