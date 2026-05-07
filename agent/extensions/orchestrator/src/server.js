@@ -1,0 +1,1274 @@
+import * as http from "node:http";
+import { execFile } from "node:child_process";
+import { URL } from "node:url";
+import { promisify } from "node:util";
+import { DEFAULT_CONFIG, LANE, LANES, ROLE_DEFAULTS, THINKING_LEVELS } from "./constants.js";
+
+const execFileAsync = promisify(execFile);
+
+export function isAuthorized(reqUrl, headers, token) {
+	const url = new URL(reqUrl, "http://127.0.0.1");
+	return (
+		url.searchParams.get("token") === token ||
+		headers["x-orchestrator-token"] === token ||
+		headers.authorization === `Bearer ${token}`
+	);
+}
+
+async function readJsonBody(req) {
+	let raw = "";
+	for await (const chunk of req) {
+		raw += chunk;
+		if (raw.length > 1024 * 1024) throw new Error("Request body too large.");
+	}
+	if (!raw.trim()) return {};
+	return JSON.parse(raw);
+}
+
+async function chooseDirectory() {
+	if (process.platform !== "darwin") {
+		throw new Error("Native directory picking currently requires macOS. Paste an absolute path instead.");
+	}
+	const script = 'POSIX path of (choose folder with prompt "Choose linked directory for Pi Orchestrator")';
+	try {
+		const { stdout } = await execFileAsync("osascript", ["-e", script], {
+			timeout: 5 * 60 * 1000,
+			maxBuffer: 64 * 1024,
+		});
+		const selected = stdout.trim();
+		if (!selected) throw new Error("No directory selected.");
+		return selected.length > 1 && selected.endsWith("/") ? selected.slice(0, -1) : selected;
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		if (/User canceled/i.test(message)) throw new Error("Directory selection cancelled.");
+		throw error;
+	}
+}
+
+function sendJson(res, status, body) {
+	res.writeHead(status, {
+		"content-type": "application/json; charset=utf-8",
+		"cache-control": "no-store",
+	});
+	res.end(`${JSON.stringify(body)}\n`);
+}
+
+function sendText(res, status, text, contentType = "text/plain; charset=utf-8") {
+	res.writeHead(status, {
+		"content-type": contentType,
+		"cache-control": "no-store",
+	});
+	res.end(text);
+}
+
+export class OrchestratorServer {
+	constructor({ store, token, actions, config = {} }) {
+		this.store = store;
+		this.token = token;
+		this.actions = actions;
+		this.config = { ...DEFAULT_CONFIG, ...config };
+		this.server = null;
+		this.url = null;
+		this.clients = new Set();
+		this.unsubscribe = null;
+	}
+
+	async start() {
+		if (this.server) return this.url;
+		this.server = http.createServer((req, res) => {
+			void this.handle(req, res).catch((error) => {
+				sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
+			});
+		});
+		this.unsubscribe = this.store.onChange((event) => this.broadcast({ type: "store", event }));
+		await new Promise((resolve, reject) => {
+			this.server.once("error", reject);
+			this.server.listen(this.config.port, this.config.host, () => {
+				this.server.off("error", reject);
+				resolve();
+			});
+		});
+		const address = this.server.address();
+		const port = typeof address === "object" && address ? address.port : this.config.port;
+		this.url = `http://${this.config.host}:${port}/?token=${encodeURIComponent(this.token)}`;
+		return this.url;
+	}
+
+	async stop() {
+		if (this.unsubscribe) this.unsubscribe();
+		this.unsubscribe = null;
+		for (const client of this.clients) client.end();
+		this.clients.clear();
+		if (!this.server) return;
+		await new Promise((resolve) => this.server.close(resolve));
+		this.server = null;
+	}
+
+	broadcast(event) {
+		const payload = `data: ${JSON.stringify(event)}\n\n`;
+		for (const client of this.clients) client.write(payload);
+	}
+
+	async handle(req, res) {
+		const url = new URL(req.url || "/", `http://${req.headers.host || "127.0.0.1"}`);
+		const pathname = url.pathname;
+
+		if (pathname === "/" && req.method === "GET") {
+			if (!isAuthorized(req.url || "/", req.headers, this.token)) {
+				return sendText(res, 401, "Missing or invalid orchestrator token.");
+			}
+			return sendText(res, 200, renderHtml(this.token), "text/html; charset=utf-8");
+		}
+
+		if (!pathname.startsWith("/api/")) {
+			return sendText(res, 404, "Not found.");
+		}
+		if (!isAuthorized(req.url || "/", req.headers, this.token)) {
+			return sendJson(res, 401, { error: "Unauthorized." });
+		}
+
+		if (pathname === "/api/state" && req.method === "GET") {
+			return sendJson(res, 200, await this.store.getBoardState());
+		}
+
+		if (pathname === "/api/events" && req.method === "GET") {
+			res.writeHead(200, {
+				"content-type": "text/event-stream",
+				"cache-control": "no-store",
+				connection: "keep-alive",
+			});
+			res.write("event: ready\ndata: {}\n\n");
+			this.clients.add(res);
+			req.on("close", () => this.clients.delete(res));
+			return;
+		}
+
+		if (pathname === "/api/pick-directory" && req.method === "POST") {
+			try {
+				return sendJson(res, 200, { linkedDirectory: await chooseDirectory() });
+			} catch (error) {
+				return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+			}
+		}
+
+		if (pathname === "/api/issues" && req.method === "POST") {
+			const body = await readJsonBody(req);
+			const issue = await this.actions.createIssue(body);
+			return sendJson(res, 201, issue);
+		}
+
+		const match = pathname.match(/^\/api\/issues\/([^/]+)\/([^/]+)$/);
+		if (!match || req.method !== "POST") return sendJson(res, 404, { error: "Not found." });
+
+		const id = decodeURIComponent(match[1]);
+		const action = match[2];
+		const body = await readJsonBody(req);
+		if (action === "comment") return sendJson(res, 200, await this.actions.comment(id, body));
+		if (action === "approve-plan") return sendJson(res, 200, await this.actions.approvePlan(id));
+		if (action === "request-plan-changes") return sendJson(res, 200, await this.actions.requestPlanChanges(id, body));
+		if (action === "approve-review") return sendJson(res, 200, await this.actions.approveReview(id));
+		if (action === "approve-review-merge") return sendJson(res, 200, await this.actions.approveReviewAndMerge(id));
+		if (action === "request-review-changes") return sendJson(res, 200, await this.actions.requestReviewChanges(id, body));
+		return sendJson(res, 404, { error: "Not found." });
+	}
+}
+
+function renderHtml(token) {
+	const lanesJson = JSON.stringify(LANES);
+	const laneJson = JSON.stringify(LANE);
+	const roleDefaultsJson = JSON.stringify(ROLE_DEFAULTS);
+	const thinkingLevelsJson = JSON.stringify(THINKING_LEVELS);
+	return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pi Orchestrator</title>
+<style>
+:root {
+  color-scheme: dark;
+  --bg: #141414;
+  --bg-grid: rgba(250, 189, 47, .035);
+  --surface: #1d2021;
+  --surface-2: #242424;
+  --surface-3: #2d2a26;
+  --field: #111111;
+  --line: #3c3836;
+  --line-strong: #665c54;
+  --text: #fbf1c7;
+  --text-soft: #ebdbb2;
+  --muted: #a89984;
+  --dim: #7c6f64;
+  --accent: #8ec07c;
+  --accent-strong: #b8bb26;
+  --blue: #83a598;
+  --warn: #fabd2f;
+  --bad: #fb4934;
+  --bad-bg: #3c1f1e;
+  --ok-bg: #263319;
+  --shadow: rgba(0, 0, 0, .42);
+  --radius: 8px;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+    --bg: #f2e5bc;
+    --bg-grid: rgba(146, 131, 116, .16);
+    --surface: #fbf1c7;
+    --surface-2: #f4e8be;
+    --surface-3: #ebdbb2;
+    --field: #fff7d6;
+    --line: #d5c4a1;
+    --line-strong: #a89984;
+    --text: #282828;
+    --text-soft: #3c3836;
+    --muted: #7c6f64;
+    --dim: #928374;
+    --accent: #427b58;
+    --accent-strong: #79740e;
+    --blue: #076678;
+    --warn: #b57614;
+    --bad: #9d0006;
+    --bad-bg: #f2d0c4;
+    --ok-bg: #dfe6bf;
+    --shadow: rgba(60, 56, 54, .18);
+  }
+}
+* { box-sizing: border-box; }
+html, body { min-height: 100%; }
+body {
+  margin: 0;
+  width: 100vw;
+  font-family: "Avenir Next", "Gill Sans", "Helvetica Neue", ui-sans-serif, sans-serif;
+  background:
+    linear-gradient(90deg, var(--bg-grid) 1px, transparent 1px),
+    linear-gradient(var(--bg-grid) 1px, transparent 1px),
+    var(--bg);
+  background-size: 28px 28px;
+  color: var(--text);
+  overflow: hidden;
+}
+button, input, textarea, select {
+  font: inherit;
+}
+button {
+  background: var(--accent);
+  color: var(--bg);
+  border: 1px solid transparent;
+  border-radius: 7px;
+  padding: 9px 12px;
+  cursor: pointer;
+  font-weight: 700;
+}
+button.secondary { background: var(--surface-2); color: var(--text); border-color: var(--line); }
+button.ghost { background: transparent; color: var(--text-soft); border-color: var(--line); }
+button.warn { background: var(--warn); color: #211800; }
+button.bad { background: var(--bad); color: #210000; }
+button:disabled { opacity: .5; cursor: not-allowed; }
+button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible, .issue-card:focus-visible {
+  outline: 2px solid var(--warn);
+  outline-offset: 2px;
+}
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  height: 64px;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--line);
+  background: color-mix(in srgb, var(--surface) 92%, transparent);
+  box-shadow: 0 18px 40px var(--shadow);
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  width: 100vw;
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.brand-mark {
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--surface-3);
+  color: var(--warn);
+  font-family: "JetBrains Mono", "SFMono-Regular", ui-monospace, monospace;
+  font-weight: 800;
+}
+h1 { margin: 0; font-size: 20px; letter-spacing: 0; line-height: 1; }
+.status { color: var(--muted); font-size: 12px; margin-top: 4px; overflow-wrap: anywhere; }
+.top-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 0 0 auto;
+  position: fixed;
+  top: 11px;
+  right: 18px;
+  z-index: 25;
+}
+.app-shell {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  height: calc(100vh - 64px);
+  width: 100vw;
+  min-width: 0;
+  overflow: hidden;
+}
+.command-bar {
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) minmax(320px, 520px);
+  gap: 12px;
+  align-items: end;
+  padding: 14px 18px 10px;
+  border-bottom: 1px solid var(--line);
+  background: color-mix(in srgb, var(--bg) 84%, transparent);
+}
+.metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+.metric {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  padding: 8px 10px;
+  min-width: 86px;
+}
+.metric-value {
+  display: block;
+  color: var(--text);
+  font-size: 18px;
+  font-weight: 800;
+  line-height: 1;
+}
+.metric-label {
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+.filters {
+  display: grid;
+  grid-template-columns: minmax(160px, 1fr) minmax(120px, 160px) minmax(120px, 160px);
+  gap: 8px;
+}
+.data-root {
+  grid-column: 1 / -1;
+  color: var(--dim);
+  font-family: "JetBrains Mono", "SFMono-Regular", ui-monospace, monospace;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+label { display: block; color: var(--muted); font-size: 12px; margin: 12px 0 6px; }
+input, textarea, select {
+  width: 100%;
+  border: 1px solid var(--line);
+  background: var(--field);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 9px 10px;
+}
+textarea { min-height: 150px; resize: vertical; }
+.picker-row { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: end; }
+fieldset {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 10px;
+  margin: 14px 0 0;
+}
+legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
+.role-grid { display: grid; grid-template-columns: 92px 1fr 112px; gap: 8px; align-items: end; margin-top: 8px; }
+.role-name { color: var(--muted); font-size: 12px; padding-bottom: 10px; }
+.board {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(200px, 1fr));
+  gap: 12px;
+  overflow: auto;
+  padding: 14px 18px 18px;
+  min-height: 0;
+}
+.lane {
+  background: color-mix(in srgb, var(--surface) 82%, transparent);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  min-height: 430px;
+  padding: 10px;
+  box-shadow: 0 16px 30px rgba(0, 0, 0, .12);
+}
+.lane h2 {
+  margin: 0 0 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--text-soft);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+}
+.lane-count { color: var(--muted); font-family: "JetBrains Mono", "SFMono-Regular", ui-monospace, monospace; }
+.lane-empty {
+  border: 1px dashed var(--line);
+  border-radius: var(--radius);
+  color: var(--dim);
+  padding: 16px;
+  font-size: 12px;
+  text-align: center;
+}
+.issue-card {
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  border-radius: var(--radius);
+  padding: 11px;
+  margin-bottom: 8px;
+  cursor: pointer;
+  min-height: 122px;
+  transition: border-color .15s ease, transform .15s ease, background .15s ease;
+}
+.issue-card:hover, .issue-card.selected {
+  border-color: var(--accent);
+  background: var(--surface-3);
+  transform: translateY(-1px);
+}
+.card-head { display: flex; align-items: start; justify-content: space-between; gap: 8px; }
+.card-title { font-size: 14px; font-weight: 800; line-height: 1.25; margin-bottom: 6px; overflow-wrap: anywhere; }
+.meta, .small { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.mono { font-family: "JetBrains Mono", "SFMono-Regular", ui-monospace, monospace; }
+.card-path { margin-top: 7px; color: var(--dim); font-size: 11px; overflow-wrap: anywhere; }
+.card-badges, .inspector-badges { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
+.badge {
+  display: inline-block;
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: var(--surface-3);
+  color: var(--muted);
+  font-size: 11px;
+  border: 1px solid var(--line);
+}
+.badge.active { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 55%, var(--line)); }
+.badge.review { color: var(--blue); border-color: color-mix(in srgb, var(--blue) 55%, var(--line)); }
+.badge.done { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); }
+.badge.error { background: var(--bad-bg); color: var(--bad); border-color: color-mix(in srgb, var(--bad) 55%, var(--line)); }
+.inspector {
+  position: fixed;
+  top: 64px;
+  right: 0;
+  bottom: 0;
+  width: min(520px, 100vw);
+  border-left: 1px solid var(--line);
+  background: var(--surface);
+  box-shadow: -22px 0 44px var(--shadow);
+  transform: translateX(102%);
+  transition: transform .18s ease;
+  z-index: 30;
+  overflow: auto;
+  padding: 16px;
+}
+.inspector.open { transform: translateX(0); }
+.detail-header { display: flex; align-items: start; justify-content: space-between; gap: 12px; }
+.detail-header h2 { margin: 0 0 6px; overflow-wrap: anywhere; line-height: 1.12; }
+.status-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin: 12px 0;
+}
+.status-cell {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  padding: 9px;
+  min-width: 0;
+}
+.status-cell span { display: block; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+.status-cell strong { display: block; margin-top: 4px; color: var(--text); overflow-wrap: anywhere; }
+.actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+.tabs {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--line);
+  margin: 14px -16px 0;
+  padding: 0 16px;
+}
+.tab {
+  background: transparent;
+  border: 1px solid transparent;
+  border-bottom: 0;
+  color: var(--muted);
+  padding: 9px 10px;
+  border-radius: 7px 7px 0 0;
+  white-space: nowrap;
+}
+.tab.active {
+  color: var(--text);
+  background: var(--surface-2);
+  border-color: var(--line);
+}
+.tab-panel { padding-top: 14px; }
+.report-shell {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  padding: 14px;
+}
+.report-kicker {
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  margin-bottom: 8px;
+}
+.markdown h1, .markdown h2, .markdown h3, .markdown h4 {
+  margin: 18px 0 8px;
+  line-height: 1.15;
+}
+.markdown h1:first-child, .markdown h2:first-child, .markdown h3:first-child { margin-top: 0; }
+.markdown h1 { font-size: 22px; color: var(--warn); }
+.markdown h2 { font-size: 17px; color: var(--text); }
+.markdown h3 { font-size: 14px; color: var(--blue); text-transform: uppercase; letter-spacing: .04em; }
+.markdown p { color: var(--text-soft); line-height: 1.55; margin: 9px 0; }
+.markdown ul { margin: 9px 0 12px; padding-left: 20px; color: var(--text-soft); }
+.markdown li { margin: 5px 0; line-height: 1.45; }
+.markdown blockquote {
+  margin: 10px 0;
+  border-left: 3px solid var(--accent);
+  padding: 8px 10px;
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  color: var(--text-soft);
+}
+.markdown code, pre {
+  font-family: "JetBrains Mono", "SFMono-Regular", ui-monospace, monospace;
+}
+.markdown code {
+  background: var(--field);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 1px 4px;
+}
+.markdown pre, pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: var(--field);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 10px;
+  max-height: 360px;
+  overflow: auto;
+  color: var(--text-soft);
+}
+.markdown hr { border: 0; border-top: 1px solid var(--line); margin: 14px 0; }
+.timeline, .comment-list { display: grid; gap: 8px; }
+.timeline-item, .comment-item {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  padding: 10px;
+}
+.timeline-type, .comment-meta {
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+.timeline-body, .comment-body { margin-top: 5px; color: var(--text-soft); overflow-wrap: anywhere; }
+.drawer { display: none; }
+.drawer.open { display: block; }
+.drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  border: 0;
+  border-radius: 0;
+  background: rgba(0, 0, 0, .42);
+  cursor: default;
+}
+.drawer-panel {
+  position: fixed;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  width: min(460px, 100vw);
+  z-index: 41;
+  overflow: auto;
+  border-right: 1px solid var(--line);
+  background: var(--surface);
+  box-shadow: 22px 0 44px var(--shadow);
+  padding: 16px;
+}
+.drawer-head {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.drawer-head h2 { margin: 0; }
+.empty-state {
+  border: 1px dashed var(--line);
+  border-radius: var(--radius);
+  padding: 28px;
+  color: var(--muted);
+  text-align: center;
+}
+@media (max-width: 1100px) {
+  body { overflow: hidden; }
+  .command-bar { grid-template-columns: 1fr; }
+  .filters { grid-template-columns: 1fr; }
+  .board { grid-template-columns: repeat(6, minmax(230px, 78vw)); }
+  .status-grid { grid-template-columns: 1fr; }
+}
+@media (max-width: 640px) {
+  .topbar { padding: 10px 12px; }
+  .brand-mark { display: none; }
+  h1 { font-size: 18px; }
+  .top-actions {
+    gap: 6px;
+    top: 10px;
+    right: auto;
+    left: min(270px, calc(100vw - 118px));
+  }
+  button { padding: 8px 10px; }
+  .command-bar { padding: 12px; }
+  .board { padding: 12px; grid-template-columns: repeat(6, minmax(250px, 86vw)); }
+  .inspector { top: 0; width: 100vw; z-index: 50; }
+}
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <div class="brand-mark">PI</div>
+    <div>
+      <h1>Orchestrator</h1>
+      <div class="status" id="status">Connecting</div>
+    </div>
+  </div>
+  <div class="top-actions">
+    <button type="button" id="open-create">New Issue</button>
+  </div>
+</header>
+<main class="app-shell">
+  <section class="command-bar" aria-label="Board controls">
+    <div>
+      <div class="metrics" id="metrics"></div>
+      <div class="data-root" id="data-root"></div>
+    </div>
+    <div class="filters">
+      <input id="search" type="search" placeholder="Search issues">
+      <select id="lane-filter" aria-label="Filter by lane"></select>
+      <select id="state-filter" aria-label="Filter by state">
+        <option value="all">All states</option>
+        <option value="active">Active</option>
+        <option value="review">Needs review</option>
+        <option value="blocked">Blocked</option>
+        <option value="completed">Completed</option>
+      </select>
+    </div>
+  </section>
+  <section class="board" id="board" aria-label="Issue lanes"></section>
+</main>
+<aside class="inspector" id="detail" aria-label="Issue inspector"></aside>
+<div class="drawer" id="create-drawer" aria-hidden="true">
+  <button type="button" class="drawer-backdrop" id="drawer-backdrop" aria-label="Close create issue"></button>
+  <section class="drawer-panel" aria-label="Create issue">
+    <div class="drawer-head">
+      <h2>Create Issue</h2>
+      <button type="button" class="secondary" id="close-create">Close</button>
+    </div>
+    <form id="issue-form">
+      <label for="title">Title</label>
+      <input id="title" name="title" required>
+      <label for="linkedDirectory">Linked directory</label>
+      <div class="picker-row">
+        <input id="linkedDirectory" name="linkedDirectory" placeholder="/absolute/path/to/project" required>
+        <button type="button" class="secondary" id="pick-directory">Choose</button>
+      </div>
+      <label for="spec">Spec</label>
+      <textarea id="spec" name="spec" required></textarea>
+      <fieldset>
+        <legend>Agent settings</legend>
+        <div class="role-grid">
+          <div class="role-name">Planner</div>
+          <div><label for="plannerModel">Model</label><input id="plannerModel" name="plannerModel" list="modelSuggestions"></div>
+          <div><label for="plannerThinking">Thinking</label><select id="plannerThinking" name="plannerThinking"></select></div>
+        </div>
+        <div class="role-grid">
+          <div class="role-name">Worker</div>
+          <div><label for="workerModel">Model</label><input id="workerModel" name="workerModel" list="modelSuggestions"></div>
+          <div><label for="workerThinking">Thinking</label><select id="workerThinking" name="workerThinking"></select></div>
+        </div>
+        <div class="role-grid">
+          <div class="role-name">Reviewer</div>
+          <div><label for="reviewerModel">Model</label><input id="reviewerModel" name="reviewerModel" list="modelSuggestions"></div>
+          <div><label for="reviewerThinking">Thinking</label><select id="reviewerThinking" name="reviewerThinking"></select></div>
+        </div>
+        <datalist id="modelSuggestions"></datalist>
+      </fieldset>
+      <div class="actions"><button type="submit">Create</button></div>
+    </form>
+  </section>
+</div>
+<script>
+const TOKEN = ${JSON.stringify(token)};
+const LANES = ${lanesJson};
+const LANE = ${laneJson};
+const ROLE_DEFAULTS = ${roleDefaultsJson};
+const THINKING_LEVELS = ${thinkingLevelsJson};
+let state = { issues: [], lanes: {} };
+let selectedId = null;
+let detailTab = "report";
+let filters = { query: "", lane: "all", state: "all" };
+
+function api(path, options = {}) {
+  return fetch(path + (path.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(TOKEN), {
+    ...options,
+    headers: {
+      "content-type": "application/json",
+      "x-orchestrator-token": TOKEN,
+      ...(options.headers || {})
+    }
+  }).then(async (res) => {
+    const text = await res.text();
+    const data = text ? JSON.parse(text) : {};
+    if (!res.ok) throw new Error(data.error || res.statusText);
+    return data;
+  });
+}
+
+function issueById(id) {
+  return state.issues.find((issue) => issue.id === id);
+}
+
+function isActive(issue) {
+  return !!(issue.automation && (issue.automation.activeRole || issue.automation.activeRunId));
+}
+
+function isBlocked(issue) {
+  return !!(issue.automation && (issue.automation.paused || issue.automation.error));
+}
+
+function needsReview(issue) {
+  return issue.lane === LANE.PLAN_REVIEW || issue.lane === LANE.IN_REVIEW;
+}
+
+function issueState(issue) {
+  if (isBlocked(issue)) return "blocked";
+  if (isActive(issue)) return "active";
+  if (needsReview(issue)) return "review";
+  if (issue.lane === LANE.COMPLETED) return "completed";
+  return "queued";
+}
+
+function stateLabel(issue) {
+  const stateName = issueState(issue);
+  if (stateName === "active") return "active " + (issue.automation.activeRole || "run");
+  if (stateName === "blocked") return "blocked";
+  if (issue.lane === LANE.PLAN_REVIEW) return "plan review";
+  if (issue.lane === LANE.IN_REVIEW) return "review";
+  if (stateName === "completed") return "completed";
+  return "queued";
+}
+
+function compactPath(value) {
+  const text = String(value || "");
+  const parts = text.split("/").filter(Boolean);
+  if (parts.length <= 4) return text;
+  return ".../" + parts.slice(-3).join("/");
+}
+
+function shortId(value) {
+  const text = String(value || "");
+  if (text.length <= 32) return text;
+  return text.slice(0, 14) + "..." + text.slice(-10);
+}
+
+function formatDate(value) {
+  if (!value) return "unknown";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return date.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+
+function matchingIssuesForLane(lane) {
+  const ids = state.lanes[lane] || [];
+  return ids.map(issueById).filter(Boolean).filter((issue) => {
+    if (filters.lane !== "all" && issue.lane !== filters.lane) return false;
+    if (filters.state !== "all" && issueState(issue) !== filters.state) return false;
+    const query = filters.query.trim().toLowerCase();
+    if (!query) return true;
+    const haystack = [
+      issue.title,
+      issue.id,
+      issue.linkedDirectory,
+      issue.git && issue.git.branchName,
+      issue.workspace && issue.workspace.path,
+      issue.automation && issue.automation.error,
+    ].filter(Boolean).join(" ").toLowerCase();
+    return haystack.includes(query);
+  });
+}
+
+function metric(label, value, className) {
+  return "<div class='metric " + (className || "") + "'><span class='metric-value'>" + escapeHtml(value) + "</span><span class='metric-label'>" + escapeHtml(label) + "</span></div>";
+}
+
+function renderMetrics() {
+  const issues = state.issues || [];
+  const active = issues.filter(isActive).length;
+  const blocked = issues.filter(isBlocked).length;
+  const review = issues.filter(needsReview).length;
+  const completed = issues.filter((issue) => issue.lane === LANE.COMPLETED).length;
+  document.getElementById("metrics").innerHTML =
+    metric("Issues", issues.length) +
+    metric("Active", active) +
+    metric("Review", review) +
+    metric("Blocked", blocked) +
+    metric("Done", completed);
+  document.getElementById("data-root").textContent = state.dataRoot ? "Data: " + state.dataRoot : "";
+  document.getElementById("status").textContent = issues.length + " issue" + (issues.length === 1 ? "" : "s");
+}
+
+function setDefaultAgentSettings() {
+  const suggestions = Array.from(new Set(Object.values(ROLE_DEFAULTS).map((config) => config.model).filter(Boolean)));
+  document.getElementById("modelSuggestions").innerHTML = suggestions.map((model) => "<option value='" + escapeHtml(model) + "'>").join("");
+  for (const role of ["planner", "worker", "reviewer"]) {
+    const defaults = ROLE_DEFAULTS[role] || {};
+    const model = document.getElementById(role + "Model");
+    const thinking = document.getElementById(role + "Thinking");
+    model.value = defaults.model || "";
+    thinking.innerHTML = THINKING_LEVELS.map((level) => "<option value='" + escapeHtml(level) + "'>" + escapeHtml(level) + "</option>").join("");
+    thinking.value = defaults.thinking || "medium";
+  }
+}
+
+function readAgentSettings(form) {
+  return {
+    planner: { model: form.get("plannerModel"), thinking: form.get("plannerThinking") },
+    worker: { model: form.get("workerModel"), thinking: form.get("workerThinking") },
+    reviewer: { model: form.get("reviewerModel"), thinking: form.get("reviewerThinking") }
+  };
+}
+
+function openCreateDrawer() {
+  const drawer = document.getElementById("create-drawer");
+  drawer.classList.add("open");
+  drawer.setAttribute("aria-hidden", "false");
+  setTimeout(() => document.getElementById("title").focus(), 0);
+}
+
+function closeCreateDrawer() {
+  const drawer = document.getElementById("create-drawer");
+  drawer.classList.remove("open");
+  drawer.setAttribute("aria-hidden", "true");
+}
+
+function renderBoard() {
+  renderMetrics();
+  const board = document.getElementById("board");
+  board.innerHTML = "";
+  for (const lane of LANES) {
+    if (filters.lane !== "all" && filters.lane !== lane) continue;
+    const laneEl = document.createElement("section");
+    laneEl.className = "lane";
+    const allIds = state.lanes[lane] || [];
+    const issues = matchingIssuesForLane(lane);
+    laneEl.innerHTML = "<h2><span>" + escapeHtml(lane) + "</span><span class='lane-count'>" + issues.length + "/" + allIds.length + "</span></h2>";
+    if (issues.length === 0) {
+      laneEl.innerHTML += "<div class='lane-empty'>No matching issues</div>";
+    }
+    for (const issue of issues) {
+      const card = document.createElement("article");
+      const id = issue.id;
+      card.className = "issue-card " + issueState(issue) + (selectedId === id ? " selected" : "");
+      card.tabIndex = 0;
+      card.setAttribute("role", "button");
+      card.dataset.id = id;
+      const err = issue.automation && issue.automation.error;
+      const attempts = (issue.automation?.planningAttempts || 0) + "p / " + (issue.automation?.implementationAttempts || 0) + "i";
+      const branch = issue.git ? issue.git.branchName : (issue.workspace?.kind || "pending workspace");
+      card.innerHTML =
+        "<div class='card-head'>" +
+          "<div class='card-title'>" + escapeHtml(issue.title) + "</div>" +
+          "<span class='badge " + badgeClass(issue) + "'>" + escapeHtml(stateLabel(issue)) + "</span>" +
+        "</div>" +
+        "<div class='meta mono'>" + escapeHtml(shortId(issue.id)) + "</div>" +
+        "<div class='card-path'>" + escapeHtml(compactPath(issue.linkedDirectory || "")) + "</div>" +
+        "<div class='card-badges'>" +
+          "<span class='badge'>" + escapeHtml(compactPath(branch)) + "</span>" +
+          "<span class='badge'>attempts " + escapeHtml(attempts) + "</span>" +
+          (issue.approvals?.planApprovedAt ? "<span class='badge done'>plan approved</span>" : "") +
+          (err ? "<span class='badge error'>" + escapeHtml(err) + "</span>" : "") +
+        "</div>" +
+        "<div class='meta'>Updated " + escapeHtml(formatDate(issue.updatedAt)) + "</div>";
+      laneEl.appendChild(card);
+    }
+    board.appendChild(laneEl);
+  }
+}
+
+function badgeClass(issue) {
+  const name = issueState(issue);
+  if (name === "blocked") return "error";
+  if (name === "active") return "active";
+  if (name === "review") return "review";
+  if (name === "completed") return "done";
+  return "";
+}
+
+function renderDetail() {
+  const detail = document.getElementById("detail");
+  const issue = issueById(selectedId);
+  if (!issue) {
+    detail.classList.remove("open");
+    detail.innerHTML = "";
+    return;
+  }
+  detail.classList.add("open");
+  const activeRunId = issue.automation && issue.automation.activeRunId;
+  const actionButtons = [];
+  if (issue.lane === LANE.PLAN_REVIEW) {
+    actionButtons.push("<button id='approve-plan' " + (activeRunId ? "disabled" : "") + ">Approve Plan</button>");
+    actionButtons.push("<button id='change-plan' class='warn'>Request Plan Changes</button>");
+  }
+  if (issue.lane === LANE.IN_REVIEW) {
+    actionButtons.push("<button id='approve-review-merge' " + (activeRunId || !issue.git ? "disabled" : "") + ">Approve and merge</button>");
+    actionButtons.push("<button id='approve-review' class='secondary' " + (activeRunId ? "disabled" : "") + ">Approve and leave in worktree</button>");
+    actionButtons.push("<button id='change-review' class='warn' " + (activeRunId ? "disabled" : "") + ">Request Changes</button>");
+  }
+  const tabs = ["report", "plan", "spec", "workspace", "comments", "timeline"];
+  if (!tabs.includes(detailTab)) detailTab = "report";
+  detail.innerHTML =
+    "<div class='detail-header'>" +
+      "<div><h2>" + escapeHtml(issue.title) + "</h2>" +
+      "<p class='meta mono'>" + escapeHtml(issue.id) + "</p>" +
+      "</div>" +
+      "<button id='close-detail' class='secondary' type='button'>Close</button>" +
+    "</div>" +
+    "<div class='inspector-badges'>" +
+      "<span class='badge " + badgeClass(issue) + "'>" + escapeHtml(stateLabel(issue)) + "</span>" +
+      (issue.git ? "<span class='badge'>" + escapeHtml(compactPath(issue.git.branchName)) + "</span>" : "<span class='badge'>" + escapeHtml(issue.workspace?.kind || "workspace pending") + "</span>") +
+    "</div>" +
+    "<div class='status-grid'>" +
+      statusCell("Lane", issue.lane) +
+      statusCell("Updated", formatDate(issue.updatedAt)) +
+      statusCell("Active", issue.automation?.activeRole ? issue.automation.activeRole + " " + (issue.automation.activeRunId || "") : "none") +
+      statusCell("Attempts", (issue.automation?.planningAttempts || 0) + " planning / " + (issue.automation?.implementationAttempts || 0) + " implementation") +
+    "</div>" +
+    "<div class='actions'>" +
+      actionButtons.join("") +
+    "</div>" +
+    "<label>Feedback</label><textarea id='feedback' placeholder='Write feedback before requesting changes or adding a comment'></textarea>" +
+    "<div class='actions'><button id='add-comment' class='secondary'>Add Comment</button></div>" +
+    "<div class='tabs'>" + tabs.map((tab) => "<button type='button' class='tab " + (detailTab === tab ? "active" : "") + "' data-tab='" + tab + "'>" + escapeHtml(tabLabel(tab)) + "</button>").join("") + "</div>" +
+    "<div class='tab-panel'>" + renderTabContent(issue) + "</div>";
+  bindDetailActions(issue);
+}
+
+function statusCell(label, value) {
+  return "<div class='status-cell'><span>" + escapeHtml(label) + "</span><strong>" + escapeHtml(value || "none") + "</strong></div>";
+}
+
+function tabLabel(tab) {
+  return { report: "Report", plan: "Plan", spec: "Spec", workspace: "Workspace", comments: "Comments", timeline: "Timeline" }[tab] || tab;
+}
+
+function renderTabContent(issue) {
+  if (detailTab === "report") return renderReport(issue);
+  if (detailTab === "plan") return "<pre>" + escapeHtml(issue.plan || "(no plan)") + "</pre>";
+  if (detailTab === "spec") return "<pre>" + escapeHtml(issue.spec || "(no spec)") + "</pre>";
+  if (detailTab === "workspace") {
+    return "<pre>" + escapeHtml(JSON.stringify({ workspace: issue.workspace, git: issue.git, agentSettings: issue.agentSettings }, null, 2)) + "</pre>";
+  }
+  if (detailTab === "comments") return renderComments(issue.comments || []);
+  if (detailTab === "timeline") return renderTimeline(issue.recentEvents || []);
+  return "";
+}
+
+function renderReport(issue) {
+  let title = "Operational Summary";
+  let report = "";
+  if (issue.lane === LANE.PLAN_REVIEW) {
+    title = "Plan Review Report";
+    report = issue.planReport || issue.plan || "No plan review report is available yet.";
+  } else if (issue.lane === LANE.IN_REVIEW) {
+    title = "Implementation Review Report";
+    report = issue.reviewReport || "No implementation review report is available yet.";
+  } else if (issue.reviewReport) {
+    title = "Implementation Review Report";
+    report = issue.reviewReport;
+  } else if (issue.planReport) {
+    title = "Plan Review Report";
+    report = issue.planReport;
+  } else {
+    report = [
+      "# " + title,
+      "",
+      "- Lane: " + issue.lane,
+      "- Status: " + stateLabel(issue),
+      "- Linked directory: " + (issue.linkedDirectory || "unknown"),
+      "- Workspace: " + (issue.workspace?.path || "not prepared"),
+    ].join("\\n");
+  }
+  return "<section class='report-shell'><div class='report-kicker'>" + escapeHtml(title) + "</div><div class='markdown'>" + renderMarkdown(report) + "</div></section>";
+}
+
+function renderComments(comments) {
+  if (!comments.length) return "<div class='empty-state'>No comments</div>";
+  return "<div class='comment-list'>" + comments.map((comment) =>
+    "<article class='comment-item'>" +
+      "<div class='comment-meta'>" + escapeHtml(formatDate(comment.createdAt)) + " / " + escapeHtml(comment.author || "unknown") + " / " + escapeHtml(comment.phase || "general") + "</div>" +
+      "<div class='comment-body'>" + escapeHtml(comment.text || "") + "</div>" +
+    "</article>"
+  ).join("") + "</div>";
+}
+
+function renderTimeline(events) {
+  if (!events.length) return "<div class='empty-state'>No recent events</div>";
+  return "<div class='timeline'>" + events.slice().reverse().map((event) =>
+    "<article class='timeline-item'>" +
+      "<div class='timeline-type'>" + escapeHtml(formatDate(event.at)) + " / " + escapeHtml(event.type || "event") + "</div>" +
+      "<div class='timeline-body mono'>" + escapeHtml(JSON.stringify(event)) + "</div>" +
+    "</article>"
+  ).join("") + "</div>";
+}
+
+function bindDetailActions(issue) {
+  document.getElementById("close-detail").onclick = () => { selectedId = null; renderBoard(); renderDetail(); };
+  bindOptionalClick("approve-plan", () => postAction(issue.id, "approve-plan", {}));
+  bindOptionalClick("approve-review-merge", () => postAction(issue.id, "approve-review-merge", {}));
+  bindOptionalClick("approve-review", () => postAction(issue.id, "approve-review", {}));
+  bindOptionalClick("change-plan", () => postAction(issue.id, "request-plan-changes", { text: feedbackText() }));
+  bindOptionalClick("change-review", () => postAction(issue.id, "request-review-changes", { text: feedbackText() }));
+  document.getElementById("add-comment").onclick = () => postAction(issue.id, "comment", { text: feedbackText(), phase: "general" });
+}
+
+function bindOptionalClick(id, handler) {
+  const element = document.getElementById(id);
+  if (element) element.onclick = handler;
+}
+
+function feedbackText() {
+  const feedback = document.getElementById("feedback");
+  return feedback ? feedback.value.trim() : "";
+}
+
+async function postAction(id, action, body) {
+  try {
+    await api("/api/issues/" + encodeURIComponent(id) + "/" + action, { method: "POST", body: JSON.stringify(body) });
+    await load();
+  } catch (error) {
+    alert(error.message);
+  }
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" }[ch]));
+}
+
+function renderInlineMarkdown(value) {
+  return String(value)
+    .split(/(\`[^\`]+\`)/g)
+    .map((part) => {
+      if (part.startsWith("\`") && part.endsWith("\`")) return "<code>" + escapeHtml(part.slice(1, -1)) + "</code>";
+      return escapeHtml(part)
+        .replace(/\\*\\*([^*]+)\\*\\*/g, "<strong>$1</strong>")
+        .replace(/\\[([^\\]]+)\\]\\((https?:\\/\\/[^\\s)]+)\\)/g, "<a href='$2' target='_blank' rel='noreferrer'>$1</a>");
+    })
+    .join("");
+}
+
+function renderMarkdown(input) {
+  const lines = String(input || "").replace(/\\r\\n/g, "\\n").split("\\n");
+  let html = "";
+  let paragraph = [];
+  let list = [];
+  let code = [];
+  let inCode = false;
+  function flushParagraph() {
+    if (!paragraph.length) return;
+    html += "<p>" + renderInlineMarkdown(paragraph.join(" ")) + "</p>";
+    paragraph = [];
+  }
+  function flushList() {
+    if (!list.length) return;
+    html += "<ul>" + list.map((item) => "<li>" + renderInlineMarkdown(item) + "</li>").join("") + "</ul>";
+    list = [];
+  }
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (inCode) {
+      if (trimmed.startsWith("\`\`\`")) {
+        html += "<pre><code>" + escapeHtml(code.join("\\n")) + "</code></pre>";
+        code = [];
+        inCode = false;
+      } else {
+        code.push(line);
+      }
+      continue;
+    }
+    if (trimmed.startsWith("\`\`\`")) {
+      flushParagraph();
+      flushList();
+      inCode = true;
+      continue;
+    }
+    if (!trimmed) {
+      flushParagraph();
+      flushList();
+      continue;
+    }
+    if (/^---+$/.test(trimmed)) {
+      flushParagraph();
+      flushList();
+      html += "<hr>";
+      continue;
+    }
+    const heading = trimmed.match(/^(#{1,4})\\s+(.+)$/);
+    if (heading) {
+      flushParagraph();
+      flushList();
+      const level = heading[1].length;
+      html += "<h" + level + ">" + renderInlineMarkdown(heading[2]) + "</h" + level + ">";
+      continue;
+    }
+    const quote = trimmed.match(/^>\\s?(.*)$/);
+    if (quote) {
+      flushParagraph();
+      flushList();
+      html += "<blockquote>" + renderInlineMarkdown(quote[1]) + "</blockquote>";
+      continue;
+    }
+    const item = trimmed.match(/^[-*]\\s+(.+)$/);
+    if (item) {
+      flushParagraph();
+      list.push(item[1]);
+      continue;
+    }
+    paragraph.push(trimmed);
+  }
+  flushParagraph();
+  flushList();
+  if (inCode) html += "<pre><code>" + escapeHtml(code.join("\\n")) + "</code></pre>";
+  return html || "<p>No report content.</p>";
+}
+
+async function load() {
+  state = await api("/api/state");
+  if (selectedId && !issueById(selectedId)) selectedId = null;
+  renderBoard();
+  renderDetail();
+}
+
+function populateLaneFilter() {
+  const laneFilter = document.getElementById("lane-filter");
+  laneFilter.innerHTML = "<option value='all'>All lanes</option>" + LANES.map((lane) => "<option value='" + escapeHtml(lane) + "'>" + escapeHtml(lane) + "</option>").join("");
+}
+
+document.getElementById("pick-directory").addEventListener("click", async () => {
+  const button = document.getElementById("pick-directory");
+  button.disabled = true;
+  try {
+    const result = await api("/api/pick-directory", { method: "POST", body: "{}" });
+    document.getElementById("linkedDirectory").value = result.linkedDirectory || "";
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+document.getElementById("issue-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = new FormData(event.currentTarget);
+  try {
+    const issue = await api("/api/issues", {
+      method: "POST",
+      body: JSON.stringify({
+        title: form.get("title"),
+        linkedDirectory: form.get("linkedDirectory"),
+        spec: form.get("spec"),
+        agentSettings: readAgentSettings(form)
+      })
+    });
+    selectedId = issue.metadata.id;
+    event.currentTarget.reset();
+    setDefaultAgentSettings();
+    closeCreateDrawer();
+    await load();
+  } catch (error) {
+    alert(error.message);
+  }
+});
+
+document.getElementById("open-create").addEventListener("click", openCreateDrawer);
+document.getElementById("close-create").addEventListener("click", closeCreateDrawer);
+document.getElementById("drawer-backdrop").addEventListener("click", closeCreateDrawer);
+document.getElementById("search").addEventListener("input", (event) => {
+  filters.query = event.target.value;
+  renderBoard();
+});
+document.getElementById("lane-filter").addEventListener("change", (event) => {
+  filters.lane = event.target.value;
+  renderBoard();
+});
+document.getElementById("state-filter").addEventListener("change", (event) => {
+  filters.state = event.target.value;
+  renderBoard();
+});
+document.getElementById("board").addEventListener("click", (event) => {
+  const card = event.target.closest(".issue-card");
+  if (!card) return;
+  selectedId = card.dataset.id;
+  detailTab = needsReview(issueById(selectedId)) ? "report" : detailTab;
+  renderBoard();
+  renderDetail();
+});
+document.getElementById("board").addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" && event.key !== " ") return;
+  const card = event.target.closest(".issue-card");
+  if (!card) return;
+  event.preventDefault();
+  selectedId = card.dataset.id;
+  renderBoard();
+  renderDetail();
+});
+document.getElementById("detail").addEventListener("click", (event) => {
+  const tab = event.target.closest("[data-tab]");
+  if (!tab) return;
+  detailTab = tab.dataset.tab;
+  renderDetail();
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  if (document.getElementById("create-drawer").classList.contains("open")) closeCreateDrawer();
+  else if (selectedId) {
+    selectedId = null;
+    renderBoard();
+    renderDetail();
+  }
+});
+
+const events = new EventSource("/api/events?token=" + encodeURIComponent(TOKEN));
+events.onmessage = () => load().catch(() => {});
+events.addEventListener("ready", () => load().catch(() => {}));
+events.onerror = () => { document.getElementById("status").textContent = "Event stream disconnected"; };
+populateLaneFilter();
+setDefaultAgentSettings();
+load().catch((error) => { document.getElementById("status").textContent = error.message; });
+</script>
+</body>
+</html>`;
+}

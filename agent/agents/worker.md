@@ -1,7 +1,7 @@
 ---
 name: worker
 description: General-purpose subagent with full capabilities, isolated context
-model: google-gemini-cli/gemini-3.1-pro-preview
+model: openai-codex/gpt-5.5
 thinking: high
 ---
 

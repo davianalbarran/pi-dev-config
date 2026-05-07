@@ -152,6 +152,8 @@ interface UsageStats {
 	turns: number;
 }
 
+import * as bridge from "./question-bridge.ts";
+
 interface SingleResult {
 	agent: string;
 	agentSource: AgentSource | "unknown";
@@ -166,6 +168,8 @@ interface SingleResult {
 	errorMessage?: string;
 	step?: number;
 	numericId?: number;
+	bridgeFile?: string;
+	pendingQuestion?: bridge.QuestionRequest;
 }
 
 interface AgentRunOverrides {
@@ -204,7 +208,8 @@ const THINKING_COLORS: Record<AgentThinkingLevel, string> = {
 	xhigh: "thinkingXhigh",
 };
 
-function getResultState(result: SingleResult): "running" | "success" | "error" {
+function getResultState(result: SingleResult): "running" | "success" | "error" | "needs_input" {
+	if (result.pendingQuestion) return "needs_input";
 	if (result.exitCode === -1) return "running";
 	if (result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted") return "error";
 	return "success";
@@ -331,13 +336,15 @@ function joinAnsiLeftRight(left: string, right: string, width: number): string {
 	return fittedLeft + " ".repeat(gap) + fittedRight;
 }
 
-function getWidgetStatePalette(state: "running" | "success" | "error"): {
+function getWidgetStatePalette(state: "running" | "success" | "error" | "needs_input"): {
 	background: string;
 	border: string;
 	status: string;
 	label: string;
 } {
 	switch (state) {
+		case "needs_input":
+			return { background: "toolPendingBg", border: "info", status: "warning", label: "warning" };
 		case "running":
 			return { background: "toolPendingBg", border: "borderAccent", status: "warning", label: "accent" };
 		case "error":
@@ -352,14 +359,18 @@ function renderSubagentWidgetCard(result: SingleResult, width: number, theme: an
 	const state = getResultState(result);
 	const palette = getWidgetStatePalette(state);
 	const icon =
-		state === "running"
+		state === "needs_input"
+			? theme.fg("warning", "⁇")
+			: state === "running"
 			? theme.fg("warning", "⏳")
 			: state === "error"
 				? theme.fg("error", "✗")
 				: theme.fg("success", "✓");
 	const label = result.numericId ? `Subagent #${result.numericId}` : result.step ? `#${result.step} ${result.agent}` : result.agent;
 	const status =
-		state === "running"
+		state === "needs_input"
+			? theme.fg(palette.status, "needs input")
+			: state === "running"
 			? theme.fg(palette.status, "running")
 			: state === "error"
 				? theme.fg(palette.status, "failed")
@@ -483,6 +494,7 @@ function buildMonitorSnapshot(widgetKey: string, details: SubagentDetails): Moni
 			meta: metaParts.join(" · ") || undefined,
 			usage: formatUsageStats(result.usage, result.model) || undefined,
 			lines: buildMonitorLines(result),
+			pendingQuestion: result.pendingQuestion,
 		};
 	});
 
@@ -493,6 +505,19 @@ function buildMonitorSnapshot(widgetKey: string, details: SubagentDetails): Moni
 		statusText: getMonitorStatusText(details),
 		updatedAt: Date.now(),
 		panels,
+		onAnswer: (panelId: string, response: bridge.QuestionResponse) => {
+			for (let i = 0; i < panels.length; i++) {
+				if (panels[i].id === panelId) {
+					const result = details.results[i];
+					if (result?.bridgeFile && result.pendingQuestion?.requestId === response.requestId) {
+						void bridge.writeBridgeResponse(result.bridgeFile, response)
+							.then(() => { result.pendingQuestion = undefined; })
+							.then(() => emitUpdate());
+					}
+					break;
+				}
+			}
+		}
 	};
 }
 
@@ -662,6 +687,9 @@ async function runSingleAgent(
 		numericId,
 	};
 
+	const bridgeFile = bridge.createBridgeFilePath(Math.random().toString(36).slice(2));
+	currentResult.bridgeFile = bridgeFile;
+
 	const emitUpdate = () => {
 		if (onUpdate) {
 			onUpdate({
@@ -684,12 +712,24 @@ async function runSingleAgent(
 
 		const exitCode = await new Promise<number>((resolve) => {
 			const invocation = getPiInvocation(args);
+			const env = { ...process.env, [bridge.QUESTION_BRIDGE_ENV]: bridgeFile };
 			const proc = spawn(invocation.command, invocation.args, {
 				cwd: cwd ?? defaultCwd,
+				env,
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
 			});
 			let buffer = "";
+
+			const bridgePollTimer = setInterval(async () => {
+				try {
+					const req = await bridge.waitForBridgeRequest(bridgeFile);
+					if (req && (!currentResult.pendingQuestion || currentResult.pendingQuestion.requestId !== req.requestId)) {
+						currentResult.pendingQuestion = req;
+						emitUpdate();
+					}
+				} catch (e) {}
+			}, 500);
 
 			const processLine = (line: string) => {
 				if (!line.trim()) return;
@@ -740,11 +780,13 @@ async function runSingleAgent(
 			});
 
 			proc.on("close", (code) => {
+				clearInterval(bridgePollTimer);
 				if (buffer.trim()) processLine(buffer);
 				resolve(code ?? 0);
 			});
 
 			proc.on("error", () => {
+				clearInterval(bridgePollTimer);
 				resolve(1);
 			});
 
@@ -765,6 +807,7 @@ async function runSingleAgent(
 		if (wasAborted) throw new Error("Subagent was aborted");
 		return currentResult;
 	} finally {
+		if (bridgeFile) void bridge.cleanupBridgeFiles(bridgeFile);
 		if (tmpPromptPath)
 			try {
 				fs.unlinkSync(tmpPromptPath);

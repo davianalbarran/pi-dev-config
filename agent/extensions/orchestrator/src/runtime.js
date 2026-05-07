@@ -1,0 +1,278 @@
+import * as crypto from "node:crypto";
+import { DEFAULT_CONFIG } from "./constants.js";
+import { buildMergerPrompt, parseMergerOutput } from "./prompts.js";
+import { RpcAgentRunner } from "./rpc-runner.js";
+import { OrchestratorScheduler } from "./scheduler.js";
+import { OrchestratorServer } from "./server.js";
+import { IssueStore } from "./store.js";
+import { commitIssueWorktree, execGit } from "./workspace.js";
+import { nowIso } from "./utils.js";
+import { approvePlan, approveReview, requestPlanChanges, requestReviewChanges } from "./workflow.js";
+
+export function createOrchestratorRuntime(options = {}) {
+	return new OrchestratorRuntime(options);
+}
+
+function errorMessage(error) {
+	return error instanceof Error ? error.message : String(error);
+}
+
+async function verifyIssueBranchMerged(metadata) {
+	if (!metadata.git?.repoRoot || !metadata.git?.branchName || !metadata.git?.baseBranch) return null;
+	const check = await execGit(["merge-base", "--is-ancestor", metadata.git.branchName, metadata.git.baseBranch], metadata.git.repoRoot, {
+		allowExitCodes: [0, 1],
+	});
+	if (check.code !== 0) {
+		throw new Error(
+			`Merger reported success, but ${metadata.git.branchName} is not merged into ${metadata.git.baseBranch}.`,
+		);
+	}
+	const branchHead = (await execGit(["rev-parse", metadata.git.branchName], metadata.git.repoRoot)).stdout.trim();
+	const baseHead = (await execGit(["rev-parse", metadata.git.baseBranch], metadata.git.repoRoot)).stdout.trim();
+	return {
+		finalCommitSha: branchHead,
+		mergedToBranch: metadata.git.baseBranch,
+		mergeCommitSha: baseHead,
+		mergedAt: nowIso(),
+	};
+}
+
+export class OrchestratorRuntime {
+	constructor(options = {}) {
+		this.config = { ...DEFAULT_CONFIG, ...(options.config || {}) };
+		this.store = new IssueStore({ dataRoot: options.dataRoot });
+		this.runner = new RpcAgentRunner({
+			store: this.store,
+			timeoutMs: this.config.agentTimeoutMs,
+			idleTimeoutMs: this.config.agentIdleTimeoutMs,
+		});
+		this.scheduler = new OrchestratorScheduler({
+			store: this.store,
+			runner: this.runner,
+			config: this.config,
+			onEvent: (event) => this.server?.broadcast({ type: "scheduler", event }),
+		});
+		this.server = null;
+		this.token = options.token || crypto.randomBytes(24).toString("hex");
+		this.url = null;
+		this.started = false;
+		this.issueCount = 0;
+		this.unsubscribe = null;
+	}
+
+	async start(ctx = null) {
+		if (this.started) return this.url;
+		await this.store.init();
+		this.unsubscribe = this.store.onChange(() => {
+			void this.refreshIssueCount();
+		});
+		await this.refreshIssueCount();
+
+		this.server = new OrchestratorServer({
+			store: this.store,
+			token: this.token,
+			config: this.config,
+			actions: this.createActions(),
+		});
+		this.url = await this.server.start();
+		this.store.startWatcher();
+		this.scheduler.start();
+		this.started = true;
+
+		if (ctx?.hasUI) {
+			ctx.ui.notify(`Pi orchestrator board: ${this.url}`, "info");
+			ctx.ui.setStatus("pi-orchestrator", "orchestrator running");
+			ctx.ui.setWidget("pi-orchestrator", [
+				"Pi orchestrator",
+				`Board: ${this.url}`,
+				`Data: ${this.store.dataRoot}`,
+			]);
+		}
+		return this.url;
+	}
+
+	async stop() {
+		if (!this.started) return;
+		await this.scheduler.stop();
+		this.store.stopWatcher();
+		if (this.server) await this.server.stop();
+		if (this.unsubscribe) this.unsubscribe();
+		this.unsubscribe = null;
+		this.server = null;
+		this.started = false;
+	}
+
+	getStatus() {
+		return {
+			started: this.started,
+			url: this.url,
+			dataRoot: this.store.dataRoot,
+			issueCount: this.issueCount,
+		};
+	}
+
+	async refreshIssueCount() {
+		try {
+			this.issueCount = (await this.store.listIssueIds()).length;
+		} catch {
+			this.issueCount = 0;
+		}
+	}
+
+	async approveReviewAndMerge(id) {
+		const issue = await this.store.loadIssue(id);
+		approveReview(issue.metadata);
+		if (!issue.metadata.git?.repoRoot || !issue.metadata.git?.branchName || !issue.metadata.git?.baseBranch) {
+			throw new Error("Approve and merge requires a git-backed issue worktree.");
+		}
+		await this.store.updateMetadata(id, (metadata) => ({
+			...metadata,
+			automation: {
+				...metadata.automation,
+				activeRunId: "starting",
+				activeRole: "merger",
+				paused: false,
+				error: null,
+			},
+		}));
+		await this.store.appendEvent(id, { type: "review_merge_requested" });
+		void this.runReviewMerge(id);
+		return this.store.loadIssue(id);
+	}
+
+	async runReviewMerge(id) {
+		let runId = null;
+		try {
+			let issue = await this.store.loadIssue(id);
+			const result = await this.runner.run({
+				issueId: id,
+				role: "merger",
+				cwd: issue.metadata.git.repoRoot,
+				prompt: buildMergerPrompt(issue),
+				agentSettings: null,
+				onRunStarted: async (startedRunId) => {
+					runId = startedRunId;
+					await this.store.updateMetadata(id, (metadata) => ({
+						...metadata,
+						automation: {
+							...metadata.automation,
+							activeRunId: startedRunId,
+							activeRole: "merger",
+							paused: false,
+							error: null,
+						},
+					}));
+					await this.store.appendEvent(id, { type: "agent_run_started", role: "merger", runId: startedRunId });
+				},
+			});
+			runId = result.runId;
+			const parsed = parseMergerOutput(result.text);
+			await this.store.appendEvent(id, {
+				type: "merger_finished",
+				runId: result.runId,
+				result: parsed.result,
+			});
+			if (parsed.result !== "MERGED") {
+				throw new Error(parsed.summary || "Merger reported BLOCKED.");
+			}
+
+			issue = await this.store.loadIssue(id);
+			const mergedGit = await verifyIssueBranchMerged(issue.metadata);
+			await this.store.updateMetadata(id, (metadata) => ({
+				...metadata,
+				git: mergedGit
+					? {
+							...metadata.git,
+							...mergedGit,
+						}
+					: metadata.git,
+				automation: {
+					...metadata.automation,
+					activeRunId: null,
+					activeRole: null,
+					paused: false,
+					error: null,
+				},
+			}));
+			issue = await this.store.loadIssue(id);
+			await this.store.writeMetadata(id, approveReview(issue.metadata));
+			await this.store.appendEvent(id, {
+				type: "review_approved_and_merged",
+				runId: result.runId,
+				mergeCommitSha: mergedGit?.mergeCommitSha || null,
+				mergedToBranch: mergedGit?.mergedToBranch || null,
+			});
+		} catch (error) {
+			const message = errorMessage(error);
+			await this.store.updateMetadata(id, (metadata) => ({
+				...metadata,
+				automation: {
+					...metadata.automation,
+					activeRunId: null,
+					activeRole: null,
+					paused: true,
+					error: message,
+				},
+			}));
+			await this.store.appendEvent(id, { type: "review_merge_failed", runId, error: message });
+		}
+	}
+
+	createActions() {
+		return {
+			createIssue: async (body) => {
+				const issue = await this.store.createIssue({
+					title: body.title,
+					spec: body.spec,
+					linkedDirectory: body.linkedDirectory,
+					agentSettings: body.agentSettings,
+				});
+				this.scheduler.queueTick();
+				return issue;
+			},
+			comment: async (id, body) => {
+				const comment = await this.store.appendComment(id, {
+					author: "human",
+					phase: body.phase || "general",
+					text: body.text,
+				});
+				return { comment, issue: await this.store.loadIssue(id) };
+			},
+			approvePlan: async (id) => {
+				const issue = await this.store.loadIssue(id);
+				await this.store.writeMetadata(id, approvePlan(issue.metadata));
+				await this.store.appendEvent(id, { type: "plan_approved" });
+				this.scheduler.queueTick();
+				return this.store.loadIssue(id);
+			},
+			requestPlanChanges: async (id, body) => {
+				const issue = await this.store.loadIssue(id);
+				const next = requestPlanChanges(issue.metadata);
+				await this.store.appendComment(id, { author: "human", phase: "plan", text: body.text });
+				await this.store.writeMetadata(id, next);
+				await this.store.appendEvent(id, { type: "plan_changes_requested" });
+				this.scheduler.queueTick();
+				return this.store.loadIssue(id);
+			},
+			approveReview: async (id) => {
+				const before = await this.store.loadIssue(id);
+				approveReview(before.metadata);
+				const commit = await commitIssueWorktree(this.store, id);
+				const issue = await this.store.loadIssue(id);
+				await this.store.writeMetadata(id, approveReview(issue.metadata));
+				await this.store.appendEvent(id, { type: "review_approved", commit });
+				return this.store.loadIssue(id);
+			},
+			approveReviewAndMerge: async (id) => this.approveReviewAndMerge(id),
+			requestReviewChanges: async (id, body) => {
+				const issue = await this.store.loadIssue(id);
+				const next = requestReviewChanges(issue.metadata);
+				await this.store.appendComment(id, { author: "human", phase: "review", text: body.text });
+				await this.store.writeMetadata(id, next);
+				await this.store.appendEvent(id, { type: "review_changes_requested" });
+				this.scheduler.queueTick();
+				return this.store.loadIssue(id);
+			},
+		};
+	}
+}

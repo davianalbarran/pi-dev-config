@@ -2,4 +2,8 @@
 node_modules/
 agent/auth.json
 agent/sessions/
+agent/bin
 agent/.playwright-cli
+.omx/
+agent/orchestrator/
+*.log

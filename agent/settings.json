@@ -1,8 +1,8 @@
 {
-  "lastChangelogVersion": "0.67.3",
+  "lastChangelogVersion": "0.73.0",
   "defaultProvider": "openai-codex",
   "defaultModel": "gpt-5.4",
-  "defaultThinkingLevel": "high",
+  "defaultThinkingLevel": "medium",
   "theme": "gruvbox-starship",
   "packages": [
     "git:github.com/jonjonrankin/pi-caveman"
