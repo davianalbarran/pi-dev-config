@@ -22,6 +22,7 @@ import { createOrchestratorRuntime } from "../src/runtime.js";
 import { OrchestratorScheduler } from "../src/scheduler.js";
 import { OrchestratorServer, isAuthorized } from "../src/server.js";
 import { IssueStore } from "../src/store.js";
+import { renderDashboardHtml } from "../src/ui.js";
 import { branchNameForIssue, commitIssueWorktree, ensureIssueWorkspace } from "../src/workspace.js";
 import {
 	approvePlan,
@@ -47,6 +48,18 @@ test("token authorization accepts query, header, and bearer token", () => {
 	assert.equal(isAuthorized("/", { "x-orchestrator-token": "abc" }, "abc"), true);
 	assert.equal(isAuthorized("/", { authorization: "Bearer abc" }, "abc"), true);
 	assert.equal(isAuthorized("/?token=wrong", {}, "abc"), false);
+});
+
+test("dashboard renderer injects runtime data", async () => {
+	const html = await renderDashboardHtml("test-token");
+
+	assert.match(html, /const TOKEN = "test-token";/);
+	assert.match(html, /const LANES = \["Created","Planning"/);
+	assert.match(html, /const LANE = \{"CREATED":"Created"/);
+	assert.match(html, /const ROLE_DEFAULTS = \{"planner":/);
+	assert.match(html, /const THINKING_LEVELS = \["low","medium","high","xhigh"\];/);
+	assert.match(html, /id="create-drawer"/);
+	assert.doesNotMatch(html, /__(TOKEN|LANES|LANE|ROLE_DEFAULTS|THINKING_LEVELS)_JSON__/);
 });
 
 test("server renders token-gated dashboard html", async () => {
@@ -77,6 +90,7 @@ test("server renders token-gated dashboard html", async () => {
 		const allowed = await fetch(url);
 		assert.equal(allowed.status, 200);
 		const html = await allowed.text();
+		assert.match(html, /const TOKEN = "test-token";/);
 		assert.match(html, /create-drawer/);
 		assert.match(html, /renderMarkdown/);
 		assert.match(html, /Plan Review Report/);
