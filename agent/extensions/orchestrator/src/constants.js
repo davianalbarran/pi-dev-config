@@ -1,13 +1,18 @@
 import * as os from "node:os";
 import * as path from "node:path";
 
-export const LANES = Object.freeze([
+export const KANBAN_LANES = Object.freeze([
 	"Created",
 	"Planning",
 	"Plan in review",
 	"In Progress",
 	"In Review",
 	"Completed",
+]);
+
+export const LANES = Object.freeze([
+	...KANBAN_LANES,
+	"Backlog",
 ]);
 
 export const LANE = Object.freeze({
@@ -17,6 +22,7 @@ export const LANE = Object.freeze({
 	IN_PROGRESS: "In Progress",
 	IN_REVIEW: "In Review",
 	COMPLETED: "Completed",
+	BACKLOG: "Backlog",
 });
 
 export const DEFAULT_DATA_ROOT = path.join(os.homedir(), ".pi", "agent", "orchestrator");

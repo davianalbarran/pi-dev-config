@@ -138,29 +138,35 @@ export class IssueStore {
 		}
 	}
 
-	async createIssue({ title, spec, linkedDirectory, agentSettings, dependencyIssueId }) {
+	async validateDependency(dependencyIssueId, { selfId = null } = {}) {
+		const dependencyId = String(dependencyIssueId || "").trim() || null;
+		if (!dependencyId) return { dependencyId: null, dependency: null };
+		if (selfId && dependencyId === selfId) throw new Error("An issue cannot depend on itself.");
+		let dependency = null;
+		try {
+			await fsp.access(this.issuePath(dependencyId, "metadata.json"));
+			dependency = await this.loadIssue(dependencyId);
+		} catch {
+			throw new Error(`Dependency issue does not exist: ${dependencyId}`);
+		}
+		if (isDependencyResolved(dependency.metadata)) {
+			throw new Error(`Dependency issue is already resolved: ${dependencyId}`);
+		}
+		return { dependencyId, dependency };
+	}
+
+	async createIssue({ title, spec, linkedDirectory, agentSettings, dependencyIssueId, backlog = false }) {
 		if (!title || !String(title).trim()) throw new Error("Title is required.");
 		if (!linkedDirectory || !String(linkedDirectory).trim()) throw new Error("Linked directory is required.");
 		const linkedPath = normalizePath(linkedDirectory);
 		const id = makeId(title);
-		const dependencyId = String(dependencyIssueId || "").trim() || null;
-		let dependency = null;
-		if (dependencyId) {
-			try {
-				await fsp.access(this.issuePath(dependencyId, "metadata.json"));
-				dependency = await this.loadIssue(dependencyId);
-			} catch {
-				throw new Error(`Dependency issue does not exist: ${dependencyId}`);
-			}
-			if (isDependencyResolved(dependency.metadata)) {
-				throw new Error(`Dependency issue is already resolved: ${dependencyId}`);
-			}
-		}
+		const { dependencyId, dependency } = await this.validateDependency(dependencyIssueId);
+		const initialLane = backlog ? LANE.BACKLOG : LANE.CREATED;
 		const createdAt = nowIso();
 		const metadata = normalizeMetadata({
 			id,
 			title: String(title).trim(),
-			lane: LANE.CREATED,
+			lane: initialLane,
 			linkedDirectory: linkedPath,
 			createdAt,
 			updatedAt: createdAt,
@@ -182,11 +188,65 @@ export class IssueStore {
 		await this.appendEvent(id, {
 			type: "issue_created",
 			title: metadata.title,
+			lane: metadata.lane,
+			backlog: metadata.lane === LANE.BACKLOG,
 			linkedDirectory: linkedPath,
 			dependencyIssueId: dependencyId,
 			dependencyTitle: dependency?.metadata?.title || null,
 		});
-		this.emitChange({ type: "issue_created", id });
+		this.emitChange({ type: "issue_created", id, lane: metadata.lane, backlog: metadata.lane === LANE.BACKLOG });
+		return this.loadIssue(id);
+	}
+
+	async updateBacklogIssue(id, { title, spec, linkedDirectory, agentSettings, dependencyIssueId } = {}) {
+		const issue = await this.loadIssue(id);
+		if (issue.metadata.lane !== LANE.BACKLOG) throw new Error("Only Backlog issues can be edited this way.");
+		if (!title || !String(title).trim()) throw new Error("Title is required.");
+		if (!linkedDirectory || !String(linkedDirectory).trim()) throw new Error("Linked directory is required.");
+		const linkedPath = normalizePath(linkedDirectory);
+		const { dependencyId, dependency } = await this.validateDependency(dependencyIssueId, { selfId: id });
+		const metadata = await this.writeMetadata(id, {
+			...issue.metadata,
+			title: String(title).trim(),
+			linkedDirectory: linkedPath,
+			agentSettings,
+			dependencies: { issueId: dependencyId, resolvedAt: null },
+		});
+		await writeFileAtomic(this.issuePath(id, "spec.md"), `${String(spec || "").trim()}\n`);
+		await this.appendEvent(id, {
+			type: "backlog_issue_updated",
+			title: metadata.title,
+			linkedDirectory: linkedPath,
+			dependencyIssueId: dependencyId,
+			dependencyTitle: dependency?.metadata?.title || null,
+		});
+		this.emitChange({ type: "backlog_issue_updated", id });
+		return this.loadIssue(id);
+	}
+
+	async sendBacklogIssueToAgent(id) {
+		const issue = await this.loadIssue(id);
+		if (issue.metadata.lane !== LANE.BACKLOG) throw new Error("Only Backlog issues can be sent to the agent.");
+		const dependencyId = String(issue.metadata.dependencies?.issueId || "").trim() || null;
+		if (dependencyId) {
+			const dependency = await this.loadIssue(dependencyId).catch(() => null);
+			if (dependency?.metadata?.lane === LANE.BACKLOG && !isDependencyResolved(dependency.metadata)) {
+				throw new Error(`Cannot send to agent while dependency ${dependencyId} is still in Backlog.`);
+			}
+		}
+		await this.writeMetadata(id, {
+			...issue.metadata,
+			lane: LANE.CREATED,
+			automation: {
+				...issue.metadata.automation,
+				paused: false,
+				error: null,
+				activeRunId: null,
+				activeRole: null,
+			},
+		});
+		await this.appendEvent(id, { type: "backlog_issue_sent_to_agent" });
+		this.emitChange({ type: "backlog_issue_sent_to_agent", id });
 		return this.loadIssue(id);
 	}
 

@@ -299,7 +299,14 @@ export class OrchestratorRuntime {
 					linkedDirectory: body.linkedDirectory,
 					agentSettings: body.agentSettings,
 					dependencyIssueId: body.dependencyIssueId,
+					backlog: body.backlog,
 				});
+				if (!body.backlog) this.scheduler.queueTick();
+				return issue;
+			},
+			updateBacklogIssue: async (id, body) => this.store.updateBacklogIssue(id, body),
+			sendBacklogIssueToAgent: async (id) => {
+				const issue = await this.store.sendBacklogIssueToAgent(id);
 				this.scheduler.queueTick();
 				return issue;
 			},

@@ -6,7 +6,7 @@ import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
-import { DEFAULT_PROFILE_ID, LANE, ROLE_DEFAULTS } from "../src/constants.js";
+import { DEFAULT_PROFILE_ID, KANBAN_LANES, LANE, LANES, ROLE_DEFAULTS } from "../src/constants.js";
 import { getIssueDiffs } from "../src/diffs.js";
 import {
 	PLAN_END,
@@ -79,6 +79,20 @@ test("orchestrator env config host overrides LAN binding", () => {
 
 test("orchestrator env config parses a valid port", () => {
 	assert.deepEqual(parseOrchestratorEnv({ PI_ORCHESTRATOR_PORT: "8123" }), { host: "127.0.0.1", port: 8123 });
+});
+
+test("orchestrator constants distinguish valid lanes from Kanban lanes", () => {
+	assert.equal(LANE.BACKLOG, "Backlog");
+	assert.equal(LANES.includes(LANE.BACKLOG), true);
+	assert.equal(KANBAN_LANES.includes(LANE.BACKLOG), false);
+	assert.deepEqual(KANBAN_LANES, [
+		LANE.CREATED,
+		LANE.PLANNING,
+		LANE.PLAN_REVIEW,
+		LANE.IN_PROGRESS,
+		LANE.IN_REVIEW,
+		LANE.COMPLETED,
+	]);
 });
 
 test("LAN address selection returns first external IPv4 address", () => {
@@ -164,11 +178,24 @@ test("dashboard renderer injects runtime data", async () => {
 
 	assert.match(html, /const TOKEN = "test-token";/);
 	assert.match(html, /const LANES = \["Created","Planning"/);
+	assert.match(html, /"Backlog"/);
+	assert.match(html, /const KANBAN_LANES = \["Created","Planning"/);
 	assert.match(html, /const LANE = \{"CREATED":"Created"/);
+	assert.match(html, /"BACKLOG":"Backlog"/);
 	assert.match(html, /const ROLE_DEFAULTS = \{"planner":/);
 	assert.match(html, /const THINKING_LEVELS = \["low","medium","high","xhigh"\];/);
 	assert.match(html, /const DEFAULT_PROFILE_ID = "default";/);
 	assert.match(html, /id="create-drawer"/);
+	assert.match(html, /id="kanban-tab"/);
+	assert.match(html, /id="backlog-tab"/);
+	assert.match(html, />Kanban<\/button>/);
+	assert.match(html, />Backlog<\/button>/);
+	assert.match(html, /id="backlog-view"/);
+	assert.match(html, /Add to Backlog/);
+	assert.match(html, /Edit Issue/);
+	assert.match(html, /Send to Agent/);
+	assert.match(html, /for \(const lane of KANBAN_LANES\)/);
+	assert.match(html, /const KANBAN_LANES =/);
 	assert.match(html, /id="open-share"/);
 	assert.match(html, /id="share-dialog"/);
 	assert.match(html, /id="share-qr"/);
@@ -231,7 +258,7 @@ test("dashboard renderer injects runtime data", async () => {
 	assert.match(html, /data-resize-panel="detail"/);
 	assert.match(html, /function applyCreateDrawerWidth\(\)/);
 	assert.match(html, /function applyDetailPanelWidth\(\)/);
-	assert.doesNotMatch(html, /__(TOKEN|LANES|LANE|ROLE_DEFAULTS|THINKING_LEVELS|DEFAULT_PROFILE_ID)_JSON__/);
+	assert.doesNotMatch(html, /__(TOKEN|LANES|KANBAN_LANES|LANE|ROLE_DEFAULTS|THINKING_LEVELS|DEFAULT_PROFILE_ID)_JSON__/);
 });
 
 test("dashboard css keeps the desktop board compact and stacks it on mobile", async () => {
@@ -446,6 +473,94 @@ test("server exposes authenticated profile API", async () => {
 	} finally {
 		await server.stop();
 	}
+});
+
+test("server routes backlog create, update, and send actions", async () => {
+	const root = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const calls = [];
+	const reject = async () => {
+		throw new Error("not used");
+	};
+	const server = new OrchestratorServer({
+		store,
+		token: "backlog-token",
+		config: { host: "127.0.0.1", port: 0 },
+		actions: {
+			createIssue: async (body) => {
+				calls.push(["create", body]);
+				return { metadata: { id: "PI-backlog", lane: body.backlog ? LANE.BACKLOG : LANE.CREATED } };
+			},
+			updateBacklogIssue: async (id, body) => {
+				calls.push(["update", id, body]);
+				return { metadata: { id, lane: LANE.BACKLOG } };
+			},
+			sendBacklogIssueToAgent: async (id) => {
+				calls.push(["send", id]);
+				return { metadata: { id, lane: LANE.CREATED } };
+			},
+			comment: reject,
+			approvePlan: reject,
+			requestPlanChanges: reject,
+			approveReview: reject,
+			approveReviewAndMerge: reject,
+			requestReviewChanges: reject,
+		},
+	});
+	const url = await server.start();
+	const base = url.split("?")[0].replace(/\/$/, "");
+	try {
+		const denied = await fetch(`${base}/api/issues/PI-backlog/update-backlog`, { method: "POST", body: "{}" });
+		assert.equal(denied.status, 401);
+
+		const created = await fetch(`${base}/api/issues?token=backlog-token`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ title: "Idea", backlog: true }),
+		});
+		assert.equal(created.status, 201);
+		assert.equal(calls[0][0], "create");
+		assert.equal(calls[0][1].backlog, true);
+
+		const updated = await fetch(`${base}/api/issues/PI-backlog/update-backlog?token=backlog-token`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ title: "Edited" }),
+		});
+		assert.equal(updated.status, 200);
+		assert.deepEqual(calls[1], ["update", "PI-backlog", { title: "Edited" }]);
+
+		const sent = await fetch(`${base}/api/issues/PI-backlog/send-to-agent?token=backlog-token`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: "{}",
+		});
+		assert.equal(sent.status, 200);
+		assert.deepEqual(calls[2], ["send", "PI-backlog"]);
+	} finally {
+		await server.stop();
+	}
+});
+
+test("runtime creates backlog issues without scheduling until they are sent", async () => {
+	const root = await tempDir();
+	const linked = await tempDir();
+	const runtime = createOrchestratorRuntime({ dataRoot: root });
+	await runtime.store.init();
+	let queued = 0;
+	runtime.scheduler.queueTick = () => {
+		queued += 1;
+	};
+	const actions = runtime.createActions();
+
+	const backlog = await actions.createIssue({ title: "Runtime backlog", spec: "Later.", linkedDirectory: linked, backlog: true });
+	assert.equal(backlog.metadata.lane, LANE.BACKLOG);
+	assert.equal(queued, 0);
+
+	const sent = await actions.sendBacklogIssueToAgent(backlog.metadata.id);
+	assert.equal(sent.metadata.lane, LANE.CREATED);
+	assert.equal(queued, 1);
 });
 
 test("diff helper reports tracked, renamed, and untracked worktree changes", async () => {
@@ -697,6 +812,67 @@ test("issue store rejects an already resolved non-git dependency issue", async (
 			}),
 		/Dependency issue is already resolved/,
 	);
+});
+
+test("issue store creates, updates, and sends backlog issues", async () => {
+	const root = await tempDir();
+	const linked = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const issue = await store.createIssue({
+		title: "Backlog idea",
+		spec: "Save this for later.",
+		linkedDirectory: linked,
+		backlog: true,
+	});
+
+	assert.equal(issue.metadata.lane, LANE.BACKLOG);
+	assert.equal(issue.events[0].backlog, true);
+	assert.equal(issue.events[0].lane, LANE.BACKLOG);
+	let state = await store.getBoardState();
+	assert.deepEqual(state.lanes[LANE.BACKLOG], [issue.metadata.id]);
+
+	const updated = await store.updateBacklogIssue(issue.metadata.id, {
+		title: "Renamed backlog idea",
+		spec: "Edited spec.",
+		linkedDirectory: linked,
+		agentSettings: { planner: { model: "planner-x", thinking: "high" } },
+	});
+	assert.equal(updated.metadata.id, issue.metadata.id);
+	assert.equal(updated.metadata.title, "Renamed backlog idea");
+	assert.equal(updated.spec, "Edited spec.\n");
+	assert.equal(updated.metadata.agentSettings.planner.model, "planner-x");
+	assert.equal(updated.events.some((event) => event.type === "backlog_issue_updated"), true);
+
+	const sent = await store.sendBacklogIssueToAgent(issue.metadata.id);
+	assert.equal(sent.metadata.lane, LANE.CREATED);
+	assert.equal(sent.metadata.automation.paused, false);
+	assert.equal(sent.metadata.automation.error, null);
+	assert.equal(sent.events.some((event) => event.type === "backlog_issue_sent_to_agent"), true);
+	state = await store.getBoardState();
+	assert.deepEqual(state.lanes[LANE.BACKLOG], []);
+	assert.deepEqual(state.lanes[LANE.CREATED], [issue.metadata.id]);
+});
+
+test("issue store rejects sending a backlog issue blocked by another backlog issue", async () => {
+	const root = await tempDir();
+	const linked = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const dependency = await store.createIssue({ title: "Backlog dependency", spec: "First.", linkedDirectory: linked, backlog: true });
+	const issue = await store.createIssue({
+		title: "Blocked backlog",
+		spec: "Second.",
+		linkedDirectory: linked,
+		backlog: true,
+		dependencyIssueId: dependency.metadata.id,
+	});
+
+	await assert.rejects(
+		() => store.sendBacklogIssueToAgent(issue.metadata.id),
+		/Cannot send to agent while dependency .* is still in Backlog/,
+	);
+	assert.equal((await store.loadIssue(issue.metadata.id)).metadata.lane, LANE.BACKLOG);
 });
 
 test("issue store lists a built-in default profile when profiles file is absent", async () => {
@@ -1132,6 +1308,35 @@ test("scheduler writes parsed plan and plan review report after planning", async
 	assert.equal(planned.metadata.lane, LANE.PLAN_REVIEW);
 	assert.equal(planned.plan.trim(), "## Goal\nImplement the feature.");
 	assert.equal(planned.planReport.trim(), "# Plan Review\nThis plan is ready for human approval.");
+});
+
+test("scheduler does not start planning for backlog issues", async () => {
+	const root = await tempDir();
+	const linked = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const issue = await store.createIssue({
+		title: "Backlog should wait",
+		spec: "Do not plan yet.",
+		linkedDirectory: linked,
+		backlog: true,
+	});
+	let calls = 0;
+	const scheduler = new OrchestratorScheduler({
+		store,
+		runner: {
+			run: async () => {
+				calls += 1;
+				return { runId: "planner-run", text: "should not run" };
+			},
+			stopAll: async () => {},
+		},
+	});
+
+	await scheduler.tick();
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	assert.equal(calls, 0);
+	assert.equal((await store.loadIssue(issue.metadata.id)).metadata.lane, LANE.BACKLOG);
 });
 
 test("scheduler does not start planning while dependency is unresolved", async () => {

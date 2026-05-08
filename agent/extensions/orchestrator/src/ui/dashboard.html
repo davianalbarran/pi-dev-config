@@ -151,6 +151,22 @@ h1 { margin: 0; font-size: 20px; letter-spacing: 0; line-height: 1; }
   width: 100%;
   min-width: 0;
 }
+.app-tabs {
+  display: flex;
+  gap: 8px;
+  padding: 12px 18px 0;
+  background: color-mix(in srgb, var(--bg) 84%, transparent);
+}
+.app-view-tab {
+  background: var(--surface-2);
+  color: var(--muted);
+  border-color: var(--line);
+}
+.app-view-tab.active {
+  background: var(--accent);
+  color: var(--bg);
+  border-color: transparent;
+}
 .command-bar {
   display: grid;
   grid-template-columns: minmax(260px, 1fr) minmax(320px, 520px);
@@ -241,6 +257,28 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
   padding: 10px 18px 18px;
   min-height: 0;
 }
+.backlog-view {
+  padding: 14px 18px 18px;
+}
+.backlog-header {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.backlog-header h2 { margin: 0 0 4px; }
+.backlog-list { display: grid; gap: 10px; max-width: 980px; }
+.backlog-item {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  padding: 12px;
+  box-shadow: 0 12px 24px rgba(0, 0, 0, .10);
+}
+.backlog-item-head { display: flex; justify-content: space-between; align-items: start; gap: 12px; }
+.backlog-title { color: var(--text); font-weight: 800; overflow-wrap: anywhere; }
+.backlog-spec { margin-top: 8px; color: var(--text-soft); white-space: pre-wrap; overflow-wrap: anywhere; }
 .lane {
   background: color-mix(in srgb, var(--surface) 82%, transparent);
   border: 1px solid var(--line);
@@ -690,6 +728,7 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
   .top-actions button { flex: 1 1 140px; }
   button { min-height: 44px; padding: 10px 12px; }
   input, textarea, select { min-height: 44px; font-size: 16px; }
+  .app-tabs { padding: 10px 12px 0; }
   .command-bar { padding: 12px; gap: 10px; }
   .metrics { display: grid; grid-template-columns: 1fr; }
   .metric { min-width: 0; }
@@ -702,6 +741,8 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
     grid-template-columns: 1fr;
     overflow-x: visible;
   }
+  .backlog-view { padding: 12px; }
+  .backlog-item-head { flex-direction: column; }
   .lane { min-height: 180px; }
   .tabs { flex-wrap: wrap; overflow-x: visible; }
   .tab { flex: 1 1 130px; }
@@ -731,6 +772,10 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
   </div>
 </header>
 <main class="app-shell">
+  <nav class="app-tabs" aria-label="Orchestrator views">
+    <button type="button" class="app-view-tab active" id="kanban-tab" data-view="kanban">Kanban</button>
+    <button type="button" class="app-view-tab" id="backlog-tab" data-view="backlog">Backlog</button>
+  </nav>
   <section class="command-bar" aria-label="Board controls">
     <div>
       <div class="metrics" id="metrics"></div>
@@ -749,14 +794,24 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
     </div>
   </section>
   <section class="board" id="board" aria-label="Issue lanes"></section>
+  <section class="backlog-view" id="backlog-view" aria-label="Backlog issues" hidden>
+    <div class="backlog-header">
+      <div>
+        <h2>Backlog</h2>
+        <div class="small">Saved ticket ideas stay here until you send them to the agent.</div>
+      </div>
+      <button type="button" id="open-backlog-create" class="secondary">Add Backlog Issue</button>
+    </div>
+    <div class="backlog-list" id="backlog-list"></div>
+  </section>
 </main>
 <aside class="inspector" id="detail" aria-label="Issue inspector"></aside>
 <div class="drawer" id="create-drawer" aria-hidden="true">
-  <button type="button" class="drawer-backdrop" id="drawer-backdrop" aria-label="Close create issue"></button>
-  <section class="drawer-panel" aria-label="Create issue">
+  <button type="button" class="drawer-backdrop" id="drawer-backdrop" aria-label="Close issue drawer"></button>
+  <section class="drawer-panel" id="issue-drawer-panel" aria-label="Create issue">
     <button type="button" class="panel-resize-handle panel-resize-handle-right" aria-label="Resize create issue panel" data-resize-panel="create"></button>
     <div class="drawer-head">
-      <h2>Create Issue</h2>
+      <h2 id="issue-drawer-title">Create Issue</h2>
       <button type="button" class="secondary" id="close-create">Close</button>
     </div>
     <form id="issue-form">
@@ -806,7 +861,12 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
         </div>
         <datalist id="modelSuggestions"></datalist>
       </fieldset>
-      <div class="actions"><button type="submit">Create</button></div>
+      <div class="actions">
+        <button type="submit" name="issueAction" value="create" id="create-submit">Create</button>
+        <button type="submit" name="issueAction" value="backlog" id="backlog-submit" class="secondary">Add to Backlog</button>
+        <button type="submit" name="issueAction" value="save" id="save-submit" hidden>Save</button>
+        <button type="submit" name="issueAction" value="send" id="send-submit" class="secondary" hidden>Send to Agent</button>
+      </div>
     </form>
   </section>
 </div>
@@ -829,6 +889,7 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
 <script>
 const TOKEN = __TOKEN_JSON__;
 const LANES = __LANES_JSON__;
+const KANBAN_LANES = __KANBAN_LANES_JSON__;
 const LANE = __LANE_JSON__;
 const ROLE_DEFAULTS = __ROLE_DEFAULTS_JSON__;
 const THINKING_LEVELS = __THINKING_LEVELS_JSON__;
@@ -840,6 +901,9 @@ let selectedProfileId = DEFAULT_PROFILE_ID;
 let selectedId = null;
 let detailTab = "report";
 let filters = { query: "", lane: "all", state: "all" };
+let activeView = "kanban";
+let issueFormMode = "create";
+let editingBacklogId = null;
 let createDrawerWidth = null;
 let detailPanelWidth = null;
 const minimizedIssueIds = new Set();
@@ -1194,8 +1258,10 @@ function renderMetrics() {
   const blocked = issues.filter(isBlocked).length;
   const review = issues.filter(needsReview).length;
   const completed = issues.filter((issue) => issue.lane === LANE.COMPLETED).length;
+  const backlog = issues.filter((issue) => issue.lane === LANE.BACKLOG).length;
   document.getElementById("metrics").innerHTML =
     metric("Issues", issues.length) +
+    metric("Backlog", backlog) +
     metric("Active", active) +
     metric("Review", review) +
     metric("Blocked", blocked) +
@@ -1204,15 +1270,17 @@ function renderMetrics() {
   document.getElementById("status").textContent = issues.length + " issue" + (issues.length === 1 ? "" : "s");
 }
 
-function populateDependencyOptions() {
+function populateDependencyOptions({ excludeId = null, selectedId = null } = {}) {
   const select = document.getElementById("dependencyIssueId");
   if (!select) return;
-  const selected = select.value;
-  const options = (state.issues || []).filter((issue) => !isIssueResolvedForDependency(issue));
+  const selected = selectedId ?? select.value;
+  const options = (state.issues || []).filter((issue) => issue.id !== excludeId && !isIssueResolvedForDependency(issue));
   select.innerHTML = "<option value=''>No dependency</option>" + options.map((issue) =>
-    "<option value='" + escapeHtml(issue.id) + "'>" + escapeHtml(shortId(issue.id) + " — " + issue.title) + "</option>"
+    "<option value='" + escapeHtml(issue.id) + "'>" + escapeHtml(shortId(issue.id) + " — " + issue.title + (issue.lane === LANE.BACKLOG ? " (Backlog)" : "")) + "</option>"
   ).join("");
   if (options.some((issue) => issue.id === selected)) select.value = selected;
+  else select.value = "";
+  updateIssueFormActions();
 }
 
 function linkedDirectoryChoices() {
@@ -1399,9 +1467,64 @@ function readAgentSettings(form) {
   };
 }
 
-function openCreateDrawer() {
+function setIssueFormMode(mode, issue = null) {
+  issueFormMode = mode;
+  editingBacklogId = mode === "edit" ? issue?.id || null : null;
+  document.getElementById("issue-drawer-title").textContent = mode === "edit" ? "Edit Issue" : "Create Issue";
+  document.getElementById("issue-drawer-panel").setAttribute("aria-label", mode === "edit" ? "Edit issue" : "Create issue");
+  document.getElementById("create-submit").hidden = mode === "edit";
+  document.getElementById("backlog-submit").hidden = mode === "edit";
+  document.getElementById("save-submit").hidden = mode !== "edit";
+  document.getElementById("send-submit").hidden = mode !== "edit";
+  updateIssueFormActions();
+}
+
+function backlogSendBlockMessage() {
+  if (issueFormMode !== "edit") return "";
+  const dependencyId = document.getElementById("dependencyIssueId")?.value || "";
+  if (!dependencyId) return "";
+  const dependency = issueById(dependencyId);
+  if (dependency?.lane === LANE.BACKLOG && !isIssueResolvedForDependency(dependency)) {
+    return "Send to Agent is blocked until the selected Backlog dependency is sent or resolved.";
+  }
+  return "";
+}
+
+function updateIssueFormActions() {
+  const send = document.getElementById("send-submit");
+  if (!send) return;
+  const message = backlogSendBlockMessage();
+  send.disabled = !!message;
+  send.title = message;
+}
+
+function fillIssueForm(issue) {
+  document.getElementById("title").value = issue?.title || "";
+  document.getElementById("linkedDirectory").value = issue?.linkedDirectory || "";
+  document.getElementById("spec").value = issue?.spec || "";
+  populateDependencyOptions({ excludeId: issue?.id || null, selectedId: getDependencyIssueId(issue) });
+  applyAgentSettings(issue?.agentSettings || profileById(selectedProfileId).agentSettings);
+}
+
+function openCreateDrawer(options = {}) {
+  const form = document.getElementById("issue-form");
+  form.reset();
+  selectedProfileId = DEFAULT_PROFILE_ID;
   setDefaultAgentSettings();
   populateDependencyOptions();
+  populateLinkedDirectoryOptions();
+  setIssueFormMode("create");
+  const drawer = document.getElementById("create-drawer");
+  drawer.classList.add("open");
+  drawer.setAttribute("aria-hidden", "false");
+  applyCreateDrawerWidth();
+  setTimeout(() => document.getElementById("title").focus(), 0);
+}
+
+function openEditIssueDrawer(issue) {
+  if (!issue || issue.lane !== LANE.BACKLOG) return;
+  setIssueFormMode("edit", issue);
+  fillIssueForm(issue);
   populateLinkedDirectoryOptions();
   const drawer = document.getElementById("create-drawer");
   drawer.classList.add("open");
@@ -1416,11 +1539,66 @@ function closeCreateDrawer() {
   drawer.setAttribute("aria-hidden", "true");
 }
 
+function renderViewTabs() {
+  for (const button of document.querySelectorAll("[data-view]")) {
+    button.classList.toggle("active", button.dataset.view === activeView);
+  }
+}
+
+function matchingBacklogIssues() {
+  return (state.issues || []).filter((issue) => issue.lane === LANE.BACKLOG).filter((issue) => {
+    if (filters.state !== "all" && issueState(issue) !== filters.state) return false;
+    const query = filters.query.trim().toLowerCase();
+    if (!query) return true;
+    const haystack = [
+      issue.title,
+      issue.id,
+      issue.linkedDirectory,
+      issue.spec,
+      getDependencyIssueId(issue),
+      getDependencyIssue(issue)?.title,
+    ].filter(Boolean).join(" ").toLowerCase();
+    return haystack.includes(query);
+  });
+}
+
+function renderBacklog() {
+  const list = document.getElementById("backlog-list");
+  if (!list) return;
+  const issues = matchingBacklogIssues();
+  if (!issues.length) {
+    list.innerHTML = "<div class='empty-state'>No backlog issues match the current filters.</div>";
+    return;
+  }
+  list.innerHTML = issues.map((issue) =>
+    "<article class='backlog-item' data-id='" + escapeHtml(issue.id) + "'>" +
+      "<div class='backlog-item-head'>" +
+        "<div>" +
+          "<div class='backlog-title'>" + escapeHtml(issue.title) + "</div>" +
+          "<div class='meta mono'>" + escapeHtml(shortId(issue.id)) + "</div>" +
+        "</div>" +
+        "<button type='button' data-edit-backlog='" + escapeHtml(issue.id) + "'>Edit</button>" +
+      "</div>" +
+      "<div class='card-badges'>" +
+        "<span class='badge'>" + escapeHtml(compactPath(issue.linkedDirectory || "")) + "</span>" +
+        (getDependencyIssueId(issue) ? "<span class='badge " + (hasUnresolvedDependency(issue) ? "active" : "done") + "'>depends on " + escapeHtml(shortId(getDependencyIssueId(issue))) + "</span>" : "") +
+        "<span class='badge'>Updated " + escapeHtml(formatDate(issue.updatedAt)) + "</span>" +
+      "</div>" +
+      "<div class='backlog-spec'>" + escapeHtml(String(issue.spec || "").trim().slice(0, 500) || "No spec yet.") + "</div>" +
+    "</article>"
+  ).join("");
+}
+
 function renderBoard() {
   renderMetrics();
+  renderViewTabs();
   const board = document.getElementById("board");
+  const backlog = document.getElementById("backlog-view");
+  board.hidden = activeView !== "kanban";
+  if (backlog) backlog.hidden = activeView !== "backlog";
+  renderBacklog();
   board.innerHTML = "";
-  for (const lane of LANES) {
+  for (const lane of KANBAN_LANES) {
     if (filters.lane !== "all" && filters.lane !== lane) continue;
     const laneEl = document.createElement("section");
     laneEl.className = "lane";
@@ -1940,7 +2118,7 @@ async function load() {
   syncCompletedTicketMinimization(nextState);
   state = nextState;
   if (selectedId && !issueById(selectedId)) selectedId = null;
-  populateDependencyOptions();
+  populateDependencyOptions(issueFormMode === "edit" ? { excludeId: editingBacklogId } : {});
   populateLinkedDirectoryOptions();
   renderBoard();
   renderDetail();
@@ -1948,7 +2126,7 @@ async function load() {
 
 function populateLaneFilter() {
   const laneFilter = document.getElementById("lane-filter");
-  laneFilter.innerHTML = "<option value='all'>All lanes</option>" + LANES.map((lane) => "<option value='" + escapeHtml(lane) + "'>" + escapeHtml(lane) + "</option>").join("");
+  laneFilter.innerHTML = "<option value='all'>All Kanban lanes</option>" + KANBAN_LANES.map((lane) => "<option value='" + escapeHtml(lane) + "'>" + escapeHtml(lane) + "</option>").join("");
 }
 
 document.getElementById("linkedDirectory").addEventListener("input", (event) => {
@@ -1982,22 +2160,40 @@ document.getElementById("issue-form").addEventListener("submit", async (event) =
   event.preventDefault();
   const formEl = event.currentTarget;
   const form = new FormData(formEl);
+  const action = event.submitter?.value || (issueFormMode === "edit" ? "save" : "create");
+  const payload = {
+    title: form.get("title"),
+    linkedDirectory: form.get("linkedDirectory"),
+    spec: form.get("spec"),
+    dependencyIssueId: form.get("dependencyIssueId") || null,
+    agentSettings: readAgentSettings(form)
+  };
   try {
-    const issue = await api("/api/issues", {
-      method: "POST",
-      body: JSON.stringify({
-        title: form.get("title"),
-        linkedDirectory: form.get("linkedDirectory"),
-        spec: form.get("spec"),
-        dependencyIssueId: form.get("dependencyIssueId") || null,
-        agentSettings: readAgentSettings(form)
-      })
-    });
+    let issue;
+    if (issueFormMode === "edit") {
+      if (!editingBacklogId) throw new Error("No backlog issue is selected for editing.");
+      if (action === "send") {
+        const block = backlogSendBlockMessage();
+        if (block) throw new Error(block);
+        await api("/api/issues/" + encodeURIComponent(editingBacklogId) + "/update-backlog", { method: "POST", body: JSON.stringify(payload) });
+        issue = await api("/api/issues/" + encodeURIComponent(editingBacklogId) + "/send-to-agent", { method: "POST", body: "{}" });
+      } else {
+        issue = await api("/api/issues/" + encodeURIComponent(editingBacklogId) + "/update-backlog", { method: "POST", body: JSON.stringify(payload) });
+      }
+    } else {
+      issue = await api("/api/issues", {
+        method: "POST",
+        body: JSON.stringify({ ...payload, backlog: action === "backlog" })
+      });
+    }
     selectedId = issue.metadata.id;
+    if (action === "backlog" || (issue.metadata && issue.metadata.lane === LANE.BACKLOG)) activeView = "backlog";
+    else activeView = "kanban";
     formEl.reset();
     setDefaultAgentSettings();
     populateDependencyOptions();
     populateLinkedDirectoryOptions();
+    setIssueFormMode("create");
     closeCreateDrawer();
     await load();
   } catch (error) {
@@ -2010,6 +2206,7 @@ document.getElementById("close-share").addEventListener("click", closeShareDialo
 document.getElementById("share-backdrop").addEventListener("click", closeShareDialog);
 document.getElementById("copy-share").addEventListener("click", () => copyShareUrl().catch((error) => alert(error.message)));
 document.getElementById("open-create").addEventListener("click", openCreateDrawer);
+document.getElementById("open-backlog-create").addEventListener("click", () => { activeView = "backlog"; openCreateDrawer(); });
 document.getElementById("close-create").addEventListener("click", closeCreateDrawer);
 document.getElementById("drawer-backdrop").addEventListener("click", closeCreateDrawer);
 document.getElementById("search").addEventListener("input", (event) => {
@@ -2024,6 +2221,13 @@ document.getElementById("state-filter").addEventListener("change", (event) => {
   filters.state = event.target.value;
   renderBoard();
 });
+document.getElementById("dependencyIssueId").addEventListener("change", updateIssueFormActions);
+for (const button of document.querySelectorAll("[data-view]")) {
+  button.addEventListener("click", () => {
+    activeView = button.dataset.view || "kanban";
+    renderBoard();
+  });
+}
 document.getElementById("profileSelect").addEventListener("change", (event) => {
   selectedProfileId = event.target.value || DEFAULT_PROFILE_ID;
   applyAgentSettings(profileById(selectedProfileId).agentSettings);
@@ -2067,6 +2271,11 @@ document.getElementById("board").addEventListener("keydown", (event) => {
   selectedId = card.dataset.id;
   renderBoard();
   renderDetail();
+});
+document.getElementById("backlog-list").addEventListener("click", (event) => {
+  const edit = event.target.closest("[data-edit-backlog]");
+  if (!edit) return;
+  openEditIssueDrawer(issueById(edit.dataset.editBacklog));
 });
 document.getElementById("detail").addEventListener("click", (event) => {
   const tab = event.target.closest("[data-tab]");
