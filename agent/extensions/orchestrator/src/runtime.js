@@ -53,16 +53,12 @@ function isActiveMerger(metadata) {
 
 async function verifyIssueBranchMerged(metadata) {
 	if (!metadata.git?.repoRoot || !metadata.git?.branchName || !metadata.git?.baseBranch) return null;
-	const check = await execGit(["merge-base", "--is-ancestor", metadata.git.branchName, metadata.git.baseBranch], metadata.git.repoRoot, {
-		allowExitCodes: [0, 1],
-	});
-	if (check.code !== 0) {
-		throw new Error(
-			`Merger reported success, but ${metadata.git.branchName} is not merged into ${metadata.git.baseBranch}.`,
-		);
-	}
-	const branchHead = (await execGit(["rev-parse", metadata.git.branchName], metadata.git.repoRoot)).stdout.trim();
-	const baseHead = (await execGit(["rev-parse", metadata.git.baseBranch], metadata.git.repoRoot)).stdout.trim();
+	const branchHead = (
+		await execGit(["rev-parse", "--verify", `refs/heads/${metadata.git.branchName}^{commit}`], metadata.git.repoRoot)
+	).stdout.trim();
+	const baseHead = (
+		await execGit(["rev-parse", "--verify", `refs/heads/${metadata.git.baseBranch}^{commit}`], metadata.git.repoRoot)
+	).stdout.trim();
 	return {
 		finalCommitSha: branchHead,
 		mergedToBranch: metadata.git.baseBranch,

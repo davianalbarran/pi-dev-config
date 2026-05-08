@@ -133,7 +133,7 @@ export async function commitIssueWorktree(store, id) {
 	if (diff.code === 0) {
 		throw new Error("No staged changes to commit in the issue worktree.");
 	}
-	const subject = `${metadata.id}: ${metadata.title}`.slice(0, 180);
+	const subject = `chore(orchestrator): complete ${metadata.title}`.slice(0, 180);
 	await execGit(["commit", "-m", subject], cwd);
 	const commitSha = (await execGit(["rev-parse", "HEAD"], cwd)).stdout.trim();
 	await store.updateMetadata(id, (current) => ({
