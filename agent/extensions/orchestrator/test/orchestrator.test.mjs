@@ -204,6 +204,9 @@ test("dashboard renderer injects runtime data", async () => {
 	assert.match(html, /Add to Backlog/);
 	assert.match(html, /Edit Issue/);
 	assert.match(html, /Send to Agent/);
+	assert.match(html, /board\.hidden = activeView !== "kanban";/);
+	assert.match(html, /backlog\.hidden = activeView !== "backlog";/);
+	assert.match(html, /if \(activeView !== "kanban"\) return;\s*for \(const lane of KANBAN_LANES\)/);
 	assert.match(html, /for \(const lane of KANBAN_LANES\)/);
 	assert.match(html, /const KANBAN_LANES =/);
 	assert.match(html, /id="open-share"/);
@@ -287,6 +290,7 @@ test("dashboard css keeps the desktop board compact and stacks it on mobile", as
 	const html = await renderDashboardHtml("test-token");
 
 	assert.match(html, /body \{[^}]*min-width: 0;[^}]*overflow-x: hidden;/);
+	assert.match(html, /\[hidden\] \{ display: none !important; \}/);
 	assert.doesNotMatch(html, /body \{[^}]*width: 100vw;/);
 	assert.match(html, /\.topbar \{[^}]*width: 100%;[^}]*min-width: 0;/);
 	assert.match(html, /\.top-actions \{[^}]*justify-content: flex-end;[^}]*min-width: 0;/);

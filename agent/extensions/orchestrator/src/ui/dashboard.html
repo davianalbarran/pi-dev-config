@@ -58,6 +58,7 @@
   }
 }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 html, body { min-height: 100%; }
 body {
   margin: 0;
@@ -1750,6 +1751,7 @@ function renderBoard() {
   if (backlog) backlog.hidden = activeView !== "backlog";
   renderBacklog();
   board.innerHTML = "";
+  if (activeView !== "kanban") return;
   for (const lane of KANBAN_LANES) {
     if (filters.lane !== "all" && filters.lane !== lane) continue;
     const laneEl = document.createElement("section");
