@@ -266,6 +266,8 @@ export class OrchestratorServer {
 		const action = match[2];
 		const body = await readJsonBody(req);
 		if (action === "comment") return sendJson(res, 200, await this.actions.comment(id, body));
+		if (action === "update-backlog") return sendJson(res, 200, await this.actions.updateBacklogIssue(id, body));
+		if (action === "send-to-agent") return sendJson(res, 200, await this.actions.sendBacklogIssueToAgent(id));
 		if (action === "approve-plan") return sendJson(res, 200, await this.actions.approvePlan(id));
 		if (action === "request-plan-changes") return sendJson(res, 200, await this.actions.requestPlanChanges(id, body));
 		if (action === "approve-review") return sendJson(res, 200, await this.actions.approveReview(id));
