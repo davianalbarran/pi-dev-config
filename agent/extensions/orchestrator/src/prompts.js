@@ -76,6 +76,26 @@ export function parseFinalReviewerOutput(text) {
 	};
 }
 
+export function buildSpecWriterPrompt({ spec, suggestions } = {}) {
+	const currentSpec = String(spec || "").trim();
+	const humanSuggestions = String(suggestions || "").trim();
+	return [
+		"You are the spec writer for a local Pi orchestrator issue.",
+		"Rewrite the user's draft into a strong implementation spec that another agent can plan and work from.",
+		"Preserve the user's intent. Add clarity, acceptance criteria, constraints, edge cases, and test expectations when they can be inferred.",
+		"Do not invent project facts. If important context is missing, phrase assumptions explicitly inside the spec instead of asking questions.",
+		"Return only the improved spec text. Do not include commentary, preambles, code fences, or labels.",
+		"",
+		"Current spec draft:",
+		currentSpec || "(empty spec)",
+		"",
+		"Human suggestions for this rewrite:",
+		humanSuggestions || "(none)",
+		"",
+		"Output the improved spec only.",
+	].join("\n");
+}
+
 export function buildPlannerPrompt(issue) {
 	return [
 		"You are the planning agent for a local Pi orchestrator issue.",

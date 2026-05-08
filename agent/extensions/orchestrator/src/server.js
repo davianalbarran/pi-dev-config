@@ -327,6 +327,15 @@ export class OrchestratorServer {
 			}
 		}
 
+		if (pathname === "/api/spec/improve" && req.method === "POST") {
+			try {
+				const body = await readJsonBody(req);
+				return sendJson(res, 200, await this.actions.improveSpec(body));
+			} catch (error) {
+				return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+			}
+		}
+
 		if (pathname === "/api/issues" && req.method === "POST") {
 			const body = await readJsonBody(req);
 			const issue = await this.actions.createIssue(body);

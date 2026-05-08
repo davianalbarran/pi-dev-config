@@ -226,6 +226,55 @@ input, textarea, select {
   padding: 9px 10px;
 }
 textarea { min-height: 150px; resize: vertical; }
+input:disabled, textarea:disabled, select:disabled { opacity: .68; cursor: not-allowed; }
+.spec-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 12px 0 6px;
+}
+.spec-header label { margin: 0; }
+.spec-wand-button {
+  min-height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 5px 9px;
+  border-color: color-mix(in srgb, var(--warn) 62%, var(--line));
+  color: var(--warn);
+}
+.spec-wand-button:not(:disabled):hover { border-color: var(--warn); background: color-mix(in srgb, var(--warn) 12%, transparent); }
+.spec-wand-icon { line-height: 1; }
+.spec-improved {
+  margin-top: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--surface-2) 72%, transparent);
+  padding: 10px;
+}
+.spec-improved[hidden] { display: none; }
+.spec-improved-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.spec-improved-head h3 { margin: 0; font-size: 14px; }
+.spec-improved-actions { display: flex; gap: 6px; }
+.spec-improved-actions button { min-height: 32px; min-width: 34px; padding: 5px 8px; }
+#improved-spec { min-height: 150px; }
+.spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid color-mix(in srgb, currentColor 34%, transparent);
+  border-top-color: currentColor;
+  border-radius: 999px;
+  animation: spin .8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
 .picker-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(160px, 220px) auto; gap: 8px; align-items: end; }
 fieldset {
   border: 1px solid var(--line);
@@ -826,8 +875,22 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
         <button type="button" class="secondary desktop-directory-picker" id="pick-directory">Choose</button>
       </div>
       <datalist id="linkedDirectorySuggestions"></datalist>
-      <label for="spec">Spec</label>
+      <div class="spec-header">
+        <label for="spec">Spec</label>
+        <button type="button" class="ghost spec-wand-button" id="spec-wand" title="Improve spec with Spec Writer" aria-label="Improve spec with Spec Writer"><span class="spec-wand-icon" aria-hidden="true">🪄</span></button>
+      </div>
       <textarea id="spec" name="spec" required></textarea>
+      <div class="spec-improved" id="improved-spec-container" hidden>
+        <div class="spec-improved-head">
+          <h3>Improved Spec</h3>
+          <div class="spec-improved-actions">
+            <button type="button" id="accept-improved-spec" title="Use improved spec" aria-label="Use improved spec">✓</button>
+            <button type="button" class="bad" id="reject-improved-spec" title="Reject improved spec" aria-label="Reject improved spec">✕</button>
+            <button type="button" class="secondary" id="refine-improved-spec" title="Suggest refinements" aria-label="Suggest refinements">?</button>
+          </div>
+        </div>
+        <textarea id="improved-spec" readonly></textarea>
+      </div>
       <label for="dependencyIssueId">Depends on issue</label>
       <select id="dependencyIssueId" name="dependencyIssueId">
         <option value="">No dependency</option>
@@ -914,6 +977,10 @@ let diffLoading = false;
 let diffError = "";
 let diffLoadedKey = "";
 let shareInfo = null;
+let specImproveLoading = false;
+let improvedSpecText = "";
+let specWriterSuggestions = [];
+let specImproveRequestId = 0;
 const expandedDiffFiles = new Set();
 
 function cssPixelValue(name, fallback) {
@@ -1050,6 +1117,88 @@ function api(path, options = {}) {
     if (!res.ok) throw new Error(data.error || res.statusText);
     return data;
   });
+}
+
+function resetSpecWriterState() {
+  specImproveRequestId += 1;
+  specImproveLoading = false;
+  improvedSpecText = "";
+  specWriterSuggestions = [];
+  setSpecWriterLoading(false);
+  renderImprovedSpec();
+}
+
+function setSpecWriterLoading(loading) {
+  specImproveLoading = !!loading;
+  const spec = document.getElementById("spec");
+  const wand = document.getElementById("spec-wand");
+  if (spec) spec.disabled = specImproveLoading;
+  if (wand) {
+    wand.disabled = specImproveLoading;
+    wand.innerHTML = specImproveLoading
+      ? '<span class="spinner" aria-hidden="true"></span><span>Improving</span>'
+      : '<span class="spec-wand-icon" aria-hidden="true">🪄</span>';
+  }
+  for (const id of ["accept-improved-spec", "reject-improved-spec", "refine-improved-spec"]) {
+    const button = document.getElementById(id);
+    if (button) button.disabled = specImproveLoading;
+  }
+}
+
+function renderImprovedSpec() {
+  const container = document.getElementById("improved-spec-container");
+  const textarea = document.getElementById("improved-spec");
+  if (!container || !textarea) return;
+  container.hidden = !improvedSpecText;
+  textarea.value = improvedSpecText;
+}
+
+async function improveSpecWithWriter(specOverride = null) {
+  if (specImproveLoading) return;
+  const specInput = document.getElementById("spec");
+  const spec = String(specOverride ?? (specInput.value || "")).trim();
+  if (!spec) {
+    alert("Write a spec before using the magic wand.");
+    return;
+  }
+  const requestId = ++specImproveRequestId;
+  setSpecWriterLoading(true);
+  try {
+    const result = await api("/api/spec/improve", {
+      method: "POST",
+      body: JSON.stringify({
+        spec,
+        suggestions: specWriterSuggestions.join("\n\n"),
+        linkedDirectory: document.getElementById("linkedDirectory").value
+      })
+    });
+    if (requestId !== specImproveRequestId) return;
+    improvedSpecText = String(result.spec || "").trim();
+    if (!improvedSpecText) throw new Error("Spec writer returned an empty spec.");
+    renderImprovedSpec();
+  } catch (error) {
+    if (requestId === specImproveRequestId) alert(error.message);
+  } finally {
+    if (requestId === specImproveRequestId) setSpecWriterLoading(false);
+  }
+}
+
+function acceptImprovedSpec() {
+  if (!improvedSpecText) return;
+  document.getElementById("spec").value = improvedSpecText;
+  resetSpecWriterState();
+}
+
+function rejectImprovedSpec() {
+  resetSpecWriterState();
+}
+
+function refineImprovedSpec() {
+  if (specImproveLoading) return;
+  const suggestion = prompt("What should the spec writer improve or correct?");
+  if (!suggestion || !suggestion.trim()) return;
+  specWriterSuggestions.push(suggestion.trim());
+  improveSpecWithWriter(improvedSpecText || document.getElementById("spec").value).catch((error) => alert(error.message));
 }
 
 function shareSvgUrl(cacheKey = Date.now()) {
@@ -1509,6 +1658,7 @@ function fillIssueForm(issue) {
 function openCreateDrawer(options = {}) {
   const form = document.getElementById("issue-form");
   form.reset();
+  resetSpecWriterState();
   selectedProfileId = DEFAULT_PROFILE_ID;
   setDefaultAgentSettings();
   populateDependencyOptions();
@@ -1523,6 +1673,7 @@ function openCreateDrawer(options = {}) {
 
 function openEditIssueDrawer(issue) {
   if (!issue || issue.lane !== LANE.BACKLOG) return;
+  resetSpecWriterState();
   setIssueFormMode("edit", issue);
   fillIssueForm(issue);
   populateLinkedDirectoryOptions();
@@ -1534,6 +1685,7 @@ function openEditIssueDrawer(issue) {
 }
 
 function closeCreateDrawer() {
+  resetSpecWriterState();
   const drawer = document.getElementById("create-drawer");
   drawer.classList.remove("open");
   drawer.setAttribute("aria-hidden", "true");
@@ -2156,8 +2308,20 @@ if (pickDirectoryButton) pickDirectoryButton.addEventListener("click", async () 
   }
 });
 
+document.getElementById("spec-wand").addEventListener("click", () => {
+  specWriterSuggestions = [];
+  improveSpecWithWriter().catch((error) => alert(error.message));
+});
+document.getElementById("accept-improved-spec").addEventListener("click", acceptImprovedSpec);
+document.getElementById("reject-improved-spec").addEventListener("click", rejectImprovedSpec);
+document.getElementById("refine-improved-spec").addEventListener("click", refineImprovedSpec);
+
 document.getElementById("issue-form").addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (specImproveLoading) {
+    alert("Wait for the spec writer to finish before saving.");
+    return;
+  }
   const formEl = event.currentTarget;
   const form = new FormData(formEl);
   const action = event.submitter?.value || (issueFormMode === "edit" ? "save" : "create");
@@ -2190,6 +2354,7 @@ document.getElementById("issue-form").addEventListener("submit", async (event) =
     if (action === "backlog" || (issue.metadata && issue.metadata.lane === LANE.BACKLOG)) activeView = "backlog";
     else activeView = "kanban";
     formEl.reset();
+    resetSpecWriterState();
     setDefaultAgentSettings();
     populateDependencyOptions();
     populateLinkedDirectoryOptions();
