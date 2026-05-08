@@ -29,6 +29,7 @@ export class IssueStore {
 		this.issuesRoot = path.join(this.dataRoot, "issues");
 		this.worktreesRoot = path.join(this.dataRoot, "worktrees");
 		this.sessionsRoot = path.join(this.dataRoot, "sessions");
+		this.internalRunsRoot = path.join(this.dataRoot, "runs");
 		this.profilesPath = path.join(this.dataRoot, "profiles.json");
 		this.listeners = new Set();
 		this.watchHandle = null;
@@ -40,6 +41,7 @@ export class IssueStore {
 		await ensureDir(this.issuesRoot);
 		await ensureDir(this.worktreesRoot);
 		await ensureDir(this.sessionsRoot);
+		await ensureDir(this.internalRunsRoot);
 	}
 
 	defaultProfile() {
@@ -121,6 +123,10 @@ export class IssueStore {
 
 	runPath(id, runId) {
 		return path.join(this.issueDir(id), "runs", `${runId}.jsonl`);
+	}
+
+	internalRunPath(scope, runId) {
+		return path.join(this.internalRunsRoot, scope, `${runId}.jsonl`);
 	}
 
 	onChange(listener) {
@@ -253,7 +259,10 @@ export class IssueStore {
 	async listIssueIds() {
 		await this.init();
 		const entries = await fsp.readdir(this.issuesRoot, { withFileTypes: true });
-		return entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort();
+		return entries
+			.filter((entry) => entry.isDirectory() && !entry.name.startsWith("__"))
+			.map((entry) => entry.name)
+			.sort();
 	}
 
 	async loadIssue(id) {

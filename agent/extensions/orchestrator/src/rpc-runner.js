@@ -47,9 +47,9 @@ export class RpcAgentRunner {
 		this.running = new Map();
 	}
 
-	async run({ issueId, role, cwd, prompt, signal, agentSettings = null, onRunStarted = null }) {
+	async run({ issueId, role, cwd, prompt, signal, agentSettings = null, onRunStarted = null, internal = false }) {
 		const runId = `${Date.now()}-${role}-${Math.random().toString(36).slice(2, 8)}`;
-		const runLogPath = this.store.runPath(issueId, runId);
+		const runLogPath = internal ? this.store.internalRunPath(issueId, runId) : this.store.runPath(issueId, runId);
 		await ensureDir(path.dirname(runLogPath));
 
 		const roleConfig = await loadRoleConfig(role);
@@ -58,7 +58,15 @@ export class RpcAgentRunner {
 			model: agentSettings?.model || roleConfig.model,
 			thinking: agentSettings?.thinking || roleConfig.thinking,
 		};
-		await this.store.appendRunEvent(issueId, runId, {
+		const appendLifecycleEvent = async (event) => {
+			if (internal) {
+				const line = serializeRunEvent(event);
+				if (line) await fsp.appendFile(runLogPath, line, "utf-8");
+				return { ...event };
+			}
+			return this.store.appendRunEvent(issueId, runId, event);
+		};
+		await appendLifecycleEvent({
 			type: "run_started",
 			role,
 			cwd,
@@ -262,7 +270,7 @@ export class RpcAgentRunner {
 			touchIdleTimer();
 			await send({ type: "prompt", message: prompt });
 			await agentEndPromise;
-			await this.store.appendRunEvent(issueId, runId, { type: "run_finished", role });
+			await appendLifecycleEvent({ type: "run_finished", role });
 			return {
 				runId,
 				role,

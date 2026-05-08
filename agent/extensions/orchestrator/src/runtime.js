@@ -1,6 +1,7 @@
 import * as crypto from "node:crypto";
+import * as fsp from "node:fs/promises";
 import { DEFAULT_CONFIG } from "./constants.js";
-import { buildMergerPrompt, parseMergerOutput } from "./prompts.js";
+import { buildMergerPrompt, buildSpecWriterPrompt, parseMergerOutput } from "./prompts.js";
 import { RpcAgentRunner } from "./rpc-runner.js";
 import { OrchestratorScheduler } from "./scheduler.js";
 import { OrchestratorServer } from "./server.js";
@@ -49,6 +50,17 @@ function mergeTargetError(metadata) {
 
 function isActiveMerger(metadata) {
 	return metadata?.automation?.activeRole === "merger" && !!metadata?.automation?.activeRunId;
+}
+
+async function validDirectoryOrNull(value) {
+	const dir = String(value || "").trim();
+	if (!dir) return null;
+	try {
+		const stat = await fsp.stat(dir);
+		return stat.isDirectory() ? dir : null;
+	} catch {
+		return null;
+	}
 }
 
 async function verifyIssueBranchMerged(metadata) {
@@ -288,6 +300,22 @@ export class OrchestratorRuntime {
 
 	createActions() {
 		return {
+			improveSpec: async (body = {}) => {
+				const spec = String(body.spec || "").trim();
+				if (!spec) throw new Error("Spec is required to improve it.");
+				const cwd = (await validDirectoryOrNull(body.linkedDirectory)) || process.cwd();
+				const result = await this.runner.run({
+					issueId: "spec-writer",
+					role: "spec-writer",
+					cwd,
+					prompt: buildSpecWriterPrompt({ spec, suggestions: body.suggestions }),
+					agentSettings: null,
+					internal: true,
+				});
+				const improvedSpec = String(result?.text || "").trim();
+				if (!improvedSpec) throw new Error("Spec writer returned an empty spec.");
+				return { spec: improvedSpec };
+			},
 			createIssue: async (body) => {
 				const issue = await this.store.createIssue({
 					title: body.title,

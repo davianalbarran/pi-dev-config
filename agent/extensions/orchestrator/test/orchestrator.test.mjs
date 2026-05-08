@@ -6,7 +6,7 @@ import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
-import { DEFAULT_PROFILE_ID, KANBAN_LANES, LANE, LANES, ROLE_DEFAULTS } from "../src/constants.js";
+import { DEFAULT_PROFILE_ID, KANBAN_LANES, LANE, LANES, ROLE_DEFAULTS, ROLE_TOOLS } from "../src/constants.js";
 import { getIssueDiffs } from "../src/diffs.js";
 import {
 	PLAN_END,
@@ -16,6 +16,7 @@ import {
 	REVIEW_REPORT_END,
 	REVIEW_REPORT_START,
 	buildMergerPrompt,
+	buildSpecWriterPrompt,
 	parseFinalReviewerOutput,
 	parseMergerOutput,
 	parsePlannerOutput,
@@ -94,6 +95,14 @@ test("orchestrator constants distinguish valid lanes from Kanban lanes", () => {
 		LANE.IN_REVIEW,
 		LANE.COMPLETED,
 	]);
+});
+
+test("spec writer role has read-only tool and default model config", () => {
+	assert.equal(ROLE_TOOLS["spec-writer"], "read,grep,find,ls");
+	assert.deepEqual(ROLE_DEFAULTS["spec-writer"], {
+		model: ROLE_DEFAULTS.planner.model,
+		thinking: "medium",
+	});
 });
 
 test("LAN address selection returns first external IPv4 address", () => {
@@ -204,6 +213,18 @@ test("dashboard renderer injects runtime data", async () => {
 	assert.match(html, /id="linkedDirectoryQuickSelect"/);
 	assert.match(html, /class="secondary desktop-directory-picker" id="pick-directory"/);
 	assert.match(html, /id="linkedDirectorySuggestions"/);
+	assert.match(html, /id="spec-wand"/);
+	assert.match(html, /Improve spec with Spec Writer/);
+	assert.match(html, /id="improved-spec-container" hidden/);
+	assert.match(html, />Improved Spec<\/h3>/);
+	assert.match(html, /id="accept-improved-spec"/);
+	assert.match(html, /id="reject-improved-spec"/);
+	assert.match(html, /id="refine-improved-spec"/);
+	assert.match(html, /class="spinner"/);
+	assert.match(html, /\/api\/spec\/improve/);
+	assert.match(html, /function resetSpecWriterState\(\)/);
+	assert.match(html, /function setSpecWriterLoading\(loading\)/);
+	assert.match(html, /function renderImprovedSpec\(\)/);
 	assert.match(html, /function linkedDirectoryChoices\(\)/);
 	assert.match(html, /function populateLinkedDirectoryOptions\(\)/);
 	assert.match(html, /linkedDirectory"\)\.addEventListener\("input"/);
@@ -419,6 +440,60 @@ test("server exposes authenticated share metadata and QR endpoints", async () =>
 	}
 });
 
+test("server exposes authenticated spec improvement API", async () => {
+	const root = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const calls = [];
+	const reject = async () => {
+		throw new Error("not used");
+	};
+	const server = new OrchestratorServer({
+		store,
+		token: "spec-token",
+		config: { host: "127.0.0.1", port: 0 },
+		actions: {
+			improveSpec: async (body) => {
+				calls.push(body);
+				if (body.fail) throw new Error("Spec writer failed.");
+				return { spec: "Improved spec." };
+			},
+			createIssue: reject,
+			comment: reject,
+			approvePlan: reject,
+			requestPlanChanges: reject,
+			approveReview: reject,
+			approveReviewAndMerge: reject,
+			requestReviewChanges: reject,
+		},
+	});
+	const url = await server.start();
+	const base = url.split("?")[0].replace(/\/$/, "");
+	try {
+		const denied = await fetch(`${base}/api/spec/improve`, { method: "POST", body: "{}" });
+		assert.equal(denied.status, 401);
+
+		const improved = await fetch(`${base}/api/spec/improve?token=spec-token`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ spec: "Draft", suggestions: "Be clearer" }),
+		});
+		assert.equal(improved.status, 200);
+		assert.deepEqual(await improved.json(), { spec: "Improved spec." });
+		assert.deepEqual(calls[0], { spec: "Draft", suggestions: "Be clearer" });
+
+		const failed = await fetch(`${base}/api/spec/improve?token=spec-token`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ spec: "Draft", fail: true }),
+		});
+		assert.equal(failed.status, 400);
+		assert.deepEqual(await failed.json(), { error: "Spec writer failed." });
+	} finally {
+		await server.stop();
+	}
+});
+
 test("server exposes authenticated profile API", async () => {
 	const root = await tempDir();
 	const store = new IssueStore({ dataRoot: root });
@@ -564,6 +639,99 @@ test("runtime creates backlog issues without scheduling until they are sent", as
 	assert.equal(queued, 1);
 });
 
+test("runtime improves specs through spec-writer subagent", async () => {
+	const root = await tempDir();
+	const linked = await tempDir();
+	const runtime = createOrchestratorRuntime({ dataRoot: root });
+	await runtime.store.init();
+	const calls = [];
+	runtime.runner = {
+		run: async (request) => {
+			calls.push(request);
+			return { text: "  Improved runtime spec.  " };
+		},
+	};
+	const actions = runtime.createActions();
+
+	const result = await actions.improveSpec({ spec: "Draft runtime spec.", suggestions: "Add tests.", linkedDirectory: linked });
+
+	assert.deepEqual(result, { spec: "Improved runtime spec." });
+	assert.equal(calls[0].issueId, "spec-writer");
+	assert.equal(calls[0].role, "spec-writer");
+	assert.equal(calls[0].internal, true);
+	assert.equal(await fsp.realpath(calls[0].cwd), await fsp.realpath(linked));
+	assert.equal(calls[0].agentSettings, null);
+	assert.match(calls[0].prompt, /Draft runtime spec\./);
+	assert.match(calls[0].prompt, /Add tests\./);
+
+	await assert.rejects(() => actions.improveSpec({ spec: "  " }), /Spec is required/);
+	runtime.runner = { run: async () => ({ text: "  " }) };
+	await assert.rejects(() => actions.improveSpec({ spec: "Draft" }), /empty spec/);
+});
+
+test("runtime spec writer logs outside issues and does not create a synthetic board issue", async () => {
+	const root = await tempDir();
+	const linked = await tempDir();
+	const fakePi = path.join(root, "fake-pi.mjs");
+	await fsp.writeFile(
+		fakePi,
+		[
+			"#!/usr/bin/env node",
+			"let buffer = '';",
+			"process.stdin.setEncoding('utf8');",
+			"process.stdin.on('data', (chunk) => {",
+			"  buffer += chunk;",
+			"  const lines = buffer.split('\\n');",
+			"  buffer = lines.pop() || '';",
+			"  for (const line of lines) {",
+			"    if (!line.trim()) continue;",
+			"    const request = JSON.parse(line);",
+			"    if (request.type !== 'prompt') continue;",
+			"    const message = { role: 'assistant', content: [{ type: 'text', text: 'Improved by fake spec writer.' }] };",
+			"    console.log(JSON.stringify({ type: 'response', id: request.id, success: true }));",
+			"    console.log(JSON.stringify({ type: 'message_end', message }));",
+			"    console.log(JSON.stringify({ type: 'agent_end', messages: [message] }));",
+			"    setTimeout(() => process.exit(0), 20);",
+			"  }",
+			"});",
+			"",
+		].join("\n"),
+		"utf-8",
+	);
+	await fsp.chmod(fakePi, 0o755);
+
+	const runtime = createOrchestratorRuntime({ dataRoot: root });
+	await runtime.store.init();
+	runtime.runner = new RpcAgentRunner({
+		store: runtime.store,
+		command: fakePi,
+		timeoutMs: 5000,
+		idleTimeoutMs: 1000,
+	});
+	const actions = runtime.createActions();
+
+	const result = await actions.improveSpec({ spec: "Draft board-safe spec.", linkedDirectory: linked });
+
+	assert.deepEqual(result, { spec: "Improved by fake spec writer." });
+	assert.equal(await exists(path.join(root, "issues", "spec-writer")), false);
+	assert.deepEqual(await runtime.store.listIssueIds(), []);
+	assert.equal((await runtime.store.getBoardState()).issues.length, 0);
+
+	const legacyInternalIssueDir = path.join(root, "issues", "__spec-writer__");
+	await fsp.mkdir(path.join(legacyInternalIssueDir, "runs"), { recursive: true });
+	assert.deepEqual(await runtime.store.listIssueIds(), []);
+	assert.equal((await runtime.store.getBoardState()).issues.length, 0);
+	assert.equal(await exists(path.join(legacyInternalIssueDir, "events.jsonl")), false);
+
+	const internalRunDir = path.join(root, "runs", "spec-writer");
+	assert.equal(await exists(internalRunDir), true);
+	const internalRunFiles = await fsp.readdir(internalRunDir);
+	assert.equal(internalRunFiles.length, 1);
+	const log = await fsp.readFile(path.join(internalRunDir, internalRunFiles[0]), "utf-8");
+	assert.match(log, /"type":"run_started"/);
+	assert.match(log, /"type":"run_finished"/);
+});
+
 test("diff helper reports tracked, renamed, and untracked worktree changes", async () => {
 	const repo = await tempDir();
 	await git(["init"], repo);
@@ -707,6 +875,19 @@ test("issue store creates folder-per-issue artifacts and board state", async () 
 	assert.deepEqual(state.lanes[LANE.CREATED], [id]);
 	assert.equal(state.issues[0].planReport, "# Plan report\n");
 	assert.equal(state.issues[0].reviewReport, "# Review report\n");
+});
+
+test("spec writer prompt includes draft and suggestions and requires spec-only output", () => {
+	const prompt = buildSpecWriterPrompt({
+		spec: "Add a backlog magic wand.",
+		suggestions: "Mention disabled controls while loading.",
+	});
+
+	assert.match(prompt, /Add a backlog magic wand\./);
+	assert.match(prompt, /Mention disabled controls while loading\./);
+	assert.match(prompt, /Return only the improved spec text/);
+	assert.match(prompt, /Output the improved spec only\./);
+	assert.doesNotMatch(prompt, /BEGIN_IMPLEMENTATION_PLAN/);
 });
 
 test("planner and final reviewer outputs parse delimited human reports with fallback", () => {

@@ -46,6 +46,7 @@ export const DEFAULT_CONFIG = Object.freeze({
 
 export const ROLE_TOOLS = Object.freeze({
 	planner: "read,grep,find,ls",
+	"spec-writer": "read,grep,find,ls",
 	worker: "read,bash,edit,write,grep,find,ls",
 	reviewer: "read,bash,grep,find,ls",
 	"final-reviewer": "read,bash,grep,find,ls",
@@ -54,6 +55,10 @@ export const ROLE_TOOLS = Object.freeze({
 
 export const ROLE_DEFAULTS = Object.freeze({
 	planner: {
+		model: "openai-codex/gpt-5.5",
+		thinking: "medium",
+	},
+	"spec-writer": {
 		model: "openai-codex/gpt-5.5",
 		thinking: "medium",
 	},
