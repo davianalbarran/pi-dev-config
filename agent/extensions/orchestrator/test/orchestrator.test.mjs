@@ -15,6 +15,7 @@ import {
 	PLAN_START,
 	REVIEW_REPORT_END,
 	REVIEW_REPORT_START,
+	buildMergerPrompt,
 	parseFinalReviewerOutput,
 	parseMergerOutput,
 	parsePlannerOutput,
@@ -737,6 +738,34 @@ test("merger output parser requires explicit merged result", () => {
 	assert.deepEqual(parseMergerOutput("Plain summary without marker.").result, "BLOCKED");
 });
 
+test("merger prompt requires squash merge and Conventional Commits", () => {
+	const prompt = buildMergerPrompt({
+		metadata: {
+			id: "PI-merge-prompt",
+			title: "Merge prompt",
+			linkedDirectory: "/repo",
+			workspace: { kind: "git-worktree", path: "/repo/worktree" },
+			git: {
+				repoRoot: "/repo",
+				baseBranch: "main",
+				baseSha: "abc123",
+				branchName: "pi-orchestrator/pi-merge-prompt",
+				worktreePath: "/repo/worktree",
+			},
+		},
+		spec: "Make the merge useful.",
+		plan: "Squash branch changes.",
+		reviewReport: "Ready to merge.",
+		comments: [],
+		events: [],
+	});
+
+	assert.match(prompt, /git merge --squash <issue-branch>/);
+	assert.match(prompt, /Conventional Commit/);
+	assert.match(prompt, /final base-branch commit must be a Conventional Commit/);
+	assert.match(prompt, /squash commit created/);
+});
+
 test("issue store defaults new issue agent models to gpt-5.5", async () => {
 	const root = await tempDir();
 	const linked = await tempDir();
@@ -1030,13 +1059,15 @@ test("workspace manager creates a central git worktree and completion commit", a
 	const commit = await commitIssueWorktree(store, issue.metadata.id);
 	assert.equal(commit.kind, "git");
 	assert.match(commit.commitSha, /^[a-f0-9]{40}$/);
+	const subject = (await git(["log", "-1", "--pretty=%s"], workspace.path)).stdout.trim();
+	assert.equal(subject, "chore(orchestrator): complete Update readme");
 
 	const reloaded = await store.loadIssue(issue.metadata.id);
 	const completed = approveReview(reloaded.metadata);
 	assert.equal(completed.lane, LANE.COMPLETED);
 });
 
-test("approve and merge starts merger rpc role and completes after branch is merged", async () => {
+test("approve and merge starts merger rpc role and completes after squash merge", async () => {
 	const root = await tempDir();
 	const repo = await tempDir();
 	await git(["init"], repo);
@@ -1069,11 +1100,14 @@ test("approve and merge starts merger rpc role and completes after branch is mer
 			assert.match(prompt, /Update the readme and merge it/);
 			assert.match(prompt, /Update README\.md/);
 			assert.match(prompt, /Human review says this is ready/);
+			assert.match(prompt, /git merge --squash/);
+			assert.match(prompt, /Conventional Commit/);
 			if (onRunStarted) await onRunStarted("merge-run");
 			await git(["add", "-A"], workspace.path);
-			await git(["commit", "-m", "test completion"], workspace.path);
-			await git(["merge", prepared.metadata.git.branchName], repo);
-			return { runId: "merge-run", text: "MERGE_RESULT: MERGED\nMerged into the base branch." };
+			await git(["commit", "-m", "chore(orchestrator): complete merge readme update"], workspace.path);
+			await git(["merge", "--squash", prepared.metadata.git.branchName], repo);
+			await git(["commit", "-m", "feat: update readme"], repo);
+			return { runId: "merge-run", text: "MERGE_RESULT: MERGED\nSquash commit created on the base branch." };
 		},
 		stopAll: async () => {},
 	};
@@ -1085,6 +1119,15 @@ test("approve and merge starts merger rpc role and completes after branch is mer
 	assert.equal(calls.length, 1);
 	assert.equal(completed.metadata.git.mergedToBranch, baseBranch);
 	assert.match(completed.metadata.git.mergeCommitSha, /^[a-f0-9]{40}$/);
+	assert.equal(completed.metadata.git.mergeCommitSha, (await git(["rev-parse", baseBranch], repo)).stdout.trim());
+	assert.equal((await git(["log", "-1", "--pretty=%s"], repo)).stdout.trim(), "feat: update readme");
+	let issueBranchIsAncestor = true;
+	try {
+		await git(["merge-base", "--is-ancestor", prepared.metadata.git.branchName, baseBranch], repo);
+	} catch {
+		issueBranchIsAncestor = false;
+	}
+	assert.equal(issueBranchIsAncestor, false, "squash-merged issue branch should not need to be a base ancestor");
 	assert.equal(await fsp.readFile(path.join(repo, "README.md"), "utf-8"), "after\n");
 	assert.equal(completed.events.some((event) => event.type === "review_approved_and_merged"), true);
 });
