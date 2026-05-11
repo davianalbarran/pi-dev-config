@@ -40,10 +40,12 @@ import { branchNameForIssue, commitIssueWorktree, ensureIssueWorkspace } from ".
 import {
 	approvePlan,
 	approveReview,
+	canRequestResume,
 	isDependencyResolved,
 	normalizeMetadata,
 	requestPlanChanges,
 	requestReviewChanges,
+	resumeBlockedReason,
 } from "../src/workflow.js";
 
 const execFileAsync = promisify(execFile);
@@ -202,6 +204,26 @@ function notificationVmContext({ permission, requestPermission, supported = true
 		context.window = {};
 	}
 	return context;
+}
+
+function dashboardResumeTestSource(html) {
+	const laneDeclaration = html.match(/const LANE = .*?;\n/)?.[0];
+	assert.ok(laneDeclaration, "dashboard script declares LANE");
+	const resumeHelpersStart = html.indexOf("function issueById(id)");
+	const resumeHelpersEnd = html.indexOf("function issueState(issue)", resumeHelpersStart);
+	const postResumeStart = html.indexOf("async function postResumeIssue(id)");
+	const escapeStart = html.indexOf("function escapeHtml(value)", postResumeStart);
+	const escapeEnd = html.indexOf("function renderInlineMarkdown(value)", escapeStart);
+	assert.ok(resumeHelpersStart !== -1 && resumeHelpersEnd > resumeHelpersStart, "dashboard script declares resume helpers");
+	assert.ok(postResumeStart !== -1 && escapeStart > postResumeStart && escapeEnd > escapeStart, "dashboard script declares resume action helpers");
+	return [
+		laneDeclaration,
+		"let state = { issues: [], lanes: {} };\n",
+		"const pendingResumeIssueIds = new Set();\n",
+		html.slice(resumeHelpersStart, resumeHelpersEnd),
+		html.slice(postResumeStart, escapeEnd),
+		`\nglobalThis.__dashboardResume = {\n\tsetState(next) { state = next; },\n\tresumeEligibility,\n\tresumeDisabledReason,\n\trenderResumeAction,\n\tpostResumeIssue,\n\tisPending(id) { return pendingResumeIssueIds.has(id); },\n};\n`,
+	].join("");
 }
 
 test("token authorization accepts query, header, and bearer token", () => {
@@ -404,6 +426,7 @@ test("dashboard renderer injects runtime data", async () => {
 	assert.match(html, /if \(feedback\) feedback\.value = feedbackDraft\(issue\.id\);/);
 	assert.match(html, /feedback\.addEventListener\("input", \(\) => feedbackDraftsByIssueId\.set\(issue\.id, feedback\.value\)\)/);
 	assert.match(html, /const minimizedIssueIds = new Set\(\);/);
+	assert.match(html, /const pendingResumeIssueIds = new Set\(\);/);
 	assert.match(html, /let issueLaneById = new Map\(\);/);
 	assert.match(html, /function minimizedTitle\(title\)/);
 	assert.match(html, /function syncCompletedTicketMinimization\(nextState\)/);
@@ -434,6 +457,14 @@ test("dashboard renderer injects runtime data", async () => {
 	assert.ok(minimizedTitleAfterHead > minimizedHeadClose, "minimized card title renders outside and after the card head");
 	assert.match(html, /data-minimize-toggle/);
 	assert.match(html, /aria-expanded='/);
+	assert.match(html, /Resume from last session/);
+	assert.match(html, /function resumeEligibility\(issue\)/);
+	assert.match(html, /function resumeDisabledReason\(issue\)/);
+	assert.match(html, /async function postResumeIssue\(id\)/);
+	assert.match(html, /pendingResumeIssueIds\.has\(id\)/);
+	assert.match(html, /api\("\/api\/issues\/" \+ encodeURIComponent\(id\) \+ "\/resume"/);
+	assert.match(html, /Resume request failed:/);
+	assert.match(html, /data-resume-issue=/);
 	assert.match(html, /diffs-section/);
 	assert.match(html, /function loadDiffsForSelectedIssue\(issue = issueById\(selectedId\), options = \{\}\)/);
 	assert.match(html, /data-diff-section-toggle/);
@@ -544,6 +575,113 @@ test("dashboard clears only consumed feedback drafts after successful submission
 	assert.equal(result.calls[0].apiPath, "/api/issues/PI-A/request-plan-changes");
 	assert.deepEqual(JSON.parse(JSON.stringify(result.calls[0].body)), { text: "please revise the plan" });
 	assert.equal(result.calls[1].apiPath, "/api/state");
+});
+
+test("dashboard resume helpers enable and disable blocked ticket actions", async () => {
+	const html = await renderDashboardHtml("test-token");
+	const context = {
+		renderBoard() {},
+		renderDetail() {},
+		api: async () => ({}),
+		load: async () => {},
+		alert() {},
+	};
+	vm.runInNewContext(dashboardResumeTestSource(html), context);
+	const resumable = {
+		id: "PI-resumable",
+		title: "Blocked with session",
+		lane: LANE.IN_PROGRESS,
+		automation: { paused: true, error: "Worker stopped.", activeRunId: null },
+		dependencies: { issueId: null, resolvedAt: null },
+		resume: { canResume: true, runId: "worker-old", sessionFile: "/tmp/session.jsonl", reason: "" },
+	};
+	const missingSession = {
+		...resumable,
+		id: "PI-missing",
+		resume: { canResume: false, runId: null, sessionFile: null, reason: "The last worker session file is unavailable." },
+	};
+	const dependencyBlocked = {
+		...resumable,
+		id: "PI-dependency",
+		automation: { paused: false, error: null, activeRunId: null },
+		dependencies: { issueId: "PI-dep", resolvedAt: null },
+		resume: { canResume: false, reason: "This ticket is waiting on an unresolved dependency." },
+	};
+	const completed = { ...resumable, id: "PI-done", lane: LANE.COMPLETED };
+	context.__dashboardResume.setState({ issues: [resumable, missingSession, dependencyBlocked, completed, { id: "PI-dep", lane: LANE.IN_REVIEW }] });
+
+	const eligibility = context.__dashboardResume.resumeEligibility(resumable);
+	assert.equal(eligibility.visible, true);
+	assert.equal(eligibility.canResume, true);
+	assert.equal(eligibility.pending, false);
+	assert.equal(eligibility.reason, "");
+	assert.match(context.__dashboardResume.renderResumeAction(resumable), /Resume from last session/);
+	assert.doesNotMatch(context.__dashboardResume.renderResumeAction(resumable), /disabled/);
+	assert.match(context.__dashboardResume.renderResumeAction(missingSession), /disabled/);
+	assert.match(context.__dashboardResume.renderResumeAction(missingSession), /last worker session file is unavailable/);
+	assert.match(context.__dashboardResume.renderResumeAction(dependencyBlocked), /disabled/);
+	assert.match(context.__dashboardResume.renderResumeAction(dependencyBlocked), /unresolved dependency/);
+	assert.equal(context.__dashboardResume.renderResumeAction(completed), "");
+});
+
+test("dashboard resume request prevents duplicates and reloads on success", async () => {
+	const html = await renderDashboardHtml("test-token");
+	let releaseApi;
+	const apiDone = new Promise((resolve) => { releaseApi = resolve; });
+	const calls = [];
+	let loadCalls = 0;
+	let renderBoardCalls = 0;
+	let renderDetailCalls = 0;
+	const alerts = [];
+	const context = {
+		renderBoard() { renderBoardCalls += 1; },
+		renderDetail() { renderDetailCalls += 1; },
+		api: async (url, options) => {
+			calls.push({ url, options });
+			await apiDone;
+			return { metadata: { id: "PI-resumable" } };
+		},
+		load: async () => { loadCalls += 1; },
+		alert: (message) => alerts.push(message),
+	};
+	vm.runInNewContext(dashboardResumeTestSource(html), context);
+
+	const first = context.__dashboardResume.postResumeIssue("PI-resumable");
+	await Promise.resolve();
+	const second = context.__dashboardResume.postResumeIssue("PI-resumable");
+	await Promise.resolve();
+
+	assert.equal(calls.length, 1);
+	assert.equal(calls[0].url, "/api/issues/PI-resumable/resume");
+	assert.equal(calls[0].options.method, "POST");
+	assert.equal(calls[0].options.body, "{}");
+	assert.equal(context.__dashboardResume.isPending("PI-resumable"), true);
+	releaseApi();
+	await Promise.all([first, second]);
+	assert.equal(loadCalls, 1);
+	assert.equal(alerts.length, 0);
+	assert.equal(context.__dashboardResume.isPending("PI-resumable"), false);
+	assert.ok(renderBoardCalls >= 2);
+	assert.ok(renderDetailCalls >= 2);
+});
+
+test("dashboard resume request surfaces failures and leaves retry available", async () => {
+	const html = await renderDashboardHtml("test-token");
+	const alerts = [];
+	const context = {
+		renderBoard() {},
+		renderDetail() {},
+		api: async () => { throw new Error("The last worker session file is unavailable."); },
+		load: async () => assert.fail("failed resume should not reload state"),
+		alert: (message) => alerts.push(message),
+	};
+	vm.runInNewContext(dashboardResumeTestSource(html), context);
+
+	await context.__dashboardResume.postResumeIssue("PI-missing");
+
+	assert.equal(context.__dashboardResume.isPending("PI-missing"), false);
+	assert.equal(alerts.length, 1);
+	assert.match(alerts[0], /Resume request failed: The last worker session file is unavailable\./);
 });
 
 test("dashboard notification helper notifies only on human-intervention transitions", async () => {
@@ -992,6 +1130,49 @@ test("server routes backlog create, update, and send actions", async () => {
 	}
 });
 
+test("server routes blocked issue resume action", async () => {
+	const root = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const calls = [];
+	const reject = async () => {
+		throw new Error("not used");
+	};
+	const server = new OrchestratorServer({
+		store,
+		token: "resume-token",
+		config: { host: "127.0.0.1", port: 0 },
+		actions: {
+			createIssue: reject,
+			comment: reject,
+			updateBacklogIssue: reject,
+			sendBacklogIssueToAgent: reject,
+			approvePlan: reject,
+			requestPlanChanges: reject,
+			approveReview: reject,
+			approveReviewAndMerge: reject,
+			requestReviewChanges: reject,
+			resumeBlockedIssue: async (id) => {
+				calls.push(id);
+				return { metadata: { id } };
+			},
+		},
+	});
+	const url = await server.start();
+	const base = url.split("?")[0].replace(/\/$/, "");
+	try {
+		const response = await fetch(`${base}/api/issues/PI-resume/resume?token=resume-token`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: "{}",
+		});
+		assert.equal(response.status, 200);
+		assert.deepEqual(calls, ["PI-resume"]);
+	} finally {
+		await server.stop();
+	}
+});
+
 test("runtime creates backlog issues without scheduling until they are sent", async () => {
 	const root = await tempDir();
 	const linked = await tempDir();
@@ -1010,6 +1191,67 @@ test("runtime creates backlog issues without scheduling until they are sent", as
 	const sent = await actions.sendBacklogIssueToAgent(backlog.metadata.id);
 	assert.equal(sent.metadata.lane, LANE.CREATED);
 	assert.equal(queued, 1);
+});
+
+test("runtime resumes a blocked issue using the latest worker session", async () => {
+	const root = await tempDir();
+	const linked = await tempDir();
+	const runtime = createOrchestratorRuntime({ dataRoot: root });
+	await runtime.store.init();
+	let queued = 0;
+	runtime.scheduler.queueTick = () => {
+		queued += 1;
+	};
+	const issue = await createBlockedWorkerIssue(runtime.store, linked, { title: "Runtime resumable", runId: "worker-old" });
+	const actions = runtime.createActions();
+
+	const resumed = await actions.resumeBlockedIssue(issue.metadata.id);
+
+	assert.equal(resumed.metadata.automation.paused, false);
+	assert.equal(resumed.metadata.automation.error, null);
+	assert.equal(resumed.metadata.automation.resumeRunId, "worker-old");
+	assert.equal(resumed.metadata.automation.resumeSessionFile, path.join(root, "sessions", issue.metadata.id, "worker-old.jsonl"));
+	assert.equal(resumed.events.some((event) => event.type === "blocked_issue_resume_requested" && event.resumeRunId === "worker-old"), true);
+	assert.equal(queued, 1);
+	assert.deepEqual(await runtime.store.listIssueIds(), [issue.metadata.id]);
+	await assert.rejects(() => actions.resumeBlockedIssue(issue.metadata.id), /not blocked/);
+});
+
+test("runtime resume validation fails safely", async () => {
+	const root = await tempDir();
+	const linked = await tempDir();
+	const runtime = createOrchestratorRuntime({ dataRoot: root });
+	await runtime.store.init();
+	runtime.scheduler.queueTick = () => assert.fail("resume failure should not queue scheduler work");
+	const missing = await createBlockedWorkerIssue(runtime.store, linked, { title: "Missing runtime session", runId: "worker-missing", createSession: false });
+	await assert.rejects(() => runtime.createActions().resumeBlockedIssue(missing.metadata.id), /session file is unavailable/);
+	let unchanged = await runtime.store.loadIssue(missing.metadata.id);
+	assert.equal(unchanged.metadata.automation.paused, true);
+	assert.equal(unchanged.metadata.automation.resumeSessionFile, undefined);
+
+	const active = await createBlockedWorkerIssue(runtime.store, linked, { title: "Active blocked", runId: "worker-active" });
+	await runtime.store.updateMetadata(active.metadata.id, (metadata) => ({
+		...metadata,
+		automation: { ...metadata.automation, activeRunId: "worker-active", activeRole: "worker" },
+	}));
+	await assert.rejects(() => runtime.createActions().resumeBlockedIssue(active.metadata.id), /active run/);
+	unchanged = await runtime.store.loadIssue(active.metadata.id);
+	assert.equal(unchanged.metadata.automation.resumeSessionFile, undefined);
+
+	const dependency = await runtime.store.createIssue({ title: "Runtime dependency", spec: "First.", linkedDirectory: linked });
+	await runtime.store.setLane(dependency.metadata.id, LANE.IN_REVIEW, "test");
+	const blockedByDependency = await runtime.store.createIssue({
+		title: "Runtime dependency blocked",
+		spec: "Second.",
+		linkedDirectory: linked,
+		dependencyIssueId: dependency.metadata.id,
+	});
+	await runtime.store.updateMetadata(blockedByDependency.metadata.id, (metadata) => ({
+		...metadata,
+		lane: LANE.IN_PROGRESS,
+		automation: { ...metadata.automation, paused: true, error: "Blocked.", activeRunId: null, activeRole: null },
+	}));
+	await assert.rejects(() => runtime.createActions().resumeBlockedIssue(blockedByDependency.metadata.id), /unresolved dependency/);
 });
 
 test("runtime improves specs through spec-writer subagent", async () => {
@@ -1248,6 +1490,103 @@ test("issue store creates folder-per-issue artifacts and board state", async () 
 	assert.deepEqual(state.lanes[LANE.CREATED], [id]);
 	assert.equal(state.issues[0].planReport, "# Plan report\n");
 	assert.equal(state.issues[0].reviewReport, "# Review report\n");
+});
+
+test("issue store reports resume eligibility for blocked in-progress tickets", async () => {
+	const root = await tempDir();
+	const linked = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const issue = await createBlockedWorkerIssue(store, linked, { title: "Resumable issue", runId: "worker-old" });
+
+	const state = await store.getBoardState();
+	const entry = state.issues.find((item) => item.id === issue.metadata.id);
+	assert.equal(entry.resume.canResume, true);
+	assert.equal(entry.resume.runId, "worker-old");
+	assert.equal(entry.resume.sessionFile, path.join(root, "sessions", issue.metadata.id, "worker-old.jsonl"));
+});
+
+test("issue store does not fall back to an older session when the newest worker session is missing", async () => {
+	const root = await tempDir();
+	const linked = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const issue = await createBlockedWorkerIssue(store, linked, { title: "Stale session", runId: "worker-old" });
+	await store.appendEvent(issue.metadata.id, { type: "agent_run_started", role: "worker", runId: "worker-new" });
+
+	const state = await store.getBoardState();
+	const entry = state.issues.find((item) => item.id === issue.metadata.id);
+	assert.equal(entry.resume.canResume, false);
+	assert.equal(entry.resume.runId, null);
+	assert.equal(entry.resume.sessionFile, null);
+	assert.match(entry.resume.reason, /last worker session file is unavailable/);
+});
+
+test("issue store resolves mapped resume sessions for resumed worker runs", async () => {
+	const root = await tempDir();
+	const linked = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const issue = await createBlockedWorkerIssue(store, linked, { title: "Mapped resume", runId: "worker-old" });
+	const sessionFile = path.join(root, "sessions", issue.metadata.id, "worker-old.jsonl");
+	await store.appendEvent(issue.metadata.id, { type: "agent_run_started", role: "worker", runId: "worker-new" });
+	await store.appendEvent(issue.metadata.id, {
+		type: "implementation_resume_started",
+		runId: "worker-new",
+		resumeRunId: "worker-old",
+		resumeSessionFile: sessionFile,
+	});
+
+	const state = await store.getBoardState();
+	const entry = state.issues.find((item) => item.id === issue.metadata.id);
+	assert.equal(entry.resume.canResume, true);
+	assert.equal(entry.resume.runId, "worker-old");
+	assert.equal(entry.resume.sessionFile, sessionFile);
+});
+
+test("issue store explains non-resumable blocked tickets", async () => {
+	const root = await tempDir();
+	const linked = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const missingSession = await createBlockedWorkerIssue(store, linked, { title: "Missing session", runId: "worker-missing", createSession: false });
+	const dependency = await store.createIssue({ title: "Dependency", spec: "Finish first.", linkedDirectory: linked });
+	await store.setLane(dependency.metadata.id, LANE.IN_REVIEW, "test");
+	const dependencyBlocked = await store.createIssue({
+		title: "Dependency blocked",
+		spec: "Wait.",
+		linkedDirectory: linked,
+		dependencyIssueId: dependency.metadata.id,
+	});
+	await store.updateMetadata(dependencyBlocked.metadata.id, (metadata) => ({
+		...metadata,
+		lane: LANE.IN_PROGRESS,
+		automation: { ...metadata.automation, paused: false, error: null, activeRunId: null, activeRole: null },
+	}));
+
+	const state = await store.getBoardState();
+	const missingEntry = state.issues.find((item) => item.id === missingSession.metadata.id);
+	const dependencyEntry = state.issues.find((item) => item.id === dependencyBlocked.metadata.id);
+	assert.equal(missingEntry.resume.canResume, false);
+	assert.match(missingEntry.resume.reason, /session file is unavailable/);
+	assert.equal(dependencyEntry.resume.canResume, false);
+	assert.match(dependencyEntry.resume.reason, /unresolved dependency/);
+});
+
+test("workflow resume validation only allows blocked inactive In Progress tickets", () => {
+	const base = normalizeMetadata({
+		id: "PI-resume",
+		title: "Resume",
+		lane: LANE.IN_PROGRESS,
+		createdAt: "2026-01-01T00:00:00.000Z",
+		automation: { paused: true, error: "Worker stopped.", activeRunId: null },
+	});
+	assert.equal(canRequestResume(base), true);
+	assert.equal(canRequestResume({ ...base, lane: LANE.COMPLETED }), false);
+	assert.match(resumeBlockedReason({ ...base, lane: LANE.COMPLETED }), /Only In Progress/);
+	assert.equal(canRequestResume({ ...base, automation: { ...base.automation, paused: false, error: null } }), false);
+	assert.match(resumeBlockedReason({ ...base, automation: { ...base.automation, activeRunId: "run" } }), /active run/);
+	assert.match(resumeBlockedReason(base, { hasUnresolvedDependency: true }), /unresolved dependency/);
 });
 
 test("spec writer prompt includes draft and suggestions and requires spec-only output", () => {
@@ -1798,6 +2137,61 @@ test("rpc runner rejects a process that exits before agent_end", async () => {
 	assert.match(log, /"type":"process_exit"/);
 });
 
+test("rpc runner can reuse an existing session file", async () => {
+	const root = await tempDir();
+	const linked = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const issue = await store.createIssue({
+		title: "Resume runner",
+		spec: "Reuse session.",
+		linkedDirectory: linked,
+	});
+	const argvPath = path.join(root, "argv.json");
+	const existingSession = path.join(root, "sessions", issue.metadata.id, "existing-worker.jsonl");
+	await fsp.mkdir(path.dirname(existingSession), { recursive: true });
+	await fsp.writeFile(existingSession, "", "utf-8");
+	const fakeRpc = path.join(root, "fake-rpc.mjs");
+	await fsp.writeFile(
+		fakeRpc,
+		[
+			"#!/usr/bin/env node",
+			"import * as fs from 'node:fs';",
+			`fs.writeFileSync(${JSON.stringify(argvPath)}, JSON.stringify(process.argv.slice(2)));`,
+			"let buffer = '';",
+			"process.stdin.setEncoding('utf8');",
+			"process.stdin.on('data', async (chunk) => {",
+			"  buffer += chunk;",
+			"  const index = buffer.indexOf('\\n');",
+			"  if (index === -1) return;",
+			"  const command = JSON.parse(buffer.slice(0, index));",
+			"  console.log(JSON.stringify({ id: command.id, type: 'response', command: command.type, success: true }));",
+			"  const message = { role: 'assistant', content: [{ type: 'text', text: 'resumed' }] };",
+			"  console.log(JSON.stringify({ type: 'message_end', message }));",
+			"  console.log(JSON.stringify({ type: 'agent_end', messages: [message] }));",
+			"  process.exit(0);",
+			"});",
+			"",
+		].join("\n"),
+		"utf-8",
+	);
+	await fsp.chmod(fakeRpc, 0o755);
+
+	const runner = new RpcAgentRunner({ store, command: fakeRpc, timeoutMs: 2000, idleTimeoutMs: 0 });
+	const result = await runner.run({
+		issueId: issue.metadata.id,
+		role: "worker",
+		cwd: linked,
+		prompt: "resume",
+		sessionFile: existingSession,
+	});
+
+	const argv = JSON.parse(await fsp.readFile(argvPath, "utf-8"));
+	assert.equal(argv[argv.indexOf("--session") + 1], existingSession);
+	assert.equal(result.sessionFile, existingSession);
+	assert.equal(result.text, "resumed");
+});
+
 test("rpc runner does not persist streaming message deltas", async () => {
 	const root = await tempDir();
 	const linked = await tempDir();
@@ -2033,6 +2427,63 @@ test("scheduler requires git dependencies to be completed and merged before plan
 	assert.equal(runner.calls.length, 1);
 });
 
+test("scheduler passes stored session file to resumed worker run", async () => {
+	const root = await tempDir();
+	const linked = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const issue = await store.createIssue({
+		title: "Scheduler resume",
+		spec: "Continue from the worker session.",
+		linkedDirectory: linked,
+	});
+	const resumeSessionFile = path.join(root, "sessions", issue.metadata.id, "worker-old.jsonl");
+	await fsp.mkdir(path.dirname(resumeSessionFile), { recursive: true });
+	await fsp.writeFile(resumeSessionFile, "{}\n", "utf-8");
+	await store.updateMetadata(issue.metadata.id, (metadata) => ({
+		...metadata,
+		lane: LANE.IN_PROGRESS,
+		automation: {
+			...metadata.automation,
+			implementationAttempts: 2,
+			paused: false,
+			error: null,
+			activeRunId: null,
+			activeRole: null,
+			resumeSessionFile,
+			resumeRunId: "worker-old",
+		},
+	}));
+	const calls = [];
+	const runner = {
+		calls,
+		run: async (request) => {
+			calls.push(request);
+			await request.onRunStarted?.(`${request.role}-new`);
+			if (request.role === "worker") return { runId: "worker-new", text: "worker continued" };
+			if (request.role === "reviewer") return { runId: "reviewer-new", text: "DECISION: PASS\nLooks good." };
+			return {
+				runId: "final-reviewer-new",
+				text: ["DECISION: PASS", REVIEW_REPORT_START, "# Review\nReady.", REVIEW_REPORT_END].join("\n"),
+			};
+		},
+		stopAll: async () => {},
+	};
+	const scheduler = new OrchestratorScheduler({ store, runner });
+
+	await scheduler.runImplementation(issue.metadata.id, new AbortController().signal);
+
+	assert.equal(calls[0].role, "worker");
+	assert.equal(calls[0].sessionFile, resumeSessionFile);
+	assert.equal(calls[1].sessionFile, undefined);
+	const resumed = await store.loadIssue(issue.metadata.id);
+	assert.equal(resumed.metadata.lane, LANE.IN_REVIEW);
+	assert.equal(resumed.metadata.automation.implementationAttempts, 2);
+	assert.equal(resumed.metadata.automation.resumeSessionFile, null);
+	assert.equal(resumed.metadata.automation.resumeRunId, null);
+	assert.equal(resumed.events.some((event) => event.type === "implementation_resume_started" && event.resumeRunId === "worker-old" && event.resumeSessionFile === resumeSessionFile), true);
+});
+
 test("scheduler writes fallback review report when implementation loop is exhausted", async () => {
 	const root = await tempDir();
 	const linked = await tempDir();
@@ -2077,6 +2528,33 @@ function planningRunner() {
 		},
 		stopAll: async () => {},
 	};
+}
+
+async function createBlockedWorkerIssue(store, linkedDirectory, { title = "Blocked worker", runId = "worker-run", createSession = true } = {}) {
+	const issue = await store.createIssue({
+		title,
+		spec: "Resume blocked work.",
+		linkedDirectory,
+	});
+	await store.updateMetadata(issue.metadata.id, (metadata) => ({
+		...metadata,
+		lane: LANE.IN_PROGRESS,
+		automation: {
+			...metadata.automation,
+			implementationAttempts: 1,
+			paused: true,
+			error: "Worker stopped.",
+			activeRunId: null,
+			activeRole: null,
+		},
+	}));
+	await store.appendEvent(issue.metadata.id, { type: "agent_run_started", role: "worker", runId });
+	const sessionFile = path.join(store.sessionsRoot, issue.metadata.id, `${runId}.jsonl`);
+	if (createSession) {
+		await fsp.mkdir(path.dirname(sessionFile), { recursive: true });
+		await fsp.writeFile(sessionFile, JSON.stringify({ type: "message", text: "previous work" }) + "\n", "utf-8");
+	}
+	return store.loadIssue(issue.metadata.id);
 }
 
 async function exists(filePath) {

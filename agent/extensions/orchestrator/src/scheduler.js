@@ -333,8 +333,11 @@ export class OrchestratorScheduler {
 		let feedback = "";
 		while (true) {
 			issue = await this.store.loadIssue(issueId);
-			const nextAttempt = (issue.metadata.automation?.implementationAttempts || 0) + 1;
-			if (nextAttempt > MAX_IMPLEMENTATION_ATTEMPTS) {
+			const resumeSessionFile = issue.metadata.automation?.resumeSessionFile || null;
+			const resumeRunId = issue.metadata.automation?.resumeRunId || null;
+			const currentAttempts = issue.metadata.automation?.implementationAttempts || 0;
+			const nextAttempt = resumeSessionFile && currentAttempts > 0 ? currentAttempts : currentAttempts + 1;
+			if (!resumeSessionFile && nextAttempt > MAX_IMPLEMENTATION_ATTEMPTS) {
 				await this.pauseImplementationExhausted(issueId, feedback);
 				return;
 			}
@@ -349,7 +352,11 @@ export class OrchestratorScheduler {
 					error: null,
 				},
 			}));
-			await this.store.appendEvent(issueId, { type: "implementation_attempt_started", attempt: nextAttempt });
+			await this.store.appendEvent(issueId, {
+				type: resumeSessionFile ? "implementation_resume_attempt_started" : "implementation_attempt_started",
+				attempt: nextAttempt,
+				resumeRunId,
+			});
 
 			issue = await this.store.loadIssue(issueId);
 			await ensureIssueWorkspace(this.store, issue);
@@ -363,7 +370,25 @@ export class OrchestratorScheduler {
 				prompt: buildWorkerPrompt(issue, feedback),
 				signal,
 				agentSettings: this.agentSettingsFor(issue, "worker"),
-				onRunStarted: (runId) => this.markRunStarted(issueId, "worker", runId),
+				sessionFile: resumeSessionFile,
+				onRunStarted: async (runId) => {
+					await this.markRunStarted(issueId, "worker", runId);
+					if (!resumeSessionFile) return;
+					await this.store.updateMetadata(issueId, (metadata) => ({
+						...metadata,
+						automation: {
+							...metadata.automation,
+							resumeSessionFile: null,
+							resumeRunId: null,
+						},
+					}));
+					await this.store.appendEvent(issueId, {
+						type: "implementation_resume_started",
+						runId,
+						resumeRunId,
+						resumeSessionFile,
+					});
+				},
 			});
 			await this.store.appendEvent(issueId, { type: "worker_finished", runId: worker.runId });
 

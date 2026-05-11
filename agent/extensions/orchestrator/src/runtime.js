@@ -8,7 +8,15 @@ import { OrchestratorServer } from "./server.js";
 import { IssueStore } from "./store.js";
 import { commitIssueWorktree, execGit } from "./workspace.js";
 import { nowIso } from "./utils.js";
-import { approvePlan, approveReview, requestPlanChanges, requestReviewChanges } from "./workflow.js";
+import {
+	approvePlan,
+	approveReview,
+	getDependencyIssueId,
+	isDependencyResolved,
+	requestPlanChanges,
+	requestReviewChanges,
+	resumeBlockedReason,
+} from "./workflow.js";
 
 export function createOrchestratorRuntime(options = {}) {
 	return new OrchestratorRuntime(options);
@@ -216,6 +224,46 @@ export class OrchestratorRuntime {
 		return this.store.loadIssue(id);
 	}
 
+	async hasUnresolvedDependency(issue) {
+		const dependencyId = getDependencyIssueId(issue.metadata);
+		if (!dependencyId || issue.metadata.dependencies?.resolvedAt) return false;
+		const dependency = await this.store.loadIssue(dependencyId).catch(() => null);
+		return !dependency || !isDependencyResolved(dependency.metadata);
+	}
+
+	async resumeBlockedIssue(id) {
+		const issue = await this.store.loadIssue(id);
+		const hasUnresolvedDependency = await this.hasUnresolvedDependency(issue);
+		const reason = resumeBlockedReason(issue.metadata, { hasUnresolvedDependency });
+		if (reason) throw new Error(reason);
+
+		const resume = await this.store.findLatestResumableWorkerSession(id);
+		if (!resume.canResume) throw new Error(resume.reason || "No resumable worker session is available for this ticket.");
+
+		await this.store.updateMetadata(id, (metadata) => {
+			const currentReason = resumeBlockedReason(metadata, { hasUnresolvedDependency });
+			if (currentReason) throw new Error(currentReason);
+			return {
+				...metadata,
+				automation: {
+					...metadata.automation,
+					paused: false,
+					error: null,
+					activeRunId: null,
+					activeRole: null,
+					resumeSessionFile: resume.sessionFile,
+					resumeRunId: resume.runId,
+				},
+			};
+		});
+		await this.store.appendEvent(id, {
+			type: "blocked_issue_resume_requested",
+			resumeRunId: resume.runId,
+		});
+		this.scheduler.queueTick();
+		return this.store.loadIssue(id);
+	}
+
 	async runReviewMerge(id) {
 		let runId = null;
 		let mergeKey = null;
@@ -377,6 +425,7 @@ export class OrchestratorRuntime {
 				this.scheduler.queueTick();
 				return this.store.loadIssue(id);
 			},
+			resumeBlockedIssue: async (id) => this.resumeBlockedIssue(id),
 		};
 	}
 }

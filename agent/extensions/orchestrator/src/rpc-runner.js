@@ -47,7 +47,7 @@ export class RpcAgentRunner {
 		this.running = new Map();
 	}
 
-	async run({ issueId, role, cwd, prompt, signal, agentSettings = null, onRunStarted = null, internal = false }) {
+	async run({ issueId, role, cwd, prompt, signal, agentSettings = null, onRunStarted = null, internal = false, sessionFile = null, sessionFileOverride = null }) {
 		const runId = `${Date.now()}-${role}-${Math.random().toString(36).slice(2, 8)}`;
 		const runLogPath = internal ? this.store.internalRunPath(issueId, runId) : this.store.runPath(issueId, runId);
 		await ensureDir(path.dirname(runLogPath));
@@ -75,14 +75,14 @@ export class RpcAgentRunner {
 		});
 		if (onRunStarted) await onRunStarted(runId);
 		const systemPromptPath = await writeSystemPromptTemp(role, effectiveConfig.systemPrompt);
-		const sessionFile = path.join(this.store.sessionsRoot, issueId, `${runId}.jsonl`);
-		await ensureDir(path.dirname(sessionFile));
+		const effectiveSessionFile = sessionFileOverride || sessionFile || path.join(this.store.sessionsRoot, issueId, `${runId}.jsonl`);
+		await ensureDir(path.dirname(effectiveSessionFile));
 
 		const args = [
 			"--mode",
 			"rpc",
 			"--session",
-			sessionFile,
+			effectiveSessionFile,
 			"--no-extensions",
 			"--tools",
 			ROLE_TOOLS[role] || ROLE_TOOLS.worker,
@@ -275,7 +275,7 @@ export class RpcAgentRunner {
 				runId,
 				role,
 				text: lastAssistantText,
-				sessionFile,
+				sessionFile: effectiveSessionFile,
 				runLogPath,
 				stderr,
 			};

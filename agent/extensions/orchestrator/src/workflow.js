@@ -101,6 +101,18 @@ export function canApproveReview(metadata) {
 	return metadata.lane === LANE.IN_REVIEW && !metadata.automation?.activeRunId;
 }
 
+export function resumeBlockedReason(metadata, { hasUnresolvedDependency = false } = {}) {
+	if (metadata?.lane !== LANE.IN_PROGRESS) return "Only In Progress tickets can be resumed from a blocked worker session.";
+	if (hasUnresolvedDependency) return "This ticket is waiting on an unresolved dependency.";
+	if (metadata?.automation?.activeRunId) return "This ticket already has an active run.";
+	if (!(metadata?.automation?.paused || metadata?.automation?.error)) return "This ticket is not blocked.";
+	return "";
+}
+
+export function canRequestResume(metadata, options = {}) {
+	return !resumeBlockedReason(metadata, options);
+}
+
 export function approvePlan(metadata, at = nowIso()) {
 	if (!canApprovePlan(metadata)) {
 		throw new Error("Plan can only be approved from Plan in review when no run is active.");

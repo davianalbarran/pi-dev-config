@@ -18,9 +18,11 @@ import {
 import {
 	createApprovalState,
 	createAutomationState,
+	getDependencyIssueId,
 	isDependencyResolved,
 	normalizeAgentSettings,
 	normalizeMetadata,
+	resumeBlockedReason,
 } from "./workflow.js";
 
 export class IssueStore {
@@ -381,6 +383,54 @@ export class IssueStore {
 		return payload;
 	}
 
+	async findLatestResumableWorkerSession(id) {
+		const events = await readJsonLines(this.issuePath(id, "events.jsonl"));
+		for (let index = events.length - 1; index >= 0; index -= 1) {
+			const event = events[index];
+			if (event?.type !== "agent_run_started" || event.role !== "worker" || !event.runId) continue;
+			const runId = String(event.runId);
+			const sessionFile = path.join(this.sessionsRoot, id, `${runId}.jsonl`);
+			try {
+				await fsp.access(sessionFile);
+				return { canResume: true, runId, sessionFile, reason: "" };
+			} catch {
+				const resumedSession = await this.findMappedResumeSession(events, index, id, runId);
+				if (resumedSession) return resumedSession;
+				return {
+					canResume: false,
+					runId: null,
+					sessionFile: null,
+					reason: "The last worker session file is unavailable.",
+				};
+			}
+		}
+		return {
+			canResume: false,
+			runId: null,
+			sessionFile: null,
+			reason: "No worker session is available for this ticket.",
+		};
+	}
+
+	async findMappedResumeSession(events, workerEventIndex, id, workerRunId) {
+		for (let index = workerEventIndex + 1; index < events.length; index += 1) {
+			const event = events[index];
+			if (event?.type !== "implementation_resume_started" || String(event.runId || "") !== workerRunId) continue;
+			const resumeRunId = event.resumeRunId ? String(event.resumeRunId) : null;
+			const sessionFile = event.resumeSessionFile
+				? String(event.resumeSessionFile)
+				: (resumeRunId ? path.join(this.sessionsRoot, id, `${resumeRunId}.jsonl`) : null);
+			if (!sessionFile) return null;
+			try {
+				await fsp.access(sessionFile);
+				return { canResume: true, runId: resumeRunId || workerRunId, sessionFile, reason: "" };
+			} catch {
+				return null;
+			}
+		}
+		return null;
+	}
+
 	async appendSystemError(id, error) {
 		try {
 			await this.appendEvent(id, {
@@ -394,15 +444,20 @@ export class IssueStore {
 
 	async getBoardState() {
 		const issues = await this.listIssues();
+		const issuesById = new Map(issues.map((issue) => [issue.metadata.id, issue]));
 		const lanes = Object.fromEntries(LANES.map((lane) => [lane, []]));
 		for (const issue of issues) {
 			const lane = LANES.includes(issue.metadata.lane) ? issue.metadata.lane : LANE.CREATED;
 			lanes[lane].push(issue.metadata.id);
 		}
-		return {
-			dataRoot: this.dataRoot,
-			lanes,
-			issues: issues.map((issue) => ({
+		const boardIssues = [];
+		for (const issue of issues) {
+			const dependencyId = getDependencyIssueId(issue.metadata);
+			const dependency = dependencyId ? issuesById.get(dependencyId) : null;
+			const hasUnresolvedDependency = !!dependencyId && !issue.metadata.dependencies?.resolvedAt && (!dependency || !isDependencyResolved(dependency.metadata));
+			const statusReason = resumeBlockedReason(issue.metadata, { hasUnresolvedDependency });
+			const session = statusReason ? { canResume: false, runId: null, sessionFile: null, reason: statusReason } : await this.findLatestResumableWorkerSession(issue.metadata.id);
+			boardIssues.push({
 				...issue.metadata,
 				spec: issue.spec,
 				plan: issue.plan,
@@ -410,7 +465,13 @@ export class IssueStore {
 				reviewReport: issue.reviewReport,
 				comments: issue.comments,
 				recentEvents: issue.events.slice(-50),
-			})),
+				resume: session,
+			});
+		}
+		return {
+			dataRoot: this.dataRoot,
+			lanes,
+			issues: boardIssues,
 		};
 	}
 

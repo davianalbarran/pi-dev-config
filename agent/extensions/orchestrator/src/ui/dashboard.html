@@ -990,6 +990,7 @@ let improvedSpecText = "";
 let specWriterSuggestions = [];
 let specImproveRequestId = 0;
 const expandedDiffFiles = new Set();
+const pendingResumeIssueIds = new Set();
 
 function cssPixelValue(name, fallback) {
   const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -1423,6 +1424,33 @@ function isBlocked(issue) {
 
 function needsReview(issue) {
   return issue.lane === LANE.PLAN_REVIEW || issue.lane === LANE.IN_REVIEW;
+}
+
+function resumeEligibility(issue) {
+  if (!issue || issue.lane !== LANE.IN_PROGRESS || !isBlocked(issue)) return { visible: false, canResume: false, reason: "" };
+  const resume = issue.resume || {};
+  const pending = pendingResumeIssueIds.has(issue.id);
+  const dependencyBlocked = hasUnresolvedDependency(issue);
+  return {
+    visible: true,
+    canResume: !!resume.canResume && !pending && !dependencyBlocked,
+    pending,
+    reason: pending ? "Resume request is already in flight." : (dependencyBlocked ? "This ticket is waiting on an unresolved dependency." : (resume.reason || (resume.canResume ? "" : "No verified worker session is available."))),
+  };
+}
+
+function resumeDisabledReason(issue) {
+  const eligibility = resumeEligibility(issue);
+  return eligibility.canResume ? "" : eligibility.reason;
+}
+
+function renderResumeAction(issue, { id = "resume-blocked", compact = false } = {}) {
+  const eligibility = resumeEligibility(issue);
+  if (!eligibility.visible) return "";
+  const title = resumeDisabledReason(issue);
+  const pending = pendingResumeIssueIds.has(issue.id);
+  const label = pending ? "Resuming…" : (compact ? "Resume" : "Resume from last session");
+  return "<button type='button' id='" + escapeHtml(id) + "' data-resume-issue='" + escapeHtml(issue.id) + "' class='warn' " + (eligibility.canResume ? "" : "disabled") + (title ? " title='" + escapeHtml(title) + "'" : "") + ">" + escapeHtml(label) + "</button>";
 }
 
 function issueState(issue) {
@@ -2124,6 +2152,8 @@ function renderDetail() {
   const activeMerge = activeMergeForIssue(issue);
   const hasGitMetadata = !!(issue.git?.repoRoot && issue.git?.branchName && issue.git?.baseBranch);
   const actionButtons = [];
+  const resumeAction = renderResumeAction(issue);
+  if (resumeAction) actionButtons.push(resumeAction);
   if (issue.lane === LANE.PLAN_REVIEW) {
     actionButtons.push("<button id='approve-plan' " + (activeRunId ? "disabled" : "") + ">Approve Plan</button>");
     actionButtons.push("<button id='change-plan' class='warn'>Request Plan Changes</button>");
@@ -2255,6 +2285,7 @@ function bindDetailActions(issue) {
   bindOptionalClick("approve-review", () => postAction(issue.id, "approve-review", {}));
   bindOptionalClick("change-plan", () => postAction(issue.id, "request-plan-changes", { text: feedbackText() }));
   bindOptionalClick("change-review", () => postAction(issue.id, "request-review-changes", { text: feedbackText() }));
+  bindOptionalClick("resume-blocked", () => postResumeIssue(issue.id));
   document.getElementById("add-comment").onclick = () => postAction(issue.id, "comment", { text: feedbackText(), phase: "general" });
 }
 
@@ -2275,6 +2306,23 @@ async function postAction(id, action, body) {
     await load();
   } catch (error) {
     alert(error.message);
+  }
+}
+
+async function postResumeIssue(id) {
+  if (pendingResumeIssueIds.has(id)) return;
+  pendingResumeIssueIds.add(id);
+  renderBoard();
+  renderDetail();
+  try {
+    await api("/api/issues/" + encodeURIComponent(id) + "/resume", { method: "POST", body: "{}" });
+    await load();
+  } catch (error) {
+    alert("Resume request failed: " + (error.message || "Try again from the blocked ticket."));
+  } finally {
+    pendingResumeIssueIds.delete(id);
+    renderBoard();
+    renderDetail();
   }
 }
 
