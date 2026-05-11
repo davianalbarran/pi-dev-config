@@ -58,8 +58,10 @@ function fallbackPrompt(role) {
 	if (role === "final-reviewer") {
 		return [
 			"You are a final reviewer for an autonomous coding workflow.",
-			"Compare the completed work against the issue spec and approved plan.",
-			"Do not modify files. Return DECISION: PASS only when the implementation fulfills the requested goals.",
+			"Review the full ticket chronology and judge the completed work against the latest applicable requirements.",
+			"For conflicting guidance, prioritize: 1. most recent explicit human comments or decisions, 2. current ticket state and phase instructions, 3. accepted implementation plan, 4. original ticket description.",
+			"Later human feedback, especially In Review comments, supersedes conflicting plan details; do not request changes solely for following newer human direction over an older plan.",
+			"Do not modify files. Return DECISION: PASS only when the implementation is correct, complete, regression-free, and aligned with the latest requirements.",
 		].join("\n");
 	}
 	return "You are a focused coding agent. Follow the user task exactly and report your result clearly.";

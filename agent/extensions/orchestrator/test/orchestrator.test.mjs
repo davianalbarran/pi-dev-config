@@ -16,6 +16,7 @@ import {
 	PLAN_START,
 	REVIEW_REPORT_END,
 	REVIEW_REPORT_START,
+	buildFinalReviewerPrompt,
 	buildMergerPrompt,
 	buildSpecWriterPrompt,
 	parseFinalReviewerOutput,
@@ -1600,6 +1601,51 @@ test("spec writer prompt includes draft and suggestions and requires spec-only o
 	assert.match(prompt, /Return only the improved spec text/);
 	assert.match(prompt, /Output the improved spec only\./);
 	assert.doesNotMatch(prompt, /BEGIN_IMPLEMENTATION_PLAN/);
+});
+
+test("final reviewer prompt prioritizes newer review comments over conflicting plan details", () => {
+	const prompt = buildFinalReviewerPrompt(
+		{
+			metadata: {
+				id: "PI-final-review-chronology",
+				title: "Honor review feedback",
+				linkedDirectory: "/repo",
+				workspace: { kind: "git-worktree", path: "/repo/worktree" },
+				git: {
+					repoRoot: "/repo",
+					baseBranch: "main",
+					baseSha: "abc123",
+					branchName: "pi-orchestrator/pi-final-review-chronology",
+					worktreePath: "/repo/worktree",
+				},
+			},
+			spec: "Original requirement: render the status using a plain text label.",
+			plan: "Accepted plan: implement approach A by adding a blocking modal for the status.",
+			comments: [
+				{
+					createdAt: "2026-05-11T20:00:00.000Z",
+					author: "human",
+					phase: "review",
+					text: "In Review decision: do not use approach A; use approach B with an inline non-blocking banner instead.",
+				},
+			],
+		},
+		"Worker followed approach B with an inline non-blocking banner; reviewer noted this deviates from approach A in the plan.",
+	);
+
+	assert.match(prompt, /review the full ticket chronology/i);
+	assert.match(prompt, /Guidance priority for conflicting requirements:/);
+	const humanPriority = prompt.indexOf("1. Most recent explicit human comments or decisions on the ticket.");
+	const statePriority = prompt.indexOf("2. Current ticket state and phase-specific instructions.");
+	const planPriority = prompt.indexOf("3. The accepted implementation plan.");
+	const descriptionPriority = prompt.indexOf("4. The original ticket description.");
+	assert.ok(humanPriority !== -1, "prompt includes human feedback as first priority");
+	assert.ok(humanPriority < statePriority && statePriority < planPriority && planPriority < descriptionPriority, "prompt orders conflicting guidance priorities");
+	assert.match(prompt, /In Review decision: do not use approach A; use approach B with an inline non-blocking banner instead\./);
+	assert.match(prompt, /Do not request changes solely for deviation from an older plan when the worker followed newer human feedback\./);
+	assert.match(prompt, /incorrect implementations/);
+	assert.match(prompt, /regressions/);
+	assert.match(prompt, /incomplete required work/);
 });
 
 test("planner and final reviewer outputs parse delimited human reports with fallback", () => {
