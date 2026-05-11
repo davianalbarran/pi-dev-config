@@ -965,6 +965,7 @@ let state = { issues: [], lanes: {} };
 let profiles = [];
 let selectedProfileId = DEFAULT_PROFILE_ID;
 let selectedId = null;
+const feedbackDraftsByIssueId = new Map();
 let detailTab = "report";
 let filters = { query: "", lane: "all", state: "all" };
 let activeView = "kanban";
@@ -2086,6 +2087,30 @@ function bindDiffActions(issue) {
   }
 }
 
+function currentFeedbackDraftKey() {
+  return selectedId;
+}
+
+function captureFeedbackDraft(issueId = currentFeedbackDraftKey()) {
+  if (!issueId) return;
+  const feedback = document.getElementById("feedback");
+  if (!feedback) return;
+  feedbackDraftsByIssueId.set(issueId, feedback.value);
+}
+
+function feedbackDraft(issueId) {
+  return issueId && feedbackDraftsByIssueId.has(issueId) ? feedbackDraftsByIssueId.get(issueId) : "";
+}
+
+function clearFeedbackDraft(issueId) {
+  if (!issueId) return;
+  feedbackDraftsByIssueId.delete(issueId);
+  if (issueId === currentFeedbackDraftKey()) {
+    const feedback = document.getElementById("feedback");
+    if (feedback) feedback.value = "";
+  }
+}
+
 function renderDetail() {
   const detail = document.getElementById("detail");
   const issue = issueById(selectedId);
@@ -2145,6 +2170,8 @@ function renderDetail() {
     "<div class='tabs'>" + tabs.map((tab) => "<button type='button' class='tab " + (detailTab === tab ? "active" : "") + "' data-tab='" + tab + "'>" + escapeHtml(tabLabel(tab)) + "</button>").join("") + "</div>" +
     "<div class='tab-panel'>" + renderTabContent(issue) + "</div>";
   applyDetailPanelWidth();
+  const feedback = document.getElementById("feedback");
+  if (feedback) feedback.value = feedbackDraft(issue.id);
   bindDetailActions(issue);
   bindDiffActions(issue);
   void loadDiffsForSelectedIssue(issue);
@@ -2220,6 +2247,8 @@ function renderTimeline(events) {
 }
 
 function bindDetailActions(issue) {
+  const feedback = document.getElementById("feedback");
+  if (feedback) feedback.addEventListener("input", () => feedbackDraftsByIssueId.set(issue.id, feedback.value));
   document.getElementById("close-detail").onclick = () => { selectedId = null; renderBoard(); renderDetail(); };
   bindOptionalClick("approve-plan", () => postAction(issue.id, "approve-plan", {}));
   bindOptionalClick("approve-review-merge", () => postAction(issue.id, "approve-review-merge", {}));
@@ -2242,6 +2271,7 @@ function feedbackText() {
 async function postAction(id, action, body) {
   try {
     await api("/api/issues/" + encodeURIComponent(id) + "/" + action, { method: "POST", body: JSON.stringify(body) });
+    if (["comment", "request-plan-changes", "request-review-changes"].includes(action)) clearFeedbackDraft(id);
     await load();
   } catch (error) {
     alert(error.message);
@@ -2360,6 +2390,7 @@ function syncCompletedTicketMinimization(nextState) {
 
 async function load() {
   const nextState = await api("/api/state");
+  captureFeedbackDraft();
   syncCompletedTicketMinimization(nextState);
   syncHumanInterventionNotifications(nextState);
   state = nextState;

@@ -66,6 +66,98 @@ function dashboardNotificationTestSource(html) {
 	return laneDeclaration + html.slice(start, end);
 }
 
+function dashboardDraftTestSource(html) {
+	const start = html.indexOf("let state = { issues: [], lanes: {} };");
+	const end = html.indexOf("function populateLaneFilter()", start);
+	assert.ok(start !== -1, "dashboard script declares mutable state");
+	assert.ok(end > start, "dashboard script exposes load before DOM event bindings");
+	return html.slice(start, end);
+}
+
+function dashboardDraftVmContext() {
+	const elements = new Map();
+	function classList() {
+		const classes = new Set();
+		return {
+			add: (...names) => names.forEach((name) => classes.add(name)),
+			remove: (...names) => names.forEach((name) => classes.delete(name)),
+			contains: (name) => classes.has(name),
+		};
+	}
+	class FakeElement {
+		constructor(id) {
+			this.id = id;
+			this.value = "";
+			this.hidden = false;
+			this.disabled = false;
+			this.dataset = {};
+			this.style = {};
+			this.classList = classList();
+			this.listeners = new Map();
+			this.onclick = null;
+			this._innerHTML = "";
+		}
+		set innerHTML(value) {
+			this._innerHTML = String(value);
+			if (this.id === "detail") replaceDetailElements(this._innerHTML);
+		}
+		get innerHTML() {
+			return this._innerHTML;
+		}
+		addEventListener(type, handler) {
+			const handlers = this.listeners.get(type) || [];
+			handlers.push(handler);
+			this.listeners.set(type, handlers);
+		}
+		dispatchEvent(event) {
+			for (const handler of this.listeners.get(event.type) || []) {
+				handler({ ...event, target: this, currentTarget: this });
+			}
+		}
+		getBoundingClientRect() {
+			return { width: 520 };
+		}
+		setAttribute(name, value) {
+			this[name] = value;
+		}
+	}
+	function replaceDetailElements(html) {
+		for (const id of Array.from(elements.keys())) {
+			if (id !== "detail") elements.delete(id);
+		}
+		for (const match of html.matchAll(/\sid=(['"])(.*?)\1/g)) {
+			elements.set(match[2], new FakeElement(match[2]));
+		}
+	}
+	const detail = new FakeElement("detail");
+	elements.set("detail", detail);
+	const document = {
+		body: { classList: classList() },
+		documentElement: { clientWidth: 1200 },
+		getElementById(id) {
+			return elements.get(id) || null;
+		},
+		querySelector() {
+			return null;
+		},
+		querySelectorAll() {
+			return [];
+		},
+	};
+	return {
+		DEFAULT_PROFILE_ID,
+		LANE,
+		ROLE_DEFAULTS,
+		THINKING_LEVELS: ["low", "medium", "high", "xhigh"],
+		document,
+		window: { innerWidth: 1200, matchMedia: () => ({ matches: false }) },
+		getComputedStyle: () => ({ getPropertyValue: () => "" }),
+		alert(message) {
+			throw new Error(message);
+		},
+	};
+}
+
 function notificationVmContext({ permission, requestPermission, supported = true } = {}) {
 	const button = { hidden: true, disabled: true };
 	const notifications = [];
@@ -307,6 +399,10 @@ test("dashboard renderer injects runtime data", async () => {
 	assert.match(html, /QR code failed to load\. Use the URL above or refresh the dialog\./);
 	assert.match(html, /<div class="brand-mark" aria-label="Pi">π<\/div>/);
 	assert.doesNotMatch(html, /<div class="brand-mark">PI<\/div>/);
+	assert.match(html, /const feedbackDraftsByIssueId = new Map\(\);/);
+	assert.match(html, /function captureFeedbackDraft\(issueId = currentFeedbackDraftKey\(\)\)/);
+	assert.match(html, /if \(feedback\) feedback\.value = feedbackDraft\(issue\.id\);/);
+	assert.match(html, /feedback\.addEventListener\("input", \(\) => feedbackDraftsByIssueId\.set\(issue\.id, feedback\.value\)\)/);
 	assert.match(html, /const minimizedIssueIds = new Set\(\);/);
 	assert.match(html, /let issueLaneById = new Map\(\);/);
 	assert.match(html, /function minimizedTitle\(title\)/);
@@ -315,7 +411,7 @@ test("dashboard renderer injects runtime data", async () => {
 	assert.match(html, /minimizedIssueIds\.add\(issue\.id\);/);
 	assert.match(html, /issueLaneById = nextIssueLaneById;/);
 	assert.match(html, /const nextState = await api\("\/api\/state"\);/);
-	assert.match(html, /syncCompletedTicketMinimization\(nextState\);\s*syncHumanInterventionNotifications\(nextState\);\s*state = nextState;/);
+	assert.match(html, /const nextState = await api\("\/api\/state"\);\s*captureFeedbackDraft\(\);\s*syncCompletedTicketMinimization\(nextState\);\s*syncHumanInterventionNotifications\(nextState\);\s*state = nextState;/);
 	const cardActionsStart = html.indexOf("\"<div class='card-actions'>\" +");
 	const cardHeadBeforeActions = html.lastIndexOf("\"<div class='card-head'>\" +", cardActionsStart);
 	const badgeInCardActions = html.indexOf("\"<span class='badge \" + badgeClass(issue) + \"'>\" + escapeHtml(stateLabel(issue)) + \"</span>\" +", cardActionsStart);
@@ -348,6 +444,106 @@ test("dashboard renderer injects runtime data", async () => {
 	assert.match(html, /function applyCreateDrawerWidth\(\)/);
 	assert.match(html, /function applyDetailPanelWidth\(\)/);
 	assert.doesNotMatch(html, /__(TOKEN|LANES|KANBAN_LANES|LANE|ROLE_DEFAULTS|THINKING_LEVELS|DEFAULT_PROFILE_ID)_JSON__/);
+});
+
+test("dashboard preserves unsent feedback drafts across unrelated ticket refreshes", async () => {
+	const html = await renderDashboardHtml("test-token");
+	const context = dashboardDraftVmContext();
+	const result = await vm.runInNewContext(`${dashboardDraftTestSource(html)}
+		renderBoard = () => {};
+		syncHumanInterventionNotifications = () => {};
+		renderDiffsSection = () => "";
+		bindDiffActions = () => {};
+		loadDiffsForSelectedIssue = async () => {};
+		activeMergeForIssue = () => null;
+		getDependencyIssueId = () => "";
+		hasUnresolvedDependency = () => false;
+		dependencyDisplay = () => "none";
+		(async () => {
+			const selectedIssue = {
+				id: "PI-A",
+				title: "Selected ticket",
+				lane: LANE.PLAN_REVIEW,
+				updatedAt: "2026-05-11T00:00:00.000Z",
+				comments: [{ createdAt: "2026-05-11T00:01:00.000Z", author: "human", phase: "general", text: "submitted comment" }],
+			};
+			state = { issues: [
+				selectedIssue,
+				{ id: "PI-B", title: "Other worker ticket", lane: LANE.IN_PROGRESS, updatedAt: "2026-05-11T00:00:00.000Z", comments: [] },
+			], lanes: {} };
+			selectedId = "PI-A";
+			detailTab = "comments";
+			renderDetail();
+			const feedback = document.getElementById("feedback");
+			feedback.value = "keep this local draft";
+			feedback.dispatchEvent({ type: "input" });
+			api = async (apiPath) => {
+				if (apiPath !== "/api/state") throw new Error("unexpected API path " + apiPath);
+				return { issues: [
+					{ ...selectedIssue },
+					{ id: "PI-B", title: "Other worker ticket", lane: LANE.IN_REVIEW, updatedAt: "2026-05-11T00:02:00.000Z", comments: [] },
+				], lanes: {} };
+			};
+			await load();
+			return {
+				feedbackValue: document.getElementById("feedback").value,
+				draftValue: feedbackDraft("PI-A"),
+				detailHtml: document.getElementById("detail").innerHTML,
+			};
+		})()
+	`, context);
+
+	assert.equal(result.feedbackValue, "keep this local draft");
+	assert.equal(result.draftValue, "keep this local draft");
+	assert.match(result.detailHtml, /submitted comment/);
+});
+
+test("dashboard clears only consumed feedback drafts after successful submissions", async () => {
+	const html = await renderDashboardHtml("test-token");
+	const context = dashboardDraftVmContext();
+	const result = await vm.runInNewContext(`${dashboardDraftTestSource(html)}
+		renderBoard = () => {};
+		syncHumanInterventionNotifications = () => {};
+		renderDiffsSection = () => "";
+		bindDiffActions = () => {};
+		loadDiffsForSelectedIssue = async () => {};
+		activeMergeForIssue = () => null;
+		getDependencyIssueId = () => "";
+		hasUnresolvedDependency = () => false;
+		dependencyDisplay = () => "none";
+		(async () => {
+			state = { issues: [
+				{ id: "PI-A", title: "Selected ticket", lane: LANE.PLAN_REVIEW, comments: [] },
+				{ id: "PI-B", title: "Unrelated ticket", lane: LANE.IN_PROGRESS, comments: [] },
+			], lanes: {} };
+			selectedId = "PI-A";
+			renderDetail();
+			const feedback = document.getElementById("feedback");
+			feedback.value = "  please revise the plan  ";
+			feedback.dispatchEvent({ type: "input" });
+			feedbackDraftsByIssueId.set("PI-B", "unrelated draft");
+			const calls = [];
+			api = async (apiPath, options = {}) => {
+				calls.push({ apiPath, body: options.body ? JSON.parse(options.body) : null });
+				if (apiPath === "/api/state") return state;
+				return {};
+			};
+			await postAction("PI-A", "request-plan-changes", { text: feedbackText() });
+			return {
+				feedbackValue: document.getElementById("feedback").value,
+				selectedDraft: feedbackDraft("PI-A"),
+				otherDraft: feedbackDraft("PI-B"),
+				calls,
+			};
+		})()
+	`, context);
+
+	assert.equal(result.feedbackValue, "");
+	assert.equal(result.selectedDraft, "");
+	assert.equal(result.otherDraft, "unrelated draft");
+	assert.equal(result.calls[0].apiPath, "/api/issues/PI-A/request-plan-changes");
+	assert.deepEqual(JSON.parse(JSON.stringify(result.calls[0].body)), { text: "please revise the plan" });
+	assert.equal(result.calls[1].apiPath, "/api/state");
 });
 
 test("dashboard notification helper notifies only on human-intervention transitions", async () => {
