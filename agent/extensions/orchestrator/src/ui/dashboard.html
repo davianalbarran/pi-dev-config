@@ -817,6 +817,7 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
     </div>
   </div>
   <div class="top-actions">
+    <button type="button" id="enable-notifications" class="secondary" hidden disabled>Enable Notifications</button>
     <button type="button" id="open-share" class="secondary">Share QR</button>
     <button type="button" id="open-create">New Issue</button>
   </div>
@@ -959,6 +960,7 @@ const ROLE_DEFAULTS = __ROLE_DEFAULTS_JSON__;
 const THINKING_LEVELS = __THINKING_LEVELS_JSON__;
 const DEFAULT_PROFILE_ID = __DEFAULT_PROFILE_ID_JSON__;
 const PROFILE_ROLES = ["planner", "worker", "reviewer"];
+const HUMAN_INTERVENTION_LANES = new Set([LANE.PLAN_REVIEW, LANE.IN_REVIEW]);
 let state = { issues: [], lanes: {} };
 let profiles = [];
 let selectedProfileId = DEFAULT_PROFILE_ID;
@@ -978,6 +980,10 @@ let diffLoading = false;
 let diffError = "";
 let diffLoadedKey = "";
 let shareInfo = null;
+let notificationPermissionRequested = false;
+let notificationPermissionState = "unsupported";
+let hasLoadedNotificationBaseline = false;
+let issueHumanStepById = new Map();
 let specImproveLoading = false;
 let improvedSpecText = "";
 let specWriterSuggestions = [];
@@ -1118,6 +1124,91 @@ function api(path, options = {}) {
     if (!res.ok) throw new Error(data.error || res.statusText);
     return data;
   });
+}
+
+function supportsNotifications() {
+  return typeof window !== "undefined" && "Notification" in window;
+}
+
+function currentNotificationPermission() {
+  if (!supportsNotifications()) return "unsupported";
+  return window.Notification.permission || "default";
+}
+
+function refreshNotificationPermissionUi() {
+  const button = document.getElementById("enable-notifications");
+  notificationPermissionState = currentNotificationPermission();
+  if (!button) return notificationPermissionState;
+  const canRequest = notificationPermissionState === "default" && !notificationPermissionRequested;
+  button.hidden = !canRequest;
+  button.disabled = !canRequest;
+  return notificationPermissionState;
+}
+
+async function requestNotificationPermission() {
+  if (!supportsNotifications()) return refreshNotificationPermissionUi();
+  if (currentNotificationPermission() !== "default") return refreshNotificationPermissionUi();
+  if (notificationPermissionRequested) return refreshNotificationPermissionUi();
+  notificationPermissionRequested = true;
+  try {
+    if (typeof window.Notification.requestPermission === "function") {
+      await window.Notification.requestPermission();
+    }
+  } catch (_) {
+    // Permission prompts can fail in restrictive runtimes; the dashboard should continue without notifications.
+  }
+  return refreshNotificationPermissionUi();
+}
+
+function humanInterventionStep(issue) {
+  if (!issue || !HUMAN_INTERVENTION_LANES.has(issue.lane)) return null;
+  return issue.lane;
+}
+
+function notificationTitle(issue, step) {
+  return "Ticket needs attention";
+}
+
+function notificationBody(issue, step) {
+  const parts = [];
+  const title = String(issue?.title || "Untitled ticket").trim();
+  parts.push(shortId(issue?.id) + " — " + title);
+  parts.push("Step: " + step);
+  if (issue?.linkedDirectory) parts.push("Directory: " + compactPath(issue.linkedDirectory));
+  else if (issue?.workspace?.path) parts.push("Workspace: " + compactPath(issue.workspace.path));
+  if (issue?.git?.branchName) parts.push("Branch: " + issue.git.branchName);
+  return parts.join("\n");
+}
+
+function showTicketNotification(issue, step) {
+  if (currentNotificationPermission() !== "granted") return false;
+  try {
+    new Notification(notificationTitle(issue, step), {
+      body: notificationBody(issue, step),
+      tag: "orchestrator:" + issue.id + ":" + step
+    });
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function syncHumanInterventionNotifications(nextState) {
+  const nextIssues = Array.isArray(nextState?.issues) ? nextState.issues : [];
+  const nextIssueHumanStepById = new Map();
+  for (const issue of nextIssues) {
+    if (!issue?.id) continue;
+    const step = humanInterventionStep(issue);
+    const previousStep = issueHumanStepById.get(issue.id);
+    if (step) {
+      nextIssueHumanStepById.set(issue.id, step);
+      if (hasLoadedNotificationBaseline && step !== previousStep) {
+        showTicketNotification(issue, step);
+      }
+    }
+  }
+  issueHumanStepById = nextIssueHumanStepById;
+  hasLoadedNotificationBaseline = true;
 }
 
 function resetSpecWriterState() {
@@ -2270,6 +2361,7 @@ function syncCompletedTicketMinimization(nextState) {
 async function load() {
   const nextState = await api("/api/state");
   syncCompletedTicketMinimization(nextState);
+  syncHumanInterventionNotifications(nextState);
   state = nextState;
   if (selectedId && !issueById(selectedId)) selectedId = null;
   populateDependencyOptions(issueFormMode === "edit" ? { excludeId: editingBacklogId } : {});
@@ -2368,6 +2460,9 @@ document.getElementById("issue-form").addEventListener("submit", async (event) =
   }
 });
 
+document.getElementById("enable-notifications").addEventListener("click", () => {
+  requestNotificationPermission().catch(() => refreshNotificationPermissionUi());
+});
 document.getElementById("open-share").addEventListener("click", () => openShareDialog().catch((error) => alert(error.message)));
 document.getElementById("close-share").addEventListener("click", closeShareDialog);
 document.getElementById("share-backdrop").addEventListener("click", closeShareDialog);
@@ -2477,6 +2572,7 @@ events.onmessage = () => load().catch(() => {});
 events.addEventListener("ready", () => load().catch(() => {}));
 events.onerror = () => { document.getElementById("status").textContent = "Event stream disconnected"; };
 populateLaneFilter();
+refreshNotificationPermissionUi();
 loadProfiles()
   .catch((error) => { document.getElementById("status").textContent = error.message; })
   .then(() => load().catch((error) => { document.getElementById("status").textContent = error.message; }));

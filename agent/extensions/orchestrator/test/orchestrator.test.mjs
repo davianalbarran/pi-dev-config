@@ -3,6 +3,7 @@ import { execFile } from "node:child_process";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import vm from "node:vm";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
@@ -53,6 +54,62 @@ async function tempDir() {
 
 async function git(args, cwd) {
 	return execFileAsync("git", args, { cwd, maxBuffer: 1024 * 1024 });
+}
+
+function dashboardNotificationTestSource(html) {
+	const laneDeclaration = html.match(/const LANE = .*?;\n/)?.[0];
+	assert.ok(laneDeclaration, "dashboard script declares LANE");
+	const start = html.indexOf("const HUMAN_INTERVENTION_LANES = new Set");
+	const end = html.indexOf("function resetSpecWriterState()", start);
+	assert.ok(start !== -1, "dashboard script declares notification state");
+	assert.ok(end > start, "dashboard script keeps notification helpers before spec writer helpers");
+	return laneDeclaration + html.slice(start, end);
+}
+
+function notificationVmContext({ permission, requestPermission, supported = true } = {}) {
+	const button = { hidden: true, disabled: true };
+	const notifications = [];
+	let permissionState = permission ?? "default";
+	let permissionRequests = 0;
+	function MockNotification(title, options) {
+		notifications.push({ title, options });
+	}
+	Object.defineProperty(MockNotification, "permission", {
+		get: () => permissionState,
+		set: (value) => { permissionState = value; },
+	});
+	MockNotification.requestPermission = async () => {
+		permissionRequests += 1;
+		const nextPermission = requestPermission ? await requestPermission(permissionState) : permissionState;
+		if (nextPermission) permissionState = nextPermission;
+		return permissionState;
+	};
+	const context = {
+		DEFAULT_PROFILE_ID: "default",
+		button,
+		notifications,
+		get permissionRequests() { return permissionRequests; },
+		get permissionState() { return permissionState; },
+		document: {
+			getElementById(id) {
+				return id === "enable-notifications" ? button : null;
+			},
+		},
+		shortId(value) {
+			const text = String(value || "");
+			return text.length <= 32 ? text : text.slice(0, 14) + "..." + text.slice(-10);
+		},
+		compactPath(value) {
+			return String(value || "");
+		},
+	};
+	if (supported) {
+		context.Notification = MockNotification;
+		context.window = { Notification: MockNotification };
+	} else {
+		context.window = {};
+	}
+	return context;
 }
 
 test("token authorization accepts query, header, and bearer token", () => {
@@ -209,6 +266,13 @@ test("dashboard renderer injects runtime data", async () => {
 	assert.match(html, /if \(activeView !== "kanban"\) return;\s*for \(const lane of KANBAN_LANES\)/);
 	assert.match(html, /for \(const lane of KANBAN_LANES\)/);
 	assert.match(html, /const KANBAN_LANES =/);
+	assert.match(html, /id="enable-notifications"/);
+	assert.match(html, /id="enable-notifications" class="secondary" hidden disabled/);
+	assert.match(html, /Notification\.permission/);
+	assert.match(html, /Notification\.requestPermission\(\)/);
+	assert.match(html, /new Notification\(/);
+	assert.match(html, /const HUMAN_INTERVENTION_LANES = new Set\(\[LANE\.PLAN_REVIEW, LANE\.IN_REVIEW\]\);/);
+	assert.match(html, /function syncHumanInterventionNotifications\(nextState\)/);
 	assert.match(html, /id="open-share"/);
 	assert.match(html, /id="share-dialog"/);
 	assert.match(html, /id="share-qr"/);
@@ -251,7 +315,7 @@ test("dashboard renderer injects runtime data", async () => {
 	assert.match(html, /minimizedIssueIds\.add\(issue\.id\);/);
 	assert.match(html, /issueLaneById = nextIssueLaneById;/);
 	assert.match(html, /const nextState = await api\("\/api\/state"\);/);
-	assert.match(html, /syncCompletedTicketMinimization\(nextState\);\s*state = nextState;/);
+	assert.match(html, /syncCompletedTicketMinimization\(nextState\);\s*syncHumanInterventionNotifications\(nextState\);\s*state = nextState;/);
 	const cardActionsStart = html.indexOf("\"<div class='card-actions'>\" +");
 	const cardHeadBeforeActions = html.lastIndexOf("\"<div class='card-head'>\" +", cardActionsStart);
 	const badgeInCardActions = html.indexOf("\"<span class='badge \" + badgeClass(issue) + \"'>\" + escapeHtml(stateLabel(issue)) + \"</span>\" +", cardActionsStart);
@@ -284,6 +348,115 @@ test("dashboard renderer injects runtime data", async () => {
 	assert.match(html, /function applyCreateDrawerWidth\(\)/);
 	assert.match(html, /function applyDetailPanelWidth\(\)/);
 	assert.doesNotMatch(html, /__(TOKEN|LANES|KANBAN_LANES|LANE|ROLE_DEFAULTS|THINKING_LEVELS|DEFAULT_PROFILE_ID)_JSON__/);
+});
+
+test("dashboard notification helper notifies only on human-intervention transitions", async () => {
+	const html = await renderDashboardHtml("test-token");
+	const context = notificationVmContext({ permission: "granted" });
+	const result = await vm.runInNewContext(`${dashboardNotificationTestSource(html)}
+		(async () => {
+			syncHumanInterventionNotifications({ issues: [
+				{ id: "PI-202605110001-very-long-ticket-id-for-shortening", title: "Review the plan", lane: LANE.PLAN_REVIEW, linkedDirectory: "/tmp/project" }
+			] });
+			const afterBaseline = notifications.length;
+			syncHumanInterventionNotifications({ issues: [
+				{ id: "PI-202605110001-very-long-ticket-id-for-shortening", title: "Review the plan", lane: LANE.PLAN_REVIEW, linkedDirectory: "/tmp/project" }
+			] });
+			const afterDuplicate = notifications.length;
+			syncHumanInterventionNotifications({ issues: [
+				{ id: "PI-202605110001-very-long-ticket-id-for-shortening", title: "Review the plan", lane: LANE.IN_PROGRESS, linkedDirectory: "/tmp/project" },
+				{ id: "PI-ignored", title: "Still working", lane: LANE.CREATED }
+			] });
+			const afterNonHuman = notifications.length;
+			syncHumanInterventionNotifications({ issues: [
+				{ id: "PI-202605110001-very-long-ticket-id-for-shortening", title: "Review the plan", lane: LANE.PLAN_REVIEW, linkedDirectory: "/tmp/project" }
+			] });
+			const afterReenterPlanReview = notifications.length;
+			syncHumanInterventionNotifications({ issues: [
+				{ id: "PI-202605110001-very-long-ticket-id-for-shortening", title: "Review the implementation", lane: LANE.IN_REVIEW, git: { branchName: "feature/review" } }
+			] });
+			const afterEnterImplementationReview = notifications.length;
+			syncHumanInterventionNotifications({ issues: [
+				{ id: "PI-202605110001-very-long-ticket-id-for-shortening", title: "Review the implementation", lane: LANE.IN_REVIEW, git: { branchName: "feature/review" } }
+			] });
+			return { afterBaseline, afterDuplicate, afterNonHuman, afterReenterPlanReview, afterEnterImplementationReview, finalCount: notifications.length, notifications };
+		})()
+	`, context);
+
+	assert.equal(result.afterBaseline, 0, "initial load establishes a baseline without notification bursts");
+	assert.equal(result.afterDuplicate, 0, "polling while staying in the same human step is suppressed");
+	assert.equal(result.afterNonHuman, 0, "non-human lanes do not notify");
+	assert.equal(result.afterReenterPlanReview, 1, "leaving and re-entering plan review notifies");
+	assert.equal(result.afterEnterImplementationReview, 2, "transitioning into implementation review notifies");
+	assert.equal(result.finalCount, 2, "remaining in implementation review does not spam duplicates");
+	assert.equal(result.notifications[0].title, "Ticket needs attention");
+	assert.match(result.notifications[0].options.body, /Step: Plan in review/);
+	assert.match(result.notifications[0].options.tag, /^orchestrator:PI-202605110001-very-long-ticket-id-for-shortening:Plan in review$/);
+	assert.match(result.notifications[1].options.body, /Branch: feature\/review/);
+});
+
+test("dashboard notification permission states are graceful", async () => {
+	const html = await renderDashboardHtml("test-token");
+	const source = dashboardNotificationTestSource(html);
+
+	const grantedContext = notificationVmContext({ permission: "granted" });
+	const granted = await vm.runInNewContext(`${source}
+		(async () => {
+			const state = refreshNotificationPermissionUi();
+			const shown = showTicketNotification({ id: "PI-granted", title: "Ready", lane: LANE.IN_REVIEW }, LANE.IN_REVIEW);
+			return { state, button, shown, notifications };
+		})()
+	`, grantedContext);
+	assert.equal(granted.state, "granted");
+	assert.equal(granted.button.hidden, true);
+	assert.equal(granted.shown, true);
+	assert.equal(granted.notifications.length, 1);
+
+	const deniedContext = notificationVmContext({ permission: "denied", requestPermission: () => "granted" });
+	const denied = await vm.runInNewContext(`${source}
+		(async () => {
+			const state = refreshNotificationPermissionUi();
+			await requestNotificationPermission();
+			const shown = showTicketNotification({ id: "PI-denied", title: "Denied", lane: LANE.PLAN_REVIEW }, LANE.PLAN_REVIEW);
+			return { state, button, permissionRequests, shown, notifications };
+		})()
+	`, deniedContext);
+	assert.equal(denied.state, "denied");
+	assert.equal(denied.button.hidden, true);
+	assert.equal(denied.permissionRequests, 0, "denied permission is not requested again");
+	assert.equal(denied.shown, false);
+	assert.equal(denied.notifications.length, 0);
+
+	const defaultContext = notificationVmContext({ permission: "default", requestPermission: () => "default" });
+	const defaultResult = await vm.runInNewContext(`${source}
+		(async () => {
+			const state = refreshNotificationPermissionUi();
+			const visibleBeforePrompt = !button.hidden && !button.disabled;
+			await requestNotificationPermission();
+			await requestNotificationPermission();
+			return { state, visibleBeforePrompt, button, permissionRequests, notifications };
+		})()
+	`, defaultContext);
+	assert.equal(defaultResult.state, "default");
+	assert.equal(defaultResult.visibleBeforePrompt, true, "default permission exposes the explicit enable button");
+	assert.equal(defaultResult.permissionRequests, 1, "dismissed prompts are not repeated automatically");
+	assert.equal(defaultResult.button.hidden, true);
+	assert.equal(defaultResult.notifications.length, 0);
+
+	const unsupportedContext = notificationVmContext({ supported: false });
+	const unsupported = await vm.runInNewContext(`${source}
+		(async () => {
+			const state = refreshNotificationPermissionUi();
+			await requestNotificationPermission();
+			const shown = showTicketNotification({ id: "PI-unsupported", title: "Unsupported", lane: LANE.IN_REVIEW }, LANE.IN_REVIEW);
+			return { state, button, shown, notifications };
+		})()
+	`, unsupportedContext);
+	assert.equal(unsupported.state, "unsupported");
+	assert.equal(unsupported.button.hidden, true);
+	assert.equal(unsupported.button.disabled, true);
+	assert.equal(unsupported.shown, false);
+	assert.equal(unsupported.notifications.length, 0);
 });
 
 test("dashboard css keeps the desktop board compact and stacks it on mobile", async () => {
