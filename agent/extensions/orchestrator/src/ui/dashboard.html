@@ -205,9 +205,10 @@ h1 { margin: 0; font-size: 20px; letter-spacing: 0; line-height: 1; }
 }
 .filters {
   display: grid;
-  grid-template-columns: minmax(160px, 1fr) minmax(120px, 160px) minmax(120px, 160px);
+  grid-template-columns: minmax(160px, 1fr) minmax(120px, 160px) minmax(120px, 160px) auto;
   gap: 8px;
 }
+.clean-completed-button { white-space: nowrap; }
 .data-root {
   grid-column: 1 / -1;
   color: var(--dim);
@@ -842,6 +843,7 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
         <option value="blocked">Blocked</option>
         <option value="completed">Completed</option>
       </select>
+      <button type="button" id="clean-completed" class="secondary clean-completed-button">Clean completed tickets</button>
     </div>
   </section>
   <section class="board" id="board" aria-label="Issue lanes"></section>
@@ -989,6 +991,7 @@ let specImproveLoading = false;
 let improvedSpecText = "";
 let specWriterSuggestions = [];
 let specImproveRequestId = 0;
+let cleanupCompletedLoading = false;
 const expandedDiffFiles = new Set();
 const pendingResumeIssueIds = new Set();
 
@@ -2449,6 +2452,33 @@ async function load() {
   renderDetail();
 }
 
+function updateCleanCompletedButton() {
+  const button = document.getElementById("clean-completed");
+  if (!button) return;
+  button.disabled = cleanupCompletedLoading;
+  button.textContent = cleanupCompletedLoading ? "Cleaning…" : "Clean completed tickets";
+}
+
+async function cleanCompletedTickets() {
+  if (cleanupCompletedLoading) return;
+  cleanupCompletedLoading = true;
+  updateCleanCompletedButton();
+  document.getElementById("status").textContent = "Cleaning old completed tickets…";
+  try {
+    const result = await api("/api/issues/clean-completed", { method: "POST", body: "{}" });
+    await load();
+    const cleanedCount = result.cleanedCount || 0;
+    document.getElementById("status").textContent = cleanedCount
+      ? "Cleaned " + cleanedCount + " completed ticket" + (cleanedCount === 1 ? "" : "s") + "."
+      : "No old completed tickets to clean.";
+  } catch (error) {
+    document.getElementById("status").textContent = "Cleanup failed: " + (error.message || "Unknown error");
+  } finally {
+    cleanupCompletedLoading = false;
+    updateCleanCompletedButton();
+  }
+}
+
 function populateLaneFilter() {
   const laneFilter = document.getElementById("lane-filter");
   laneFilter.innerHTML = "<option value='all'>All Kanban lanes</option>" + KANBAN_LANES.map((lane) => "<option value='" + escapeHtml(lane) + "'>" + escapeHtml(lane) + "</option>").join("");
@@ -2561,6 +2591,11 @@ document.getElementById("lane-filter").addEventListener("change", (event) => {
 document.getElementById("state-filter").addEventListener("change", (event) => {
   filters.state = event.target.value;
   renderBoard();
+});
+document.getElementById("clean-completed").addEventListener("click", () => {
+  cleanCompletedTickets().catch((error) => {
+    document.getElementById("status").textContent = "Cleanup failed: " + (error.message || "Unknown error");
+  });
 });
 document.getElementById("dependencyIssueId").addEventListener("change", updateIssueFormActions);
 for (const button of document.querySelectorAll("[data-view]")) {

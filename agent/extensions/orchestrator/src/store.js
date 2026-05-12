@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
-import { DEFAULT_DATA_ROOT, DEFAULT_PROFILE_ID, LANE, LANES } from "./constants.js";
+import { COMPLETED_TICKET_CLEANUP_RETENTION_DAYS, DEFAULT_DATA_ROOT, DEFAULT_PROFILE_ID, LANE, LANES } from "./constants.js";
 import {
 	appendJsonLine,
 	debounce,
@@ -29,6 +29,7 @@ export class IssueStore {
 	constructor(options = {}) {
 		this.dataRoot = options.dataRoot || DEFAULT_DATA_ROOT;
 		this.issuesRoot = path.join(this.dataRoot, "issues");
+		this.completedTicketArchiveRoot = path.join(this.issuesRoot, "__archived_completed__");
 		this.worktreesRoot = path.join(this.dataRoot, "worktrees");
 		this.sessionsRoot = path.join(this.dataRoot, "sessions");
 		this.internalRunsRoot = path.join(this.dataRoot, "runs");
@@ -303,6 +304,62 @@ export class IssueStore {
 			}
 		}
 		return issues.sort((a, b) => String(a.metadata.createdAt).localeCompare(String(b.metadata.createdAt)));
+	}
+
+	isCompletedTicketCleanupEligible(metadata, { now = new Date() } = {}) {
+		if (metadata?.lane !== LANE.COMPLETED) return false;
+		const updatedAtMs = Date.parse(metadata.updatedAt || "");
+		if (!Number.isFinite(updatedAtMs)) return false;
+		const nowMs = now instanceof Date ? now.getTime() : Date.parse(now);
+		if (!Number.isFinite(nowMs)) return false;
+		const retentionMs = COMPLETED_TICKET_CLEANUP_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+		return updatedAtMs < nowMs - retentionMs;
+	}
+
+	async uniqueCompletedArchiveDir(id, { now = new Date() } = {}) {
+		const stamp = (now instanceof Date ? now : new Date(now)).toISOString().replace(/[:.]/g, "-");
+		const candidates = [id, `${id}--${stamp}`];
+		let suffix = 2;
+		while (true) {
+			const name = candidates.shift() || `${id}--${stamp}-${suffix++}`;
+			const archiveDir = path.join(this.completedTicketArchiveRoot, name);
+			try {
+				await fsp.access(archiveDir);
+			} catch (error) {
+				if (error.code === "ENOENT") return archiveDir;
+				throw error;
+			}
+		}
+	}
+
+	async cleanCompletedTickets({ now = new Date() } = {}) {
+		const cleanupNow = now instanceof Date ? now : new Date(now);
+		await this.init();
+		const issues = await this.listIssues();
+		const eligible = issues.filter((issue) => this.isCompletedTicketCleanupEligible(issue.metadata, { now: cleanupNow }));
+		if (!eligible.length) {
+			return { cleanedCount: 0, cleanedIds: [], retentionDays: COMPLETED_TICKET_CLEANUP_RETENTION_DAYS };
+		}
+		await ensureDir(this.completedTicketArchiveRoot);
+		const cleanedIds = [];
+		const moved = [];
+		try {
+			for (const issue of eligible) {
+				const id = issue.metadata.id;
+				const sourceDir = this.issueDir(id);
+				const archiveDir = await this.uniqueCompletedArchiveDir(id, { now: cleanupNow });
+				await fsp.rename(sourceDir, archiveDir);
+				moved.push({ sourceDir, archiveDir });
+				cleanedIds.push(id);
+			}
+		} catch (error) {
+			for (const move of moved.reverse()) {
+				await fsp.rename(move.archiveDir, move.sourceDir).catch(() => {});
+			}
+			throw error;
+		}
+		this.emitChange({ type: "completed_tickets_cleaned", cleanedIds, cleanedCount: cleanedIds.length, retentionDays: COMPLETED_TICKET_CLEANUP_RETENTION_DAYS });
+		return { cleanedCount: cleanedIds.length, cleanedIds, retentionDays: COMPLETED_TICKET_CLEANUP_RETENTION_DAYS };
 	}
 
 	async writeMetadata(id, metadata) {

@@ -32,6 +32,11 @@ export const MAX_IMPLEMENTATION_ATTEMPTS = 3;
 export const ISSUE_AGENT_ROLES = Object.freeze(["planner", "worker", "reviewer"]);
 export const THINKING_LEVELS = Object.freeze(["low", "medium", "high", "xhigh"]);
 
+// Conservative cleanup retention for completed tickets when no project-specific
+// policy exists. Eligibility uses updatedAt as the completion-age proxy, so
+// editing a completed ticket refreshes its retention window.
+export const COMPLETED_TICKET_CLEANUP_RETENTION_DAYS = 30;
+
 export const DEFAULT_CONFIG = Object.freeze({
 	// Keep the dashboard loopback-only by default. Use PI_ORCHESTRATOR_BIND_LAN=1
 	// or host: "0.0.0.0" to opt in to local-network access.

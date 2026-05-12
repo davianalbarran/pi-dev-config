@@ -342,6 +342,10 @@ export class OrchestratorServer {
 			return sendJson(res, 201, issue);
 		}
 
+		if (pathname === "/api/issues/clean-completed" && req.method === "POST") {
+			return sendJson(res, 200, await this.store.cleanCompletedTickets());
+		}
+
 		const diffMatch = pathname.match(/^\/api\/issues\/([^/]+)\/diffs$/);
 		if (diffMatch && req.method === "GET") {
 			const issue = await this.store.loadIssue(decodeURIComponent(diffMatch[1]));

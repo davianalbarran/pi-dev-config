@@ -7,7 +7,7 @@ import vm from "node:vm";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
-import { DEFAULT_PROFILE_ID, KANBAN_LANES, LANE, LANES, ROLE_DEFAULTS, ROLE_TOOLS } from "../src/constants.js";
+import { COMPLETED_TICKET_CLEANUP_RETENTION_DAYS, DEFAULT_PROFILE_ID, KANBAN_LANES, LANE, LANES, ROLE_DEFAULTS, ROLE_TOOLS } from "../src/constants.js";
 import { getIssueDiffs } from "../src/diffs.js";
 import {
 	PLAN_END,
@@ -77,6 +77,10 @@ function dashboardDraftTestSource(html) {
 	return html.slice(start, end);
 }
 
+function dashboardCleanupTestSource(html) {
+	return `${dashboardDraftTestSource(html)}\nglobalThis.__dashboardCleanup = { cleanCompletedTickets, updateCleanCompletedButton, get loading() { return cleanupCompletedLoading; } };\n`;
+}
+
 function dashboardDraftVmContext() {
 	const elements = new Map();
 	function classList() {
@@ -87,6 +91,7 @@ function dashboardDraftVmContext() {
 			contains: (name) => classes.has(name),
 		};
 	}
+	const persistentElementIds = new Set(["detail", "status", "clean-completed"]);
 	class FakeElement {
 		constructor(id) {
 			this.id = id;
@@ -126,7 +131,7 @@ function dashboardDraftVmContext() {
 	}
 	function replaceDetailElements(html) {
 		for (const id of Array.from(elements.keys())) {
-			if (id !== "detail") elements.delete(id);
+			if (!persistentElementIds.has(id)) elements.delete(id);
 		}
 		for (const match of html.matchAll(/\sid=(['"])(.*?)\1/g)) {
 			elements.set(match[2], new FakeElement(match[2]));
@@ -134,6 +139,8 @@ function dashboardDraftVmContext() {
 	}
 	const detail = new FakeElement("detail");
 	elements.set("detail", detail);
+	elements.set("status", new FakeElement("status"));
+	elements.set("clean-completed", new FakeElement("clean-completed"));
 	const document = {
 		body: { classList: classList() },
 		documentElement: { clientWidth: 1200 },
@@ -383,6 +390,14 @@ test("dashboard renderer injects runtime data", async () => {
 	assert.match(html, /const KANBAN_LANES =/);
 	assert.match(html, /id="enable-notifications"/);
 	assert.match(html, /id="enable-notifications" class="secondary" hidden disabled/);
+	assert.match(html, /id="clean-completed" class="secondary clean-completed-button"/);
+	assert.match(html, /Clean completed tickets/);
+	assert.match(html, /let cleanupCompletedLoading = false;/);
+	assert.match(html, /async function cleanCompletedTickets\(\)/);
+	assert.match(html, /api\("\/api\/issues\/clean-completed", \{ method: "POST", body: "\{\}" \}\)/);
+	assert.match(html, /No old completed tickets to clean\./);
+	assert.match(html, /Cleanup failed:/);
+	assert.match(html, /document\.getElementById\("clean-completed"\)\.addEventListener\("click"/);
 	assert.match(html, /Notification\.permission/);
 	assert.match(html, /Notification\.requestPermission\(\)/);
 	assert.match(html, /new Notification\(/);
@@ -576,6 +591,77 @@ test("dashboard clears only consumed feedback drafts after successful submission
 	assert.equal(result.calls[0].apiPath, "/api/issues/PI-A/request-plan-changes");
 	assert.deepEqual(JSON.parse(JSON.stringify(result.calls[0].body)), { text: "please revise the plan" });
 	assert.equal(result.calls[1].apiPath, "/api/state");
+});
+
+test("dashboard clean completed tickets action calls cleanup endpoint and reloads", async () => {
+	const html = await renderDashboardHtml("test-token");
+	const context = dashboardDraftVmContext();
+	const result = await vm.runInNewContext(`${dashboardCleanupTestSource(html)}
+		(async () => {
+			const calls = [];
+			let loadCalls = 0;
+			api = async (apiPath, options = {}) => {
+				calls.push({ apiPath, options });
+				return { cleanedCount: 2, cleanedIds: ["PI-old-a", "PI-old-b"], retentionDays: 30 };
+			};
+			load = async () => { loadCalls += 1; };
+			await cleanCompletedTickets();
+			return {
+				calls,
+				loadCalls,
+				status: document.getElementById("status").textContent,
+				buttonDisabled: document.getElementById("clean-completed").disabled,
+				buttonText: document.getElementById("clean-completed").textContent,
+				loading: __dashboardCleanup.loading,
+			};
+		})()
+	`, context);
+
+	assert.equal(result.calls.length, 1);
+	assert.equal(result.calls[0].apiPath, "/api/issues/clean-completed");
+	assert.equal(result.calls[0].options.method, "POST");
+	assert.equal(result.calls[0].options.body, "{}");
+	assert.equal(result.loadCalls, 1);
+	assert.equal(result.status, "Cleaned 2 completed tickets.");
+	assert.equal(result.buttonDisabled, false);
+	assert.equal(result.buttonText, "Clean completed tickets");
+	assert.equal(result.loading, false);
+});
+
+test("dashboard clean completed tickets action handles nothing-to-clean and failures", async () => {
+	const html = await renderDashboardHtml("test-token");
+	const nothingContext = dashboardDraftVmContext();
+	const nothing = await vm.runInNewContext(`${dashboardCleanupTestSource(html)}
+		(async () => {
+			let loadCalls = 0;
+			api = async () => ({ cleanedCount: 0, cleanedIds: [], retentionDays: 30 });
+			load = async () => { loadCalls += 1; };
+			await cleanCompletedTickets();
+			return { loadCalls, status: document.getElementById("status").textContent };
+		})()
+	`, nothingContext);
+	assert.equal(nothing.loadCalls, 1);
+	assert.equal(nothing.status, "No old completed tickets to clean.");
+
+	const failureContext = dashboardDraftVmContext();
+	const failure = await vm.runInNewContext(`${dashboardCleanupTestSource(html)}
+		(async () => {
+			let loadCalls = 0;
+			api = async () => { throw new Error("disk is unavailable"); };
+			load = async () => { loadCalls += 1; };
+			await cleanCompletedTickets();
+			return {
+				loadCalls,
+				status: document.getElementById("status").textContent,
+				buttonDisabled: document.getElementById("clean-completed").disabled,
+				loading: __dashboardCleanup.loading,
+			};
+		})()
+	`, failureContext);
+	assert.equal(failure.loadCalls, 0);
+	assert.equal(failure.status, "Cleanup failed: disk is unavailable");
+	assert.equal(failure.buttonDisabled, false);
+	assert.equal(failure.loading, false);
 });
 
 test("dashboard resume helpers enable and disable blocked ticket actions", async () => {
@@ -1131,6 +1217,62 @@ test("server routes backlog create, update, and send actions", async () => {
 	}
 });
 
+test("server exposes authenticated completed ticket cleanup API", async () => {
+	const root = await tempDir();
+	const linked = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const oldCompleted = await store.createIssue({ title: "Old done server", spec: "Archive me.", linkedDirectory: linked });
+	await store.setLane(oldCompleted.metadata.id, LANE.COMPLETED, "test");
+	await patchIssueMetadata(store, oldCompleted.metadata.id, { updatedAt: "2026-03-01T00:00:00.000Z" });
+	const recentCompleted = await store.createIssue({ title: "Recent done server", spec: "Keep me.", linkedDirectory: linked });
+	await store.setLane(recentCompleted.metadata.id, LANE.COMPLETED, "test");
+	await patchIssueMetadata(store, recentCompleted.metadata.id, { updatedAt: "2026-05-10T00:00:00.000Z" });
+	const originalCleanCompletedTickets = store.cleanCompletedTickets.bind(store);
+	store.cleanCompletedTickets = (options = {}) => originalCleanCompletedTickets({ now: new Date("2026-05-12T00:00:00.000Z"), ...options });
+	const reject = async () => {
+		throw new Error("not used");
+	};
+	const server = new OrchestratorServer({
+		store,
+		token: "cleanup-token",
+		actions: {
+			createIssue: reject,
+			comment: reject,
+			updateBacklogIssue: reject,
+			sendBacklogIssueToAgent: reject,
+			approvePlan: reject,
+			requestPlanChanges: reject,
+			approveReview: reject,
+			approveReviewAndMerge: reject,
+			requestReviewChanges: reject,
+			resumeBlockedIssue: reject,
+			improveSpec: reject,
+		},
+	});
+	const url = await server.start();
+	const base = url.split("?")[0].replace(/\/$/, "");
+	try {
+		const denied = await fetch(`${base}/api/issues/clean-completed`, { method: "POST", body: "{}" });
+		assert.equal(denied.status, 401);
+
+		const response = await fetch(`${base}/api/issues/clean-completed?token=cleanup-token`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: "{}",
+		});
+		assert.equal(response.status, 200);
+		const body = await response.json();
+		assert.equal(body.cleanedCount, 1);
+		assert.deepEqual(body.cleanedIds, [oldCompleted.metadata.id]);
+		assert.equal(body.retentionDays, COMPLETED_TICKET_CLEANUP_RETENTION_DAYS);
+		assert.equal(await exists(path.join(root, "issues", oldCompleted.metadata.id)), false);
+		assert.equal(await exists(path.join(root, "issues", recentCompleted.metadata.id)), true);
+	} finally {
+		await server.stop();
+	}
+});
+
 test("server routes blocked issue resume action", async () => {
 	const root = await tempDir();
 	const store = new IssueStore({ dataRoot: root });
@@ -1491,6 +1633,91 @@ test("issue store creates folder-per-issue artifacts and board state", async () 
 	assert.deepEqual(state.lanes[LANE.CREATED], [id]);
 	assert.equal(state.issues[0].planReport, "# Plan report\n");
 	assert.equal(state.issues[0].reviewReport, "# Review report\n");
+});
+
+test("issue store cleans only old completed tickets into archive", async () => {
+	const root = await tempDir();
+	const linked = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const cleanupNow = new Date("2026-05-12T00:00:00.000Z");
+
+	const oldCompleted = await store.createIssue({ title: "Old completed cleanup", spec: "Archive me.", linkedDirectory: linked });
+	await store.setLane(oldCompleted.metadata.id, LANE.COMPLETED, "test");
+	await patchIssueMetadata(store, oldCompleted.metadata.id, { updatedAt: "2026-03-01T00:00:00.000Z" });
+
+	const oldInProgress = await store.createIssue({ title: "Old active cleanup", spec: "Keep active.", linkedDirectory: linked });
+	await store.setLane(oldInProgress.metadata.id, LANE.IN_PROGRESS, "test");
+	await patchIssueMetadata(store, oldInProgress.metadata.id, { updatedAt: "2026-03-01T00:00:00.000Z" });
+
+	const recentCompleted = await store.createIssue({ title: "Recent completed cleanup", spec: "Keep recent.", linkedDirectory: linked });
+	await store.setLane(recentCompleted.metadata.id, LANE.COMPLETED, "test");
+	await patchIssueMetadata(store, recentCompleted.metadata.id, { updatedAt: "2026-05-01T00:00:00.000Z" });
+
+	const result = await store.cleanCompletedTickets({ now: cleanupNow });
+	assert.equal(result.cleanedCount, 1);
+	assert.deepEqual(result.cleanedIds, [oldCompleted.metadata.id]);
+	assert.equal(result.retentionDays, COMPLETED_TICKET_CLEANUP_RETENTION_DAYS);
+	assert.equal(await exists(path.join(root, "issues", oldCompleted.metadata.id)), false);
+	assert.equal(await exists(path.join(root, "issues", "__archived_completed__", oldCompleted.metadata.id, "metadata.json")), true);
+	assert.equal(await exists(path.join(root, "issues", oldInProgress.metadata.id, "metadata.json")), true);
+	assert.equal(await exists(path.join(root, "issues", recentCompleted.metadata.id, "metadata.json")), true);
+
+	const state = await store.getBoardState();
+	const visibleIds = state.issues.map((issue) => issue.id).sort();
+	assert.deepEqual(visibleIds, [oldInProgress.metadata.id, recentCompleted.metadata.id].sort());
+	assert.deepEqual(state.lanes[LANE.IN_PROGRESS], [oldInProgress.metadata.id]);
+	assert.deepEqual(state.lanes[LANE.COMPLETED], [recentCompleted.metadata.id]);
+});
+
+test("issue store completed ticket cleanup handles nothing eligible", async () => {
+	const root = await tempDir();
+	const linked = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const recentCompleted = await store.createIssue({ title: "Recent only cleanup", spec: "Keep me.", linkedDirectory: linked });
+	await store.setLane(recentCompleted.metadata.id, LANE.COMPLETED, "test");
+	await patchIssueMetadata(store, recentCompleted.metadata.id, { updatedAt: "2026-05-10T00:00:00.000Z" });
+	const invalidCompleted = await store.createIssue({ title: "Invalid date cleanup", spec: "Keep invalid date.", linkedDirectory: linked });
+	await store.setLane(invalidCompleted.metadata.id, LANE.COMPLETED, "test");
+	await patchIssueMetadata(store, invalidCompleted.metadata.id, { updatedAt: "not-a-date" });
+
+	const result = await store.cleanCompletedTickets({ now: new Date("2026-05-12T00:00:00.000Z") });
+	assert.deepEqual(result, { cleanedCount: 0, cleanedIds: [], retentionDays: COMPLETED_TICKET_CLEANUP_RETENTION_DAYS });
+	assert.equal(await exists(path.join(root, "issues", recentCompleted.metadata.id, "metadata.json")), true);
+	assert.equal(await exists(path.join(root, "issues", invalidCompleted.metadata.id, "metadata.json")), true);
+	assert.equal(await exists(path.join(root, "issues", "__archived_completed__")), false);
+});
+
+test("issue store completed ticket cleanup rolls back moves when archiving fails", async () => {
+	const root = await tempDir();
+	const linked = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const cleanupNow = new Date("2026-05-12T00:00:00.000Z");
+	const first = await store.createIssue({ title: "Rollback completed one", spec: "Keep on failure.", linkedDirectory: linked });
+	await store.setLane(first.metadata.id, LANE.COMPLETED, "test");
+	await patchIssueMetadata(store, first.metadata.id, { updatedAt: "2026-03-01T00:00:00.000Z" });
+	const second = await store.createIssue({ title: "Rollback completed two", spec: "Keep on failure too.", linkedDirectory: linked });
+	await store.setLane(second.metadata.id, LANE.COMPLETED, "test");
+	await patchIssueMetadata(store, second.metadata.id, { updatedAt: "2026-03-01T00:00:00.000Z" });
+	const events = [];
+	store.onChange((event) => events.push(event));
+	const originalUniqueCompletedArchiveDir = store.uniqueCompletedArchiveDir.bind(store);
+	let archivePathCalls = 0;
+	store.uniqueCompletedArchiveDir = async (...args) => {
+		archivePathCalls += 1;
+		if (archivePathCalls === 2) return path.join(root, "missing-parent", "archive-target");
+		return originalUniqueCompletedArchiveDir(...args);
+	};
+
+	await assert.rejects(() => store.cleanCompletedTickets({ now: cleanupNow }), /ENOENT/);
+	assert.equal(await exists(path.join(root, "issues", first.metadata.id, "metadata.json")), true);
+	assert.equal(await exists(path.join(root, "issues", second.metadata.id, "metadata.json")), true);
+	assert.equal(events.some((event) => event.type === "completed_tickets_cleaned"), false);
+	const state = await store.getBoardState();
+	const visibleIds = state.issues.map((issue) => issue.id).sort();
+	assert.deepEqual(visibleIds, [first.metadata.id, second.metadata.id].sort());
 });
 
 test("issue store reports resume eligibility for blocked in-progress tickets", async () => {
@@ -2601,6 +2828,12 @@ async function createBlockedWorkerIssue(store, linkedDirectory, { title = "Block
 		await fsp.writeFile(sessionFile, JSON.stringify({ type: "message", text: "previous work" }) + "\n", "utf-8");
 	}
 	return store.loadIssue(issue.metadata.id);
+}
+
+async function patchIssueMetadata(store, id, patch) {
+	const metadataPath = store.issuePath(id, "metadata.json");
+	const metadata = JSON.parse(await fsp.readFile(metadataPath, "utf-8"));
+	await fsp.writeFile(metadataPath, `${JSON.stringify({ ...metadata, ...patch }, null, "\t")}\n`, "utf-8");
 }
 
 async function exists(filePath) {
