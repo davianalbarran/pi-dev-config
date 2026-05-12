@@ -894,6 +894,18 @@ test("dashboard css keeps the desktop board compact and stacks it on mobile", as
 	assert.match(html, /\.board \{[\s\S]*overflow-x: auto;[\s\S]*padding: 10px 18px 18px;/);
 	assert.match(html, /\.card-head \{[^}]*justify-content: flex-end;[^}]*margin-bottom: 6px;[^}]*min-width: 0;/);
 	assert.match(html, /\.card-title \{[^}]*display: block;[^}]*width: 100%;[^}]*overflow-wrap: anywhere;/);
+	const cardActionCss = html.match(/\.card-action \{([^}]*)\}/)?.[1] || "";
+	assert.ok(cardActionCss, "dashboard card action CSS rule exists");
+	assert.match(cardActionCss, /width: 26px;/);
+	assert.match(cardActionCss, /height: 26px;/);
+	assert.match(cardActionCss, /min-width: 26px;/);
+	assert.match(cardActionCss, /min-height: 26px;/);
+	assert.match(cardActionCss, /padding: 0;/);
+	assert.match(cardActionCss, /box-sizing: border-box;/);
+	assert.match(cardActionCss, /flex: 0 0 26px;/);
+	assert.match(cardActionCss, /align-self: center;/);
+	assert.doesNotMatch(cardActionCss, /height: 24px;/);
+	assert.doesNotMatch(cardActionCss, /padding: 0 7px;/);
 	assert.match(html, /\.minimized \.card-title \{ margin-bottom: 0; \}/);
 	assert.doesNotMatch(html, /\.card-head \{[^}]*justify-content: space-between;/);
 	assert.match(html, /@media \(max-width: 640px\) \{[\s\S]*\.desktop-directory-picker \{ display: none; \}[\s\S]*\.board \{[\s\S]*grid-template-columns: 1fr;[\s\S]*overflow-x: visible;[\s\S]*\}[\s\S]*\.lane \{ min-height: 180px; \}/);

@@ -387,9 +387,14 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
 .card-action {
   display: inline-grid;
   place-items: center;
+  width: 26px;
+  height: 26px;
   min-width: 26px;
-  height: 24px;
-  padding: 0 7px;
+  min-height: 26px;
+  padding: 0;
+  box-sizing: border-box;
+  flex: 0 0 26px;
+  align-self: center;
   line-height: 1;
 }
 .minimized .card-title { margin-bottom: 0; }
