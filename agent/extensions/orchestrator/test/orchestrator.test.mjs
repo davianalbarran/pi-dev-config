@@ -7,6 +7,7 @@ import vm from "node:vm";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
+import { assembleAgentSession } from "../src/agent-session.js";
 import { COMPLETED_TICKET_CLEANUP_RETENTION_DAYS, DEFAULT_PROFILE_ID, KANBAN_LANES, LANE, LANES, ROLE_DEFAULTS, ROLE_TOOLS } from "../src/constants.js";
 import { getIssueDiffs } from "../src/diffs.js";
 import {
@@ -234,6 +235,30 @@ function dashboardResumeTestSource(html) {
 	].join("");
 }
 
+function dashboardAgentSessionTestSource(html) {
+	const agentStart = html.indexOf("function agentSessionKey(issueId, runId)");
+	const agentEnd = html.indexOf("function renderDetail()", agentStart);
+	const timelineStart = html.indexOf("function renderTimeline(issue)");
+	const timelineEnd = html.indexOf("function bindDetailActions(issue)", timelineStart);
+	const eventStart = html.indexOf("function handleEventStreamMessage(message)");
+	const eventEnd = html.indexOf("function updateCleanCompletedButton()", eventStart);
+	const escapeStart = html.indexOf("function escapeHtml(value)");
+	const escapeEnd = html.indexOf("function renderMarkdown(input)", escapeStart);
+	assert.ok(agentStart !== -1 && agentEnd > agentStart, "dashboard script declares agent session helpers");
+	assert.ok(timelineStart !== -1 && timelineEnd > timelineStart, "dashboard script declares timeline renderer");
+	assert.ok(eventStart !== -1 && eventEnd > eventStart, "dashboard script declares event stream handler");
+	assert.ok(escapeStart !== -1 && escapeEnd > escapeStart, "dashboard script declares markdown helpers");
+	return [
+		"const agentSessions = new Map();\nlet selectedTimelineRunId = null;\nlet selectedTimelineSessionMissing = false;\nlet selectedId = null;\nlet detailTab = 'agent';\nlet renderDetailCalls = 0;\nlet loadCalls = 0;\n",
+		"function formatDate(value) { return value || 'unknown'; }\nfunction renderDetail() { renderDetailCalls += 1; }\nasync function load() { loadCalls += 1; }\n",
+		html.slice(agentStart, agentEnd),
+		html.slice(timelineStart, timelineEnd),
+		html.slice(eventStart, eventEnd),
+		html.slice(escapeStart, escapeEnd),
+		`\nglobalThis.__dashboardAgentSession = {\n\tagentSessionKey,\n\tassembleAgentSessionForUi,\n\tloadAgentSession,\n\tcachedAgentSession,\n\trenderAgentSession,\n\trenderTimeline,\n\thandleEventStreamMessage,\n\tsetPayload(issueId, runId, payload) { agentSessions.set(agentSessionKey(issueId, runId), payload); },\n\tselectTimelineRun(runId) { selectedTimelineRunId = runId; selectedTimelineSessionMissing = false; },\n\tmarkTimelineMissing() { selectedTimelineSessionMissing = true; },\n\tsetSelected(issueId, tab = 'agent', runId = null) { selectedId = issueId; detailTab = tab; selectedTimelineRunId = runId; },\n\tget renderDetailCalls() { return renderDetailCalls; },\n\tget loadCalls() { return loadCalls; },\n};\n`,
+	].join("");
+}
+
 test("token authorization accepts query, header, and bearer token", () => {
 	assert.equal(isAuthorized("/?token=abc", {}, "abc"), true);
 	assert.equal(isAuthorized("/", { "x-orchestrator-token": "abc" }, "abc"), true);
@@ -256,6 +281,100 @@ test("orchestrator env config host overrides LAN binding", () => {
 		parseOrchestratorEnv({ PI_ORCHESTRATOR_BIND_LAN: "true", PI_ORCHESTRATOR_HOST: "192.168.1.50" }).host,
 		"192.168.1.50",
 	);
+});
+
+test("agent session assembler builds streamed assistant messages", () => {
+	const session = assembleAgentSession([
+		{ type: "message_start", messageId: "m1", at: "2026-05-12T00:00:00.000Z" },
+		{ type: "message_update", messageId: "m1", delta: "Hello" },
+		{ type: "message_update", messageId: "m1", assistantMessageEvent: { delta: " world" } },
+	]);
+	assert.equal(session.messages.length, 1);
+	assert.equal(session.messages[0].content, "Hello world");
+	assert.equal(session.messages[0].status, "streaming");
+	assert.equal(session.incomplete, true);
+});
+
+test("agent session assembler finalizes from message_end message content", () => {
+	const session = assembleAgentSession([
+		{ type: "message_update", delta: "draft" },
+		{ type: "message_end", message: { id: "final", role: "assistant", content: [{ type: "text", text: "final answer" }] } },
+	]);
+	assert.equal(session.messages.length, 1);
+	assert.equal(session.messages[0].content, "final answer");
+	assert.equal(session.messages[0].status, "complete");
+});
+
+test("agent session assembler handles Pi text_delta and text_end without duplicating snapshots", () => {
+	const session = assembleAgentSession([
+		{ type: "message_start", message: { id: "m-pi", role: "assistant", content: [] } },
+		{
+			type: "message_update",
+			message: { id: "m-pi", role: "assistant", content: [{ type: "text", text: "Hel" }] },
+			assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "Hel", partial: { role: "assistant", content: [{ type: "text", text: "Hel" }] } },
+		},
+		{
+			type: "message_update",
+			message: { id: "m-pi", role: "assistant", content: [{ type: "text", text: "Hello" }] },
+			assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "lo", partial: { role: "assistant", content: [{ type: "text", text: "Hello" }] } },
+		},
+		{
+			type: "message_update",
+			message: { id: "m-pi", role: "assistant", content: [{ type: "text", text: "Hello" }] },
+			assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "Hello", partial: { role: "assistant", content: [{ type: "text", text: "Hello" }] } },
+		},
+	]);
+	assert.equal(session.messages.length, 1);
+	assert.equal(session.messages[0].content, "Hello");
+	assert.deepEqual(session.messages[0].eventTypes, ["message_start", "message_update", "message_update", "message_update"]);
+});
+
+test("agent session assembler tracks Pi RPC tool execution lifecycle aliases", () => {
+	const session = assembleAgentSession([
+		{ type: "tool_execution_start", toolExecutionId: "t1", toolName: "bash", input: { command: "echo hi" } },
+		{ type: "tool_execution_update", toolExecutionId: "t1", partialResult: { content: [{ type: "text", text: "hi" }], isError: false } },
+		{ type: "tool_execution_end", toolExecutionId: "t1", result: { content: [{ type: "text", text: "done" }], isError: false } },
+	]);
+	assert.equal(session.tools.length, 1);
+	assert.equal(session.tools[0].id, "t1");
+	assert.equal(session.tools[0].name, "bash");
+	assert.match(session.tools[0].input, /echo hi/);
+	assert.deepEqual(session.tools[0].updates, [{ at: null, text: "hi" }]);
+	assert.equal(session.tools[0].output, "done");
+	assert.equal(session.tools[0].status, "complete");
+});
+
+test("agent session assembler marks Pi RPC isError tool results as errors", () => {
+	const session = assembleAgentSession([
+		{ type: "tool_execution_start", toolExecutionId: "t2", toolName: "read" },
+		{ type: "tool_execution_update", toolExecutionId: "t2", partialResult: { content: [{ type: "text", text: "permission denied" }], isError: true } },
+		{ type: "tool_execution_end", toolExecutionId: "t2", result: { content: [{ type: "text", text: "permission denied" }], isError: true } },
+	]);
+	assert.equal(session.tools.length, 1);
+	assert.equal(session.tools[0].updates[0].text, "permission denied");
+	assert.equal(session.tools[0].output, "permission denied");
+	assert.equal(session.tools[0].status, "error");
+	assert.match(session.tools[0].error, /Tool returned an error/);
+});
+
+test("agent session assembler handles malformed and interrupted streams", () => {
+	const session = assembleAgentSession([
+		null,
+		{ type: "message_update", text: "partial" },
+		{ type: "tool_call_end", name: "read", error: "missing file" },
+	]);
+	assert.equal(session.ignoredCount, 1);
+	assert.equal(session.messages[0].content, "partial");
+	assert.equal(session.messages[0].incomplete, true);
+	assert.equal(session.tools[0].status, "error");
+	assert.equal(session.incomplete, true);
+});
+
+test("agent session assembler keeps independent run histories distinguishable", () => {
+	const first = assembleAgentSession([{ type: "message_end", message: { content: [{ type: "text", text: "run one" }] } }]);
+	const second = assembleAgentSession([{ type: "message_end", message: { content: [{ type: "text", text: "run two" }] } }]);
+	assert.equal(first.messages[0].content, "run one");
+	assert.equal(second.messages[0].content, "run two");
 });
 
 test("orchestrator env config parses a valid port", () => {
@@ -490,7 +609,94 @@ test("dashboard renderer injects runtime data", async () => {
 	assert.match(html, /data-resize-panel="detail"/);
 	assert.match(html, /function applyCreateDrawerWidth\(\)/);
 	assert.match(html, /function applyDetailPanelWidth\(\)/);
+	assert.match(html, /Agent Output/);
+	assert.match(html, /data-view-run/);
 	assert.doesNotMatch(html, /__(TOKEN|LANES|KANBAN_LANES|LANE|ROLE_DEFAULTS|THINKING_LEVELS|DEFAULT_PROFILE_ID)_JSON__/);
+});
+
+test("dashboard renders agent sessions and timeline history states", async () => {
+	const html = await renderDashboardHtml("test-token");
+	const context = {
+		api: async () => ({ issueId: "PI-agent", runId: "run-2", events: [{ type: "message_update", messageId: "m2", delta: "persisted " }] }),
+	};
+	vm.runInNewContext(dashboardAgentSessionTestSource(html), context);
+	const ui = context.__dashboardAgentSession;
+	const issue = { id: "PI-agent", recentEvents: [{ type: "agent_run_started", at: "2026-05-12T00:00:00.000Z", runId: "run-1" }] };
+
+	assert.match(ui.renderAgentSession(issue, null), /No agent session is active/);
+	ui.setPayload(issue.id, "missing-run", { issueId: issue.id, runId: "missing-run", error: "not found", events: [], session: { items: [] } });
+	assert.match(ui.renderAgentSession(issue, "missing-run"), /Agent session history is unavailable: not found/);
+	ui.setPayload(issue.id, "run-1", {
+		issueId: issue.id,
+		runId: "run-1",
+		events: [],
+		session: ui.assembleAgentSessionForUi([
+			{ type: "message_start", messageId: "m1" },
+			{ type: "message_update", messageId: "m1", assistantMessageEvent: { content: "Hello " } },
+			{ type: "message_end", messageId: "m1", message: { content: [{ type: "text", text: "Hello final" }] } },
+			{ type: "tool_execution_start", toolExecutionId: "t1", toolName: "bash", input: { command: "echo hi" } },
+			{ type: "tool_execution_update", toolExecutionId: "t1", partialResult: { content: [{ type: "text", text: "hi" }] } },
+			{ type: "tool_execution_end", toolExecutionId: "t1", result: { content: [{ type: "text", text: "done" }] } },
+		]),
+	});
+
+	const rendered = ui.renderAgentSession(issue, "run-1");
+	assert.match(rendered, /Live session/);
+	assert.match(rendered, /agent-message/);
+	assert.match(rendered, /Hello final/);
+	assert.match(rendered, /tool-call-card/);
+	assert.match(rendered, /echo hi/);
+
+	const piStream = ui.assembleAgentSessionForUi([
+		{ type: "message_start", message: { id: "m-pi", role: "assistant", content: [] } },
+		{ type: "message_update", message: { id: "m-pi", role: "assistant", content: [{ type: "text", text: "Hi" }] }, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "Hi" } },
+		{ type: "message_update", message: { id: "m-pi", role: "assistant", content: [{ type: "text", text: "Hi" }] }, assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "Hi" } },
+	]);
+	assert.equal(piStream.items[0].content, "Hi");
+
+	ui.setPayload(issue.id, "run-2", { issueId: issue.id, runId: "run-2", events: [{ type: "message_update", messageId: "m2", delta: "live" }], session: { items: [] }, loadedFromApi: false });
+	const loaded = await ui.loadAgentSession(issue.id, "run-2");
+	assert.equal(loaded.loadedFromApi, true);
+	assert.equal(ui.cachedAgentSession(issue.id, "run-2").session.items[0].content, "persisted live");
+
+	assert.match(ui.renderTimeline(issue), /View session/);
+	ui.selectTimelineRun("run-1");
+	assert.match(ui.renderTimeline(issue), /Persisted session/);
+	ui.markTimelineMissing();
+	assert.match(ui.renderTimeline(issue), /No persisted history was found/);
+});
+
+test("dashboard event stream ingests live run events without full reload", async () => {
+	const html = await renderDashboardHtml("test-token");
+	const context = { api: async () => ({ issueId: "PI-agent", runId: "run-live", events: [], session: { items: [] } }) };
+	vm.runInNewContext(dashboardAgentSessionTestSource(html), context);
+	const ui = context.__dashboardAgentSession;
+
+	ui.setSelected("PI-agent", "agent");
+	ui.handleEventStreamMessage({
+		data: JSON.stringify({
+			type: "store",
+			event: { type: "run_event", id: "PI-agent", runId: "run-live", event: { type: "message_update", messageId: "m-live", delta: "Hello" } },
+		}),
+	});
+	assert.equal(ui.loadCalls, 0);
+	assert.equal(ui.renderDetailCalls, 1);
+	assert.equal(ui.cachedAgentSession("PI-agent", "run-live").session.items[0].content, "Hello");
+
+	ui.setSelected("PI-agent", "timeline", "run-live");
+	ui.handleEventStreamMessage({
+		data: JSON.stringify({
+			type: "store",
+			event: { type: "run_event", id: "PI-agent", runId: "run-live", event: { type: "message_update", messageId: "m-live", delta: " world" } },
+		}),
+	});
+	assert.equal(ui.renderDetailCalls, 2);
+	assert.equal(ui.cachedAgentSession("PI-agent", "run-live").session.items[0].content, "Hello world");
+
+	ui.handleEventStreamMessage({ data: JSON.stringify({ type: "store", event: { type: "metadata_updated", id: "PI-agent" } }) });
+	assert.equal(ui.loadCalls, 1);
+	ui.handleEventStreamMessage({ data: "not json" });
+	assert.equal(ui.loadCalls, 2);
 });
 
 test("dashboard preserves unsent feedback drafts across unrelated ticket refreshes", async () => {
@@ -991,6 +1197,14 @@ test("server renders token-gated dashboard html", async () => {
 		assert.match(html, /Diffs appear once work reaches In Progress/);
 		assert.match(html, /\/api\/issues\/" \+ encodeURIComponent\(issue\.id\) \+ "\/diffs/);
 		assert.match(html, /diff-file-toggle/);
+		assert.match(html, /Agent Output/);
+		assert.match(html, /function renderAgentSession\(issue, runId/);
+		assert.match(html, /data-view-run/);
+		assert.match(html, /\/api\/issues\/" \+ encodeURIComponent\(issueId\) \+ "\/runs\//);
+		assert.match(html, /partialResult/);
+		assert.match(html, /toolEventIsError/);
+		assert.match(html, /isError/);
+		assert.match(html, /handleEventStreamMessage/);
 	} finally {
 		await server.stop();
 	}
@@ -1156,6 +1370,50 @@ test("server exposes authenticated profile API", async () => {
 		const second = await fetch(`${base}/api/profiles?token=profile-token`);
 		const secondBody = await second.json();
 		assert.equal(secondBody.profiles.some((profile) => profile.id === createdBody.profile.id), true);
+	} finally {
+		await server.stop();
+	}
+});
+
+test("server exposes authenticated agent session API", async () => {
+	const root = await tempDir();
+	const linked = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const issue = await store.createIssue({ title: "API session", spec: "Expose run output.", linkedDirectory: linked });
+	await store.appendRunEvent(issue.metadata.id, "run-api", { type: "message_end", message: { content: [{ type: "text", text: "persisted" }] } });
+	const reject = async () => { throw new Error("not used"); };
+	const server = new OrchestratorServer({
+		store,
+		token: "session-token",
+		config: { host: "127.0.0.1", port: 0 },
+		actions: {
+			createIssue: reject,
+			comment: reject,
+			updateBacklogIssue: reject,
+			sendBacklogIssueToAgent: reject,
+			approvePlan: reject,
+			requestPlanChanges: reject,
+			approveReview: reject,
+			approveReviewAndMerge: reject,
+			requestReviewChanges: reject,
+			resumeBlockedIssue: reject,
+			improveSpec: reject,
+		},
+	});
+	const url = await server.start();
+	const base = url.split("?")[0].replace(/\/$/, "");
+	try {
+		const denied = await fetch(`${base}/api/issues/${encodeURIComponent(issue.metadata.id)}/runs/run-api`);
+		assert.equal(denied.status, 401);
+		const response = await fetch(`${base}/api/issues/${encodeURIComponent(issue.metadata.id)}/runs/run-api?token=session-token`);
+		assert.equal(response.status, 200);
+		const body = await response.json();
+		assert.equal(body.issueId, issue.metadata.id);
+		assert.equal(body.runId, "run-api");
+		assert.equal(body.session.messages[0].content, "persisted");
+		const traversal = await fetch(`${base}/api/issues/${encodeURIComponent(issue.metadata.id)}/runs/${encodeURIComponent("../run-api")}?token=session-token`);
+		assert.equal(traversal.status, 400);
 	} finally {
 		await server.stop();
 	}
@@ -1647,6 +1905,24 @@ test("issue store creates folder-per-issue artifacts and board state", async () 
 	assert.equal(state.issues[0].reviewReport, "# Review report\n");
 });
 
+test("issue store retrieves persisted agent session history", async () => {
+	const root = await tempDir();
+	const linked = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const issue = await store.createIssue({ title: "Session history", spec: "Persist run output.", linkedDirectory: linked });
+	await store.appendRunEvent(issue.metadata.id, "run-1", { type: "message_update", delta: "hello" });
+	await store.appendRunEvent(issue.metadata.id, "run-1", { type: "message_end", message: { content: [{ type: "text", text: "hello final" }] } });
+	await store.appendRunEvent(issue.metadata.id, "run-2", { type: "message_end", message: { content: [{ type: "text", text: "other run" }] } });
+
+	const session = await store.getAgentSession(issue.metadata.id, "run-1");
+	assert.equal(session.issueId, issue.metadata.id);
+	assert.equal(session.runId, "run-1");
+	assert.equal(session.events.length, 2);
+	assert.equal(session.session.messages[0].content, "hello final");
+	assert.equal((await store.getAgentSession(issue.metadata.id, "run-2")).session.messages[0].content, "other run");
+});
+
 test("issue store cleans only old completed tickets into archive", async () => {
 	const root = await tempDir();
 	const linked = await tempDir();
@@ -1665,6 +1941,9 @@ test("issue store cleans only old completed tickets into archive", async () => {
 	const recentCompleted = await store.createIssue({ title: "Recent completed cleanup", spec: "Keep recent.", linkedDirectory: linked });
 	await store.setLane(recentCompleted.metadata.id, LANE.COMPLETED, "test");
 	await patchIssueMetadata(store, recentCompleted.metadata.id, { updatedAt: "2026-05-01T00:00:00.000Z" });
+	await fsp.mkdir(path.join(root, "sessions", oldCompleted.metadata.id), { recursive: true });
+	await fsp.writeFile(path.join(root, "sessions", oldCompleted.metadata.id, "run.jsonl"), "{}\n", "utf-8");
+	await fsp.mkdir(path.join(root, "sessions", oldInProgress.metadata.id), { recursive: true });
 
 	const result = await store.cleanCompletedTickets({ now: cleanupNow });
 	assert.equal(result.cleanedCount, 1);
@@ -1674,6 +1953,8 @@ test("issue store cleans only old completed tickets into archive", async () => {
 	assert.equal(await exists(path.join(root, "issues", "__archived_completed__", oldCompleted.metadata.id, "metadata.json")), true);
 	assert.equal(await exists(path.join(root, "issues", oldInProgress.metadata.id, "metadata.json")), true);
 	assert.equal(await exists(path.join(root, "issues", recentCompleted.metadata.id, "metadata.json")), true);
+	assert.equal(await exists(path.join(root, "sessions", oldCompleted.metadata.id)), false);
+	assert.equal(await exists(path.join(root, "sessions", oldInProgress.metadata.id)), true);
 
 	const state = await store.getBoardState();
 	const visibleIds = state.issues.map((issue) => issue.id).sort();
@@ -2477,7 +2758,7 @@ test("rpc runner can reuse an existing session file", async () => {
 	assert.equal(result.text, "resumed");
 });
 
-test("rpc runner does not persist streaming message deltas", async () => {
+test("rpc runner persists streaming lifecycle events with oversized payload truncation", async () => {
 	const root = await tempDir();
 	const linked = await tempDir();
 	const store = new IssueStore({ dataRoot: root });
@@ -2526,8 +2807,12 @@ test("rpc runner does not persist streaming message deltas", async () => {
 	const log = await fsp.readFile(logPath, "utf-8");
 	const stats = await fsp.stat(logPath);
 	assert.equal(result.text, "finished");
-	assert.doesNotMatch(log, /message_update/);
+	assert.match(log, /message_update/);
+	assert.match(log, /"truncated":true/);
 	assert.ok(stats.size < 16 * 1024, `run log should stay compact, got ${stats.size} bytes`);
+	const events = log.trim().split("\n").map((line) => JSON.parse(line));
+	assert.equal(events.some((event) => event.type === "message_update" && event.truncated), true);
+	assert.equal(events.some((event) => event.type === "message_end"), true);
 });
 
 test("scheduler startup recovers interrupted active runs", async () => {

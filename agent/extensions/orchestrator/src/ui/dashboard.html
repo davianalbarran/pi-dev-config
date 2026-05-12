@@ -659,6 +659,20 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
   letter-spacing: .04em;
 }
 .timeline-body, .comment-body { margin-top: 5px; color: var(--text-soft); overflow-wrap: anywhere; }
+.agent-session { display: grid; gap: 10px; }
+.agent-session-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--muted); font-size: 12px; }
+.agent-message, .tool-call-card {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  padding: 10px;
+}
+.agent-message { border-left: 3px solid var(--accent); }
+.tool-call-card { border-left: 3px solid var(--warn); }
+.agent-item-meta, .tool-call-title { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; margin-bottom: 6px; }
+.agent-message-content, .tool-call-body { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text-soft); }
+.tool-call-update { margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--line); }
+.timeline-session-action { margin-top: 8px; }
 .drawer { display: none; }
 .drawer.open { display: block; }
 .drawer-backdrop {
@@ -974,6 +988,9 @@ let selectedProfileId = DEFAULT_PROFILE_ID;
 let selectedId = null;
 const feedbackDraftsByIssueId = new Map();
 let detailTab = "report";
+const agentSessions = new Map();
+let selectedTimelineRunId = null;
+let selectedTimelineSessionMissing = false;
 let filters = { query: "", lane: "all", state: "all" };
 let activeView = "kanban";
 let issueFormMode = "create";
@@ -2147,6 +2164,238 @@ function clearFeedbackDraft(issueId) {
   }
 }
 
+function agentSessionKey(issueId, runId) {
+  return encodeURIComponent(issueId || "") + "/" + encodeURIComponent(runId || "");
+}
+
+function agentFirstString(...values) {
+  for (const value of values) {
+    if (typeof value === "string" && value) return value;
+    if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  }
+  return "";
+}
+
+function contentPartText(part) {
+  if (typeof part === "string") return part;
+  if (!part || typeof part !== "object") return "";
+  if (typeof part.content === "string") return part.content;
+  if (Array.isArray(part.content)) return part.content.map(contentPartText).filter(Boolean).join("\n").trim();
+  return agentFirstString(part.text, part.delta, part.summary, part.thinking, part.value);
+}
+
+function messageText(message) {
+  if (!message) return "";
+  if (typeof message === "string") return message;
+  if (typeof message.content === "string") return message.content;
+  if (Array.isArray(message.content)) return message.content.map(contentPartText).filter(Boolean).join("\n").trim();
+  return agentFirstString(message.text, message.delta, message.summary, message.thinking);
+}
+
+function toolResultText(value) {
+  const text = messageText(value);
+  if (text) return text;
+  if (!value || typeof value !== "object") return "";
+  return agentFirstString(value.output, value.stdout, value.stderr, value.result, value.value);
+}
+
+function eventSnapshotText(event) {
+  const assistant = event?.assistantMessageEvent && typeof event.assistantMessageEvent === "object" ? event.assistantMessageEvent : null;
+  return agentFirstString(messageText(event?.message), messageText(assistant?.partial), messageText(assistant?.message));
+}
+
+function eventText(event, lifecycleType) {
+  const assistant = event?.assistantMessageEvent && typeof event.assistantMessageEvent === "object" ? event.assistantMessageEvent : null;
+  const delta = event?.delta && typeof event.delta === "object" ? event.delta : null;
+  if (lifecycleType === "message_update") {
+    if (assistant) {
+      if (assistant.type === "text_delta" || assistant.type === "thinking_delta") return { text: agentFirstString(assistant.delta), mode: "append" };
+      if (assistant.type === "text_end" || assistant.type === "thinking_end") return { text: agentFirstString(eventSnapshotText(event), assistant.content), mode: "replace" };
+      if (assistant.type === "text_start" || assistant.type === "thinking_start" || assistant.type === "toolcall_start" || assistant.type === "toolcall_delta" || assistant.type === "toolcall_end") return { text: eventSnapshotText(event), mode: "replace" };
+      if (typeof assistant.delta === "string") return { text: assistant.delta, mode: "append" };
+      if (typeof assistant.content === "string") return { text: agentFirstString(eventSnapshotText(event), assistant.content), mode: "replace" };
+      if (typeof assistant.text === "string") return { text: assistant.text, mode: "append" };
+    }
+    const directDelta = agentFirstString(event?.delta, event?.textDelta, event?.messageDelta, delta?.text, delta?.content, delta?.delta);
+    if (directDelta) return { text: directDelta, mode: "append" };
+    const directText = agentFirstString(event?.text, event?.content);
+    if (directText) return { text: directText, mode: "append" };
+    return { text: eventSnapshotText(event), mode: "replace" };
+  }
+  return {
+    text: agentFirstString(event?.text, event?.content, eventSnapshotText(event), event?.delta, event?.textDelta, event?.messageDelta, assistant?.text, assistant?.content, assistant?.delta, delta?.text, delta?.content, delta?.delta),
+    mode: "replace",
+  };
+}
+
+function stringifyAgentValue(value) {
+  if (value === undefined || value === null) return "";
+  if (typeof value === "string") return value;
+  const contentText = toolResultText(value);
+  if (contentText) return contentText;
+  try { return JSON.stringify(value, null, 2); } catch (_) { return String(value); }
+}
+
+function toolEventError(event, tool) {
+  const result = (event?.result && typeof event.result === "object") ? event.result : (tool?.result && typeof tool.result === "object" ? tool.result : null);
+  const partialResult = (event?.partialResult && typeof event.partialResult === "object") ? event.partialResult : (tool?.partialResult && typeof tool.partialResult === "object" ? tool.partialResult : null);
+  return event?.error || event?.errorMessage || result?.error || result?.errorMessage || partialResult?.error || partialResult?.errorMessage || tool?.error || tool?.errorMessage || "";
+}
+
+function toolEventIsError(event, tool) {
+  const result = (event?.result && typeof event.result === "object") ? event.result : (tool?.result && typeof tool.result === "object" ? tool.result : null);
+  const partialResult = (event?.partialResult && typeof event.partialResult === "object") ? event.partialResult : (tool?.partialResult && typeof tool.partialResult === "object" ? tool.partialResult : null);
+  return event?.isError === true || result?.isError === true || partialResult?.isError === true || tool?.isError === true;
+}
+
+function assembleAgentSessionForUi(events) {
+  const items = [];
+  const messages = new Map();
+  const tools = new Map();
+  let currentMessage = null;
+  let messageCount = 0;
+  let toolCount = 0;
+  for (const event of Array.isArray(events) ? events : []) {
+    const type = event?.type;
+    if (type === "message_start" || type === "message_update" || type === "message_end") {
+      let id = event.messageId || event.message_id || event.message?.id || event.assistantMessageEvent?.messageId || event.assistantMessageEvent?.message_id || event.assistantMessageEvent?.id || "";
+      if (type === "message_end" && currentMessage && (!id || !messages.has(id))) id = currentMessage.id;
+      id = id || currentMessage?.id || "message-" + (++messageCount);
+      let item = messages.get(id);
+      if (!item) {
+        item = { kind: "message", id, role: event.role || event.message?.role || "assistant", content: "", status: "streaming", startedAt: event.at, updatedAt: event.at };
+        messages.set(id, item);
+        items.push(item);
+      }
+      currentMessage = item;
+      item.updatedAt = event.at || item.updatedAt;
+      if (type === "message_update") {
+        const updateText = eventText(event, type);
+        if (updateText.mode === "replace") {
+          if (updateText.text) item.content = updateText.text;
+        } else {
+          item.content += updateText.text;
+        }
+      }
+      if (type === "message_start" && !item.content) item.content = eventText(event, type).text;
+      if (type === "message_end") {
+        const finalText = eventText(event, type).text;
+        if (finalText) item.content = finalText;
+        item.status = "complete";
+        item.endedAt = event.at || item.updatedAt;
+        currentMessage = null;
+      }
+      continue;
+    }
+    const toolType = ({ tool_execution_start: "tool_call_start", tool_execution_update: "tool_call_update", tool_execution_end: "tool_call_end" })[type] || type;
+    if (toolType === "tool_call_start" || toolType === "tool_call_update" || toolType === "tool_call_end") {
+      const tool = event.toolCall || event.tool_call || event.toolExecution || event.tool_execution || event.call || event.execution || {};
+      const id = event.toolCallId || event.tool_call_id || event.toolExecutionId || event.tool_execution_id || event.callId || tool.id || tool.callId || tool.toolCallId || tool.tool_call_id || "tool-" + (++toolCount);
+      let item = tools.get(id);
+      if (!item) {
+        item = { kind: "tool", id, name: event.toolName || event.tool_name || event.name || event.tool || tool.name || tool.toolName || tool.command || "tool", input: "", updates: [], output: "", error: "", status: "running", startedAt: event.at, updatedAt: event.at };
+        tools.set(id, item);
+        items.push(item);
+      }
+      if (!item.input) item.input = stringifyAgentValue(event.input ?? event.arguments ?? event.args ?? event.parameters ?? tool.input ?? tool.arguments ?? tool.args ?? tool.parameters);
+      item.updatedAt = event.at || item.updatedAt;
+      const output = stringifyAgentValue(event.partialResult ?? event.output ?? event.result ?? event.stdout ?? event.stderr ?? event.text ?? event.delta ?? tool.partialResult ?? tool.output ?? tool.result ?? tool.stdout ?? tool.stderr);
+      const isError = toolEventIsError(event, tool);
+      if (toolType === "tool_call_update" && output) item.updates.push({ at: event.at, text: output });
+      if (isError) item.status = "error";
+      if (toolType === "tool_call_end") {
+        item.output = output || item.output;
+        item.error = toolEventError(event, tool);
+        if (isError && !item.error) item.error = "Tool returned an error.";
+        item.status = item.error || isError || event.success === false ? "error" : (event.status || tool.status || "complete");
+        item.endedAt = event.at || item.updatedAt;
+      } else if (event.status && !isError) {
+        item.status = event.status;
+      }
+    }
+  }
+  for (const item of items) if (item.status === "streaming" || item.status === "running") item.incomplete = true;
+  return { items, incomplete: items.some((item) => item.incomplete) };
+}
+
+function agentEventFingerprint(event) {
+  try { return JSON.stringify(event); } catch (_) { return String(event); }
+}
+
+function mergeAgentSessionEvents(primaryEvents, secondaryEvents) {
+  const events = Array.isArray(primaryEvents) ? [...primaryEvents] : [];
+  const seen = new Set(events.map(agentEventFingerprint));
+  for (const event of Array.isArray(secondaryEvents) ? secondaryEvents : []) {
+    const fingerprint = agentEventFingerprint(event);
+    if (seen.has(fingerprint)) continue;
+    seen.add(fingerprint);
+    events.push(event);
+  }
+  return events;
+}
+
+function updateAgentSessionCache(issueId, runId, payload) {
+  const next = { issueId, runId, ...payload };
+  next.events = Array.isArray(next.events) ? next.events : [];
+  next.session = next.session || assembleAgentSessionForUi(next.events);
+  agentSessions.set(agentSessionKey(issueId, runId), next);
+  return next;
+}
+
+async function loadAgentSession(issueId, runId) {
+  if (!issueId || !runId) return null;
+  const key = agentSessionKey(issueId, runId);
+  const before = agentSessions.get(key) || { issueId, runId, events: [], session: assembleAgentSessionForUi([]) };
+  updateAgentSessionCache(issueId, runId, { ...before, loadingFromApi: true });
+  try {
+    const payload = await api("/api/issues/" + encodeURIComponent(issueId) + "/runs/" + encodeURIComponent(runId));
+    const latest = agentSessions.get(key) || before;
+    const events = mergeAgentSessionEvents(payload.events || [], latest.events || []);
+    const next = updateAgentSessionCache(issueId, runId, { ...payload, events, session: payload.session && events.length === (payload.events || []).length ? payload.session : assembleAgentSessionForUi(events), loadedFromApi: true, loadingFromApi: false, error: "" });
+    selectedTimelineSessionMissing = false;
+    return next;
+  } catch (error) {
+    const latest = agentSessions.get(key) || before;
+    updateAgentSessionCache(issueId, runId, { ...latest, error: error?.message || "Session history is unavailable.", loadedFromApi: true, loadingFromApi: false });
+    throw error;
+  }
+}
+
+function cachedAgentSession(issueId, runId) {
+  return agentSessions.get(agentSessionKey(issueId, runId)) || null;
+}
+
+function renderAgentSession(issue, runId, options = {}) {
+  if (!runId) return "<div class='empty-state'>No agent session is active for this ticket.</div>";
+  const payload = cachedAgentSession(issue.id, runId);
+  if (!payload) return "<div class='empty-state'>Loading agent output for " + escapeHtml(runId) + "…</div>";
+  if (payload.error) return "<div class='empty-state'>Agent session history is unavailable: " + escapeHtml(payload.error) + "</div>";
+  const session = payload.session || assembleAgentSessionForUi(payload.events || []);
+  if (!session.items?.length && payload.loadingFromApi) return "<div class='empty-state'>Loading agent output for " + escapeHtml(runId) + "…</div>";
+  if (!session.items?.length) return "<div class='empty-state'>No agent output has been recorded for this session yet.</div>";
+  const label = options.historical ? "Persisted session" : "Live session";
+  return "<div class='agent-session'>" +
+    "<div class='agent-session-head'><strong>" + escapeHtml(label) + "</strong><span class='mono'>" + escapeHtml(runId) + "</span></div>" +
+    session.items.map(renderAgentSessionItem).join("") +
+  "</div>";
+}
+
+function renderAgentSessionItem(item) {
+  if (item.kind === "tool") {
+    return "<article class='tool-call-card " + escapeHtml(item.status || "") + "'>" +
+      "<div class='tool-call-title'>Tool / " + escapeHtml(item.name || "tool") + " / " + escapeHtml(item.status || "running") + "</div>" +
+      (item.input ? "<div class='tool-call-body mono'>Input\n" + escapeHtml(item.input) + "</div>" : "") +
+      (item.updates || []).map((update) => "<div class='tool-call-update mono'>" + escapeHtml(update.text || "") + "</div>").join("") +
+      (item.output ? "<div class='tool-call-update mono'>Output\n" + escapeHtml(item.output) + "</div>" : "") +
+      (item.error ? "<div class='tool-call-update error'>" + escapeHtml(item.error) + "</div>" : "") +
+    "</article>";
+  }
+  return "<article class='agent-message " + (item.incomplete ? "incomplete" : "") + "'>" +
+    "<div class='agent-item-meta'>" + escapeHtml(item.role || "assistant") + " / " + escapeHtml(item.status || "streaming") + "</div>" +
+    "<div class='agent-message-content markdown'>" + renderInlineMarkdown(item.content || "(no message content yet)") + "</div>" +
+  "</article>";
+}
+
 function renderDetail() {
   const detail = document.getElementById("detail");
   const issue = issueById(selectedId);
@@ -2176,8 +2425,8 @@ function renderDetail() {
     actionButtons.push("<button id='approve-review' class='secondary' " + (activeRunId ? "disabled" : "") + ">Approve and leave in worktree</button>");
     actionButtons.push("<button id='change-review' class='warn' " + (activeRunId ? "disabled" : "") + ">Request Changes</button>");
   }
-  const tabs = ["report", "plan", "spec", "workspace", "comments", "timeline"];
-  if (!tabs.includes(detailTab)) detailTab = "report";
+  const tabs = ["agent", "report", "plan", "spec", "workspace", "comments", "timeline"];
+  if (!tabs.includes(detailTab)) detailTab = activeRunId ? "agent" : "report";
   detail.innerHTML =
     '<button type="button" class="panel-resize-handle panel-resize-handle-left" aria-label="Resize ticket inspector panel" data-resize-panel="detail"></button>' +
     "<div class='detail-header'>" +
@@ -2208,6 +2457,10 @@ function renderDetail() {
     "<div class='tabs'>" + tabs.map((tab) => "<button type='button' class='tab " + (detailTab === tab ? "active" : "") + "' data-tab='" + tab + "'>" + escapeHtml(tabLabel(tab)) + "</button>").join("") + "</div>" +
     "<div class='tab-panel'>" + renderTabContent(issue) + "</div>";
   applyDetailPanelWidth();
+  const activeSessionPayload = activeRunId ? cachedAgentSession(issue.id, activeRunId) : null;
+  if (activeRunId && !activeSessionPayload?.loadedFromApi && !activeSessionPayload?.loadingFromApi) {
+    loadAgentSession(issue.id, activeRunId).then(() => { if (selectedId === issue.id) renderDetail(); }).catch(() => { if (selectedId === issue.id) renderDetail(); });
+  }
   const feedback = document.getElementById("feedback");
   if (feedback) feedback.value = feedbackDraft(issue.id);
   bindDetailActions(issue);
@@ -2220,10 +2473,11 @@ function statusCell(label, value) {
 }
 
 function tabLabel(tab) {
-  return { report: "Report", plan: "Plan", spec: "Spec", workspace: "Workspace", comments: "Comments", timeline: "Timeline" }[tab] || tab;
+  return { agent: "Agent Output", report: "Report", plan: "Plan", spec: "Spec", workspace: "Workspace", comments: "Comments", timeline: "Timeline" }[tab] || tab;
 }
 
 function renderTabContent(issue) {
+  if (detailTab === "agent") return renderAgentSession(issue, issue.automation?.activeRunId || null);
   if (detailTab === "report") return renderReport(issue);
   if (detailTab === "plan") return "<pre>" + escapeHtml(issue.plan || "(no plan)") + "</pre>";
   if (detailTab === "spec") return "<pre>" + escapeHtml(issue.spec || "(no spec)") + "</pre>";
@@ -2231,7 +2485,7 @@ function renderTabContent(issue) {
     return "<pre>" + escapeHtml(JSON.stringify({ workspace: issue.workspace, git: issue.git, dependencies: issue.dependencies, agentSettings: issue.agentSettings }, null, 2)) + "</pre>";
   }
   if (detailTab === "comments") return renderComments(issue.comments || []);
-  if (detailTab === "timeline") return renderTimeline(issue.recentEvents || []);
+  if (detailTab === "timeline") return renderTimeline(issue);
   return "";
 }
 
@@ -2274,20 +2528,41 @@ function renderComments(comments) {
   ).join("") + "</div>";
 }
 
-function renderTimeline(events) {
-  if (!events.length) return "<div class='empty-state'>No recent events</div>";
-  return "<div class='timeline'>" + events.slice().reverse().map((event) =>
-    "<article class='timeline-item'>" +
+function renderTimeline(issue) {
+  const events = issue.recentEvents || [];
+  const list = !events.length ? "<div class='empty-state'>No recent events</div>" : "<div class='timeline'>" + events.slice().reverse().map((event) => {
+    const runId = event?.runId || "";
+    const selected = runId && selectedTimelineRunId === runId;
+    return "<article class='timeline-item'>" +
       "<div class='timeline-type'>" + escapeHtml(formatDate(event.at)) + " / " + escapeHtml(event.type || "event") + "</div>" +
       "<div class='timeline-body mono'>" + escapeHtml(JSON.stringify(event)) + "</div>" +
-    "</article>"
-  ).join("") + "</div>";
+      (runId ? "<div class='timeline-session-action'><button type='button' class='secondary' data-view-run='" + escapeHtml(runId) + "'>" + (selected ? "Refresh session" : "View session") + "</button></div>" : "") +
+    "</article>";
+  }).join("") + "</div>";
+  const selectedRun = selectedTimelineRunId;
+  const session = selectedRun
+    ? (selectedTimelineSessionMissing ? "<div class='empty-state'>No persisted history was found for that session.</div>" : renderAgentSession(issue, selectedRun, { historical: true }))
+    : "<div class='empty-state'>Select a timeline event with a session to view persisted output history.</div>";
+  return list + "<div class='tab-panel'>" + session + "</div>";
 }
 
 function bindDetailActions(issue) {
   const feedback = document.getElementById("feedback");
   if (feedback) feedback.addEventListener("input", () => feedbackDraftsByIssueId.set(issue.id, feedback.value));
-  document.getElementById("close-detail").onclick = () => { selectedId = null; renderBoard(); renderDetail(); };
+  for (const button of document.querySelectorAll("[data-view-run]")) {
+    button.onclick = async () => {
+      selectedTimelineRunId = button.dataset.viewRun || null;
+      selectedTimelineSessionMissing = false;
+      renderDetail();
+      try {
+        await loadAgentSession(issue.id, selectedTimelineRunId);
+      } catch (_) {
+        selectedTimelineSessionMissing = true;
+      }
+      if (selectedId === issue.id && detailTab === "timeline") renderDetail();
+    };
+  }
+  document.getElementById("close-detail").onclick = () => { selectedId = null; selectedTimelineRunId = null; renderBoard(); renderDetail(); };
   bindOptionalClick("approve-plan", () => postAction(issue.id, "approve-plan", {}));
   bindOptionalClick("approve-review-merge", () => postAction(issue.id, "approve-review-merge", {}));
   bindOptionalClick("approve-review", () => postAction(issue.id, "approve-review", {}));
@@ -2455,6 +2730,23 @@ async function load() {
   populateLinkedDirectoryOptions();
   renderBoard();
   renderDetail();
+}
+
+function handleEventStreamMessage(message) {
+  let payload;
+  try { payload = JSON.parse(message.data || "{}"); } catch (_) { load().catch(() => {}); return; }
+  const event = payload?.event;
+  if (payload?.type === "store" && event?.type === "run_event" && event.id && event.runId) {
+    const key = agentSessionKey(event.id, event.runId);
+    const cached = agentSessions.get(key) || { issueId: event.id, runId: event.runId, events: [], session: { items: [] }, loadedFromApi: false, loadingFromApi: false };
+    cached.events = mergeAgentSessionEvents(cached.events || [], [event.event]);
+    delete cached.error;
+    cached.session = assembleAgentSessionForUi(cached.events);
+    agentSessions.set(key, cached);
+    if (selectedId === event.id && (detailTab === "agent" || (detailTab === "timeline" && selectedTimelineRunId === event.runId))) renderDetail();
+    return;
+  }
+  load().catch(() => {});
 }
 
 function updateCleanCompletedButton() {
@@ -2639,7 +2931,9 @@ document.getElementById("board").addEventListener("click", (event) => {
   const card = event.target.closest(".issue-card");
   if (!card) return;
   selectedId = card.dataset.id;
-  detailTab = needsReview(issueById(selectedId)) ? "report" : detailTab;
+  selectedTimelineRunId = null;
+  const selectedIssue = issueById(selectedId);
+  detailTab = selectedIssue?.automation?.activeRunId ? "agent" : (needsReview(selectedIssue) ? "report" : detailTab);
   renderBoard();
   renderDetail();
 });
@@ -2650,6 +2944,9 @@ document.getElementById("board").addEventListener("keydown", (event) => {
   if (!card) return;
   event.preventDefault();
   selectedId = card.dataset.id;
+  selectedTimelineRunId = null;
+  const selectedIssue = issueById(selectedId);
+  if (selectedIssue?.automation?.activeRunId) detailTab = "agent";
   renderBoard();
   renderDetail();
 });
@@ -2662,6 +2959,7 @@ document.getElementById("detail").addEventListener("click", (event) => {
   const tab = event.target.closest("[data-tab]");
   if (!tab) return;
   detailTab = tab.dataset.tab;
+  if (detailTab !== "timeline") selectedTimelineRunId = null;
   renderDetail();
 });
 document.addEventListener("pointerdown", (event) => {
@@ -2681,13 +2979,14 @@ document.addEventListener("keydown", (event) => {
   else if (document.getElementById("create-drawer").classList.contains("open")) closeCreateDrawer();
   else if (selectedId) {
     selectedId = null;
+    selectedTimelineRunId = null;
     renderBoard();
     renderDetail();
   }
 });
 
 const events = new EventSource("/api/events?token=" + encodeURIComponent(TOKEN));
-events.onmessage = () => load().catch(() => {});
+events.onmessage = handleEventStreamMessage;
 events.addEventListener("ready", () => load().catch(() => {}));
 events.onerror = () => { document.getElementById("status").textContent = "Event stream disconnected"; };
 populateLaneFilter();

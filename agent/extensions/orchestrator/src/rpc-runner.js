@@ -22,20 +22,25 @@ function getLastAssistantTextFromMessages(messages) {
 	return "";
 }
 
-const STREAMING_EVENT_TYPES = new Set(["message_update", "tool_execution_update"]);
+const INTERNAL_STREAMING_EVENT_TYPES = new Set(["message_update", "tool_call_update", "tool_execution_update"]);
 const MAX_RUN_EVENT_BYTES = 64 * 1024;
 
-function serializeRunEvent(event) {
-	if (STREAMING_EVENT_TYPES.has(event?.type)) return null;
-	const payload = { ...event, at: nowIso() };
+function compactRunEvent(event, { addTimestamp = false } = {}) {
+	const payload = { ...event };
+	if (addTimestamp) payload.at = nowIso();
 	const serialized = JSON.stringify(payload);
-	if (Buffer.byteLength(serialized, "utf8") <= MAX_RUN_EVENT_BYTES) return `${serialized}\n`;
-	return `${JSON.stringify({
+	if (Buffer.byteLength(serialized, "utf8") <= MAX_RUN_EVENT_BYTES) return payload;
+	return {
 		type: payload.type || "oversized_event",
-		at: payload.at,
+		...(payload.at ? { at: payload.at } : {}),
 		truncated: true,
 		originalBytes: Buffer.byteLength(serialized, "utf8"),
-	})}\n`;
+	};
+}
+
+function serializeRunEvent(event, { filterStreaming = false } = {}) {
+	if (filterStreaming && INTERNAL_STREAMING_EVENT_TYPES.has(event?.type)) return null;
+	return `${JSON.stringify(compactRunEvent(event, { addTimestamp: true }))}\n`;
 }
 
 export class RpcAgentRunner {
@@ -60,11 +65,11 @@ export class RpcAgentRunner {
 		};
 		const appendLifecycleEvent = async (event) => {
 			if (internal) {
-				const line = serializeRunEvent(event);
+				const line = serializeRunEvent(event, { filterStreaming: true });
 				if (line) await fsp.appendFile(runLogPath, line, "utf-8");
 				return { ...event };
 			}
-			return this.store.appendRunEvent(issueId, runId, event);
+			return this.store.appendRunEvent(issueId, runId, compactRunEvent(event));
 		};
 		await appendLifecycleEvent({
 			type: "run_started",
@@ -108,9 +113,17 @@ export class RpcAgentRunner {
 		const messages = [];
 		const pending = new Map();
 
-		const appendRaw = async (event) => {
-			const line = serializeRunEvent(event);
-			if (line) await fsp.appendFile(runLogPath, line, "utf-8");
+		let appendQueue = Promise.resolve();
+		const appendRaw = (event) => {
+			appendQueue = appendQueue.then(async () => {
+				if (internal) {
+					const line = serializeRunEvent(event, { filterStreaming: true });
+					if (line) await fsp.appendFile(runLogPath, line, "utf-8");
+					return;
+				}
+				await this.store.appendRunEvent(issueId, runId, compactRunEvent(event));
+			});
+			return appendQueue;
 		};
 
 		const send = (command) => {
@@ -270,6 +283,7 @@ export class RpcAgentRunner {
 			touchIdleTimer();
 			await send({ type: "prompt", message: prompt });
 			await agentEndPromise;
+			await appendQueue;
 			await appendLifecycleEvent({ type: "run_finished", role });
 			return {
 				runId,
@@ -280,6 +294,7 @@ export class RpcAgentRunner {
 				stderr,
 			};
 		} finally {
+			await appendQueue.catch(() => {});
 			clearTimeout(timeout);
 			if (idleTimer) clearTimeout(idleTimer);
 			if (signal) signal.removeEventListener?.("abort", abortHandler);

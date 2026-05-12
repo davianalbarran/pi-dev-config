@@ -15,6 +15,7 @@ import {
 	writeFileAtomic,
 	writeJsonAtomic,
 } from "./utils.js";
+import { assembleAgentSession } from "./agent-session.js";
 import {
 	createApprovalState,
 	createAutomationState,
@@ -24,6 +25,14 @@ import {
 	normalizeMetadata,
 	resumeBlockedReason,
 } from "./workflow.js";
+
+export function assertSafeRunPathSegment(value, label = "run id") {
+	const segment = String(value || "");
+	if (!segment || segment === "." || segment === ".." || segment.includes("/") || segment.includes("\\")) {
+		throw new Error(`Invalid ${label}.`);
+	}
+	return segment;
+}
 
 export class IssueStore {
 	constructor(options = {}) {
@@ -125,7 +134,7 @@ export class IssueStore {
 	}
 
 	runPath(id, runId) {
-		return path.join(this.issueDir(id), "runs", `${runId}.jsonl`);
+		return path.join(this.issueDir(assertSafeRunPathSegment(id, "issue id")), "runs", `${assertSafeRunPathSegment(runId)}.jsonl`);
 	}
 
 	internalRunPath(scope, runId) {
@@ -358,6 +367,7 @@ export class IssueStore {
 			}
 			throw error;
 		}
+		await Promise.all(cleanedIds.map((id) => fsp.rm(path.join(this.sessionsRoot, id), { recursive: true, force: true })));
 		this.emitChange({ type: "completed_tickets_cleaned", cleanedIds, cleanedCount: cleanedIds.length, retentionDays: COMPLETED_TICKET_CLEANUP_RETENTION_DAYS });
 		return { cleanedCount: cleanedIds.length, cleanedIds, retentionDays: COMPLETED_TICKET_CLEANUP_RETENTION_DAYS };
 	}
@@ -438,6 +448,15 @@ export class IssueStore {
 		await appendJsonLine(this.runPath(id, runId), payload);
 		this.emitChange({ type: "run_event", id, runId, event: payload });
 		return payload;
+	}
+
+	async readRunEvents(id, runId) {
+		return readJsonLines(this.runPath(id, runId));
+	}
+
+	async getAgentSession(id, runId) {
+		const events = await this.readRunEvents(id, runId);
+		return { issueId: id, runId, events, session: assembleAgentSession(events) };
 	}
 
 	async findLatestResumableWorkerSession(id) {

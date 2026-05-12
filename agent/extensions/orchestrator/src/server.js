@@ -7,6 +7,7 @@ import { DEFAULT_CONFIG } from "./constants.js";
 import { getIssueDiffs } from "./diffs.js";
 import { renderQrSvg } from "./qr.js";
 import { renderDashboardHtml } from "./ui.js";
+import { assertSafeRunPathSegment } from "./store.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -350,6 +351,23 @@ export class OrchestratorServer {
 		if (diffMatch && req.method === "GET") {
 			const issue = await this.store.loadIssue(decodeURIComponent(diffMatch[1]));
 			return sendJson(res, 200, await getIssueDiffs(issue));
+		}
+
+		const runMatch = pathname.match(/^\/api\/issues\/([^/]+)\/runs\/([^/]+)$/);
+		if (runMatch && req.method === "GET") {
+			const id = decodeURIComponent(runMatch[1]);
+			const runId = decodeURIComponent(runMatch[2]);
+			try {
+				assertSafeRunPathSegment(id, "issue id");
+				assertSafeRunPathSegment(runId);
+			} catch (error) {
+				return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error), issueId: id, runId, events: [], session: { items: [], messages: [], tools: [], incomplete: false, ignoredCount: 0 } });
+			}
+			try {
+				return sendJson(res, 200, await this.store.getAgentSession(id, runId));
+			} catch (error) {
+				return sendJson(res, 404, { error: error instanceof Error ? error.message : String(error), issueId: id, runId, events: [], session: { items: [], messages: [], tools: [], incomplete: false, ignoredCount: 0 } });
+			}
 		}
 
 		const match = pathname.match(/^\/api\/issues\/([^/]+)\/([^/]+)$/);
