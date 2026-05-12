@@ -322,7 +322,32 @@ export class OrchestratorServer {
 
 		if (pathname === "/api/pick-directory" && req.method === "POST") {
 			try {
-				return sendJson(res, 200, { linkedDirectory: await chooseDirectory() });
+				const pickedPath = await chooseDirectory();
+				return sendJson(res, 200, { path: pickedPath, linkedDirectory: pickedPath });
+			} catch (error) {
+				return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+			}
+		}
+
+		if (pathname === "/api/projects" && req.method === "GET") {
+			const projects = await this.store.listProjects();
+			const counts = Object.fromEntries(await Promise.all(projects.map(async (project) => [project.id, await this.store.projectTicketCounts(project.id)])));
+			return sendJson(res, 200, { projects, counts });
+		}
+
+		if (pathname === "/api/projects" && req.method === "POST") {
+			try {
+				const body = await readJsonBody(req);
+				return sendJson(res, 200, await this.store.saveProject(body));
+			} catch (error) {
+				return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+			}
+		}
+
+		if (pathname === "/api/projects/resolve-path" && req.method === "POST") {
+			try {
+				const body = await readJsonBody(req);
+				return sendJson(res, 200, await this.store.ensureProjectForPath(body.path || body.linkedDirectory, { name: body.name || body.title }));
 			} catch (error) {
 				return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
 			}
@@ -338,9 +363,13 @@ export class OrchestratorServer {
 		}
 
 		if (pathname === "/api/issues" && req.method === "POST") {
-			const body = await readJsonBody(req);
-			const issue = await this.actions.createIssue(body);
-			return sendJson(res, 201, issue);
+			try {
+				const body = await readJsonBody(req);
+				const issue = await this.actions.createIssue(body);
+				return sendJson(res, 201, issue);
+			} catch (error) {
+				return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+			}
 		}
 
 		if (pathname === "/api/issues/clean-completed" && req.method === "POST") {
@@ -367,6 +396,18 @@ export class OrchestratorServer {
 				return sendJson(res, 200, await this.store.getAgentSession(id, runId));
 			} catch (error) {
 				return sendJson(res, 404, { error: error instanceof Error ? error.message : String(error), issueId: id, runId, events: [], session: { items: [], messages: [], tools: [], incomplete: false, ignoredCount: 0 } });
+			}
+		}
+
+		const projectMatch = pathname.match(/^\/api\/projects\/([^/]+)(?:\/(delete))?$/);
+		if (projectMatch && req.method === "POST") {
+			try {
+				const id = decodeURIComponent(projectMatch[1]);
+				if (projectMatch[2] === "delete") return sendJson(res, 200, await this.store.deleteProject(id));
+				const body = await readJsonBody(req);
+				return sendJson(res, 200, await this.store.saveProject({ ...body, id }));
+			} catch (error) {
+				return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
 			}
 		}
 

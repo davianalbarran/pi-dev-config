@@ -351,7 +351,12 @@ export class OrchestratorRuntime {
 			improveSpec: async (body = {}) => {
 				const spec = String(body.spec || "").trim();
 				if (!spec) throw new Error("Spec is required to improve it.");
-				const cwd = (await validDirectoryOrNull(body.linkedDirectory)) || process.cwd();
+				let projectPath = body.linkedDirectory;
+				if (body.projectId) {
+					const { project } = await this.store.resolveProject({ projectId: body.projectId });
+					projectPath = project.path;
+				}
+				const cwd = (await validDirectoryOrNull(projectPath)) || process.cwd();
 				const result = await this.runner.run({
 					issueId: "spec-writer",
 					role: "spec-writer",
@@ -369,6 +374,10 @@ export class OrchestratorRuntime {
 					title: body.title,
 					spec: body.spec,
 					linkedDirectory: body.linkedDirectory,
+					projectId: body.projectId,
+					projectName: body.projectName,
+					projectPath: body.projectPath,
+					gitRequest: body.gitRequest,
 					agentSettings: body.agentSettings,
 					dependencyIssueId: body.dependencyIssueId,
 					backlog: body.backlog,
@@ -377,6 +386,9 @@ export class OrchestratorRuntime {
 				return issue;
 			},
 			updateBacklogIssue: async (id, body) => this.store.updateBacklogIssue(id, body),
+			saveProject: async (body) => this.store.saveProject(body),
+			deleteProject: async (id) => this.store.deleteProject(id),
+			resolveProjectPath: async (body) => this.store.ensureProjectForPath(body.path || body.linkedDirectory, { name: body.name || body.title }),
 			sendBacklogIssueToAgent: async (id) => {
 				const issue = await this.store.sendBacklogIssueToAgent(id);
 				this.scheduler.queueTick();

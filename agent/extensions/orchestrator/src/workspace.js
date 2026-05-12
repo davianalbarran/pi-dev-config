@@ -36,34 +36,104 @@ export function branchNameForIssue(issueId, title) {
 	return `pi-orchestrator/${slug}`;
 }
 
-export async function getGitRepositoryInfo(linkedDirectory) {
+export async function getGitBranches(projectPath) {
+	const root = (await execGit(["-C", projectPath, "rev-parse", "--show-toplevel"], projectPath)).stdout.trim();
+	const result = await execGit(["-C", root, "for-each-ref", "--format=%(refname:short)", "refs/heads"], root);
+	return result.stdout.split("\n").map((line) => line.trim()).filter(Boolean);
+}
+
+export async function getGitProjectInfo(projectPath) {
+	let root = "";
+	try {
+		root = (await execGit(["-C", projectPath, "rev-parse", "--show-toplevel"], projectPath)).stdout.trim();
+	} catch (error) {
+		return {
+			isGitRepository: false,
+			repoRoot: null,
+			currentBranch: "",
+			defaultBranch: "",
+			branches: [],
+			error: error instanceof Error ? error.message : String(error),
+		};
+	}
+	let currentBranch = "";
+	try {
+		currentBranch = (await execGit(["-C", root, "branch", "--show-current"], root)).stdout.trim();
+		const branches = await getGitBranches(root);
+		let defaultBranch = currentBranch || branches[0] || "";
+		try {
+			const originHead = (await execGit(["-C", root, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"], root)).stdout.trim();
+			if (originHead) defaultBranch = originHead.replace(/^origin\//, "");
+		} catch {
+			// A repository may not have an origin/HEAD; current or first local branch is the safe fallback.
+		}
+		return {
+			isGitRepository: true,
+			repoRoot: root,
+			currentBranch,
+			defaultBranch,
+			branches,
+			error: branches.length ? null : "No local git branches were detected.",
+		};
+	} catch (error) {
+		return {
+			isGitRepository: true,
+			repoRoot: root,
+			currentBranch,
+			defaultBranch: currentBranch,
+			branches: [],
+			error: `Git branch listing failed: ${error instanceof Error ? error.message : String(error)}`,
+		};
+	}
+}
+
+export async function getGitRepositoryInfo(linkedDirectory, { baseRef = null } = {}) {
 	const root = (await execGit(["-C", linkedDirectory, "rev-parse", "--show-toplevel"], linkedDirectory)).stdout.trim();
 	const branchResult = await execGit(["-C", root, "branch", "--show-current"], root);
-	let baseBranch = branchResult.stdout.trim();
+	let baseBranch = String(baseRef || "").trim() || branchResult.stdout.trim();
 	if (!baseBranch) {
 		baseBranch = (await execGit(["-C", root, "rev-parse", "--abbrev-ref", "HEAD"], root)).stdout.trim();
 	}
-	const baseSha = (await execGit(["-C", root, "rev-parse", "HEAD"], root)).stdout.trim();
+	const baseSha = (await execGit(["-C", root, "rev-parse", `${baseBranch}^{commit}`], root)).stdout.trim();
 	return { repoRoot: root, baseBranch, baseSha };
 }
 
-export async function detectWorkspace(linkedDirectory) {
+export async function validateBranchName(repoRoot, branchName) {
+	const name = String(branchName || "").trim();
+	if (!name) return { valid: false, error: "Branch name is required." };
+	const result = await execGit(["-C", repoRoot, "check-ref-format", "--branch", name], repoRoot, { allowExitCodes: [0, 1, 128] });
+	return result.code === 0 ? { valid: true, error: "" } : { valid: false, error: `Invalid branch name: ${name}` };
+}
+
+export async function branchExists(repoRoot, branchName) {
+	const result = await execGit(["-C", repoRoot, "show-ref", "--verify", "--quiet", `refs/heads/${branchName}`], repoRoot, { allowExitCodes: [0, 1] });
+	return result.code === 0;
+}
+
+export async function createBranchWithoutCheckout(repoRoot, branchName, baseRef) {
+	const validation = await validateBranchName(repoRoot, branchName);
+	if (!validation.valid) throw new Error(validation.error);
+	if (await branchExists(repoRoot, branchName)) throw new Error(`Branch already exists: ${branchName}`);
+	await execGit(["-C", repoRoot, "branch", branchName, baseRef], repoRoot);
+}
+
+export async function detectWorkspace(linkedDirectory, { baseRef = null } = {}) {
 	if (!isDirectorySync(linkedDirectory)) {
 		throw new Error(`Linked directory does not exist or is not a directory: ${linkedDirectory}`);
 	}
-	try {
-		const git = await getGitRepositoryInfo(linkedDirectory);
-		return { kind: "git", git };
-	} catch {
-		return { kind: "directory" };
-	}
+	const repoCheck = await execGit(["-C", linkedDirectory, "rev-parse", "--show-toplevel"], linkedDirectory, { allowExitCodes: [0, 1, 128] });
+	if (repoCheck.code !== 0) return { kind: "directory" };
+	const git = await getGitRepositoryInfo(linkedDirectory, { baseRef });
+	return { kind: "git", git };
 }
 
 export async function ensureIssueWorkspace(store, issue) {
 	const metadata = issue.metadata;
 	if (metadata.workspace?.path) return metadata.workspace;
 
-	const detected = await detectWorkspace(metadata.linkedDirectory);
+	const gitRequest = metadata.gitRequest || metadata.git?.request || null;
+	const requestedBaseBranch = String(gitRequest?.baseBranch || "").trim() || null;
+	const detected = await detectWorkspace(metadata.linkedDirectory, { baseRef: requestedBaseBranch });
 	if (detected.kind === "directory") {
 		const workspace = {
 			kind: "directory",
@@ -80,7 +150,9 @@ export async function ensureIssueWorkspace(store, issue) {
 		return workspace;
 	}
 
-	const branchName = metadata.git?.branchName || branchNameForIssue(metadata.id, metadata.title);
+	const isNewBranchMode = gitRequest?.mode === "new";
+	const branchName = metadata.git?.branchName || (isNewBranchMode ? String(gitRequest?.newBranchName || "").trim() : branchNameForIssue(metadata.id, metadata.title));
+	if (!branchName) throw new Error("New branch name is required.");
 	const worktreePath = metadata.git?.worktreePath || path.join(store.worktreesRoot, metadata.id);
 	const git = {
 		repoRoot: detected.git.repoRoot,
@@ -89,15 +161,15 @@ export async function ensureIssueWorkspace(store, issue) {
 		branchName,
 		worktreePath,
 		finalCommitSha: metadata.git?.finalCommitSha || null,
+		request: gitRequest || { mode: "existing", baseBranch: detected.git.baseBranch },
 	};
 
 	await ensureDir(store.worktreesRoot);
 	if (!(await pathExists(worktreePath))) {
-		const ref = `refs/heads/${branchName}`;
-		const branchCheck = await execGit(["-C", git.repoRoot, "show-ref", "--verify", "--quiet", ref], git.repoRoot, {
-			allowExitCodes: [0, 1],
-		});
-		if (branchCheck.code === 0) {
+		if (isNewBranchMode) {
+			await createBranchWithoutCheckout(git.repoRoot, branchName, git.baseSha);
+			await execGit(["-C", git.repoRoot, "worktree", "add", worktreePath, branchName], git.repoRoot);
+		} else if (await branchExists(git.repoRoot, branchName)) {
 			await execGit(["-C", git.repoRoot, "worktree", "add", worktreePath, branchName], git.repoRoot);
 		} else {
 			await execGit(["-C", git.repoRoot, "worktree", "add", "-b", branchName, worktreePath, git.baseSha], git.repoRoot);

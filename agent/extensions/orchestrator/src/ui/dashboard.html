@@ -705,6 +705,10 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
   margin-bottom: 8px;
 }
 .drawer-head h2 { margin: 0; }
+.projects-view { padding: 18px; }
+.project-item { display: grid; gap: 10px; }
+.project-item-head { display: flex; justify-content: space-between; gap: 12px; align-items: start; }
+.selected-project, .inline-project-panel, .git-branch-controls { margin-top: 8px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface-2); padding: 10px; }
 .share-dialog[hidden] { display: none; }
 .share-backdrop {
   position: fixed;
@@ -839,6 +843,7 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
   <div class="top-actions">
     <button type="button" id="enable-notifications" class="secondary" hidden disabled>Enable Notifications</button>
     <button type="button" id="open-share" class="secondary">Share QR</button>
+    <button type="button" id="open-add-project" class="secondary">Add Project</button>
     <button type="button" id="open-create">New Issue</button>
   </div>
 </header>
@@ -846,6 +851,7 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
   <nav class="app-tabs" aria-label="Orchestrator views">
     <button type="button" class="app-view-tab active" id="kanban-tab" data-view="kanban">Kanban</button>
     <button type="button" class="app-view-tab" id="backlog-tab" data-view="backlog">Backlog</button>
+    <button type="button" class="app-view-tab" id="projects-tab" data-view="projects">Projects</button>
   </nav>
   <section class="command-bar" aria-label="Board controls">
     <div>
@@ -876,6 +882,16 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
     </div>
     <div class="backlog-list" id="backlog-list"></div>
   </section>
+  <section class="projects-view" id="projects-view" aria-label="Projects" hidden>
+    <div class="backlog-header">
+      <div>
+        <h2>Projects</h2>
+        <div class="small">Reusable local directories for tickets.</div>
+      </div>
+      <button type="button" id="open-project-create" class="secondary">Add Project</button>
+    </div>
+    <div class="backlog-list" id="projects-list"></div>
+  </section>
 </main>
 <aside class="inspector" id="detail" aria-label="Issue inspector"></aside>
 <div class="drawer" id="create-drawer" aria-hidden="true">
@@ -889,15 +905,37 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
     <form id="issue-form">
       <label for="title">Title</label>
       <input id="title" name="title" required>
-      <label for="linkedDirectory">Linked directory</label>
-      <div class="picker-row">
-        <input id="linkedDirectory" name="linkedDirectory" list="linkedDirectorySuggestions" placeholder="/absolute/path/to/project" required>
-        <select id="linkedDirectoryQuickSelect" aria-label="Use linked directory from an existing ticket">
-          <option value="">Use existing directory…</option>
-        </select>
-        <button type="button" class="secondary desktop-directory-picker" id="pick-directory">Choose</button>
+      <label for="projectSelect">Project</label>
+      <select id="projectSelect" name="projectId" required>
+        <option value="">Select a Project…</option>
+      </select>
+      <input id="linkedDirectory" name="linkedDirectory" type="hidden">
+      <div class="selected-project" id="selectedProjectSummary">No Project selected.</div>
+      <div class="actions"><button type="button" class="secondary" id="toggle-inline-project">Create Project inline</button></div>
+      <div class="inline-project-panel" id="inline-project-panel" hidden>
+        <label for="inlineProjectName">Project title (optional)</label>
+        <input id="inlineProjectName" placeholder="Defaults to directory name">
+        <label for="inlineProjectPath">Project path</label>
+        <div class="picker-row">
+          <input id="inlineProjectPath" placeholder="/absolute/path/to/project">
+          <button type="button" class="secondary desktop-directory-picker" id="pick-directory">Choose</button>
+        </div>
+        <div class="small" id="inline-project-message"></div>
+        <div class="actions"><button type="button" class="secondary" id="save-inline-project">Save Project</button></div>
       </div>
-      <datalist id="linkedDirectorySuggestions"></datalist>
+      <div class="git-branch-controls" id="git-branch-controls" hidden>
+        <label for="existingBaseBranch">Base branch</label>
+        <select id="existingBaseBranch"></select>
+        <button type="button" class="secondary" id="create-new-branch-mode">Create New Branch</button>
+        <div id="new-branch-panel" hidden>
+          <label for="newBranchBase">Base branch for new branch</label>
+          <select id="newBranchBase"></select>
+          <label for="newBranchName">New branch name</label>
+          <input id="newBranchName" placeholder="feature/my-branch">
+          <div class="small" id="branch-validation-message"></div>
+          <button type="button" class="secondary" id="cancel-new-branch-mode">Cancel</button>
+        </div>
+      </div>
       <div class="spec-header">
         <label for="spec">Spec</label>
         <button type="button" class="ghost spec-wand-button" id="spec-wand" title="Improve spec with Spec Writer" aria-label="Improve spec with Spec Writer"><span class="spec-wand-icon" aria-hidden="true">🪄</span></button>
@@ -972,6 +1010,30 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
     <div class="actions"><button type="button" id="copy-share" class="secondary">Copy URL</button></div>
   </section>
 </div>
+<div class="share-dialog" id="project-dialog" role="dialog" aria-modal="true" aria-labelledby="project-dialog-title" hidden>
+  <button type="button" class="share-backdrop" id="project-backdrop" aria-label="Close project dialog"></button>
+  <section class="share-panel">
+    <div class="share-head">
+      <div>
+        <h2 id="project-dialog-title">Add Project</h2>
+        <div class="small">Create a reusable local directory for tickets.</div>
+      </div>
+      <button type="button" class="secondary" id="close-project-dialog">Close</button>
+    </div>
+    <form id="project-form">
+      <input id="projectFormId" type="hidden">
+      <label for="projectFormName">Project title (optional)</label>
+      <input id="projectFormName" placeholder="Defaults to directory name">
+      <label for="projectFormPath">Project path</label>
+      <div class="picker-row">
+        <input id="projectFormPath" required placeholder="/absolute/path/to/project">
+        <button type="button" class="secondary desktop-directory-picker" id="project-pick-directory">Choose</button>
+      </div>
+      <div class="small" id="project-form-message"></div>
+      <div class="actions"><button type="submit" id="save-project-submit">Save Project</button></div>
+    </form>
+  </section>
+</div>
 <script>
 const TOKEN = __TOKEN_JSON__;
 const LANES = __LANES_JSON__;
@@ -983,6 +1045,10 @@ const DEFAULT_PROFILE_ID = __DEFAULT_PROFILE_ID_JSON__;
 const PROFILE_ROLES = ["planner", "worker", "reviewer"];
 const HUMAN_INTERVENTION_LANES = new Set([LANE.PLAN_REVIEW, LANE.IN_REVIEW]);
 let state = { issues: [], lanes: {} };
+let projects = [];
+let projectCounts = {};
+let selectedProjectId = "";
+let branchMode = "existing";
 let profiles = [];
 let selectedProfileId = DEFAULT_PROFILE_ID;
 let selectedId = null;
@@ -1016,6 +1082,7 @@ let specImproveRequestId = 0;
 let cleanupCompletedLoading = false;
 const expandedDiffFiles = new Set();
 const pendingResumeIssueIds = new Set();
+state.projects = [];
 
 function cssPixelValue(name, fallback) {
   const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -1201,7 +1268,8 @@ function notificationBody(issue, step) {
   const title = String(issue?.title || "Untitled ticket").trim();
   parts.push(shortId(issue?.id) + " — " + title);
   parts.push("Step: " + step);
-  if (issue?.linkedDirectory) parts.push("Directory: " + compactPath(issue.linkedDirectory));
+  if (issue?.project?.name) parts.push("Project: " + issue.project.name + " — " + compactPath(issue.project.path || issue.linkedDirectory || ""));
+  else if (issue?.linkedDirectory) parts.push("Directory: " + compactPath(issue.linkedDirectory));
   else if (issue?.workspace?.path) parts.push("Workspace: " + compactPath(issue.workspace.path));
   if (issue?.git?.branchName) parts.push("Branch: " + issue.git.branchName);
   return parts.join("\n");
@@ -1533,6 +1601,7 @@ function matchingIssuesForLane(lane) {
       issue.title,
       issue.id,
       issue.linkedDirectory,
+      projectDisplay(issue),
       issue.git && issue.git.branchName,
       issue.workspace && issue.workspace.path,
       issue.automation && issue.automation.error,
@@ -1578,45 +1647,121 @@ function populateDependencyOptions({ excludeId = null, selectedId = null } = {})
   updateIssueFormActions();
 }
 
-function linkedDirectoryChoices() {
-  const choicesByDirectory = new Map();
-  for (const issue of state.issues || []) {
-    const directory = String(issue?.linkedDirectory || "").trim();
-    if (!directory) continue;
-    const updatedTime = Date.parse(issue.updatedAt || "") || 0;
-    const existing = choicesByDirectory.get(directory) || { directory, count: 0, updatedTime: 0, latestTitle: "" };
-    existing.count += 1;
-    if (updatedTime >= existing.updatedTime) {
-      existing.updatedTime = updatedTime;
-      existing.latestTitle = issue.title || "";
-    }
-    choicesByDirectory.set(directory, existing);
-  }
-  return Array.from(choicesByDirectory.values()).sort((left, right) =>
-    (right.updatedTime - left.updatedTime) || left.directory.localeCompare(right.directory)
-  );
+function projectById(id) {
+  return projects.find((project) => project.id === id) || null;
 }
 
-function linkedDirectoryChoiceLabel(choice) {
-  const countLabel = choice.count + " ticket" + (choice.count === 1 ? "" : "s");
-  return compactPath(choice.directory) + " — " + countLabel + (choice.latestTitle ? ": " + choice.latestTitle : "");
+function projectLabel(project) {
+  if (!project) return "Project no longer configured";
+  return project.name + " — " + compactPath(project.path || "");
+}
+
+function issueProject(issue) {
+  return projectById(issue?.projectId) || issue?.project || null;
+}
+
+function projectDisplay(issue) {
+  const project = issueProject(issue);
+  if (!project) return compactPath(issue?.linkedDirectory || "Project no longer configured");
+  const stale = issue?.projectId && !projectById(issue.projectId) ? " (Project no longer configured)" : "";
+  return project.name + stale + " — " + compactPath(project.path || issue?.linkedDirectory || "");
 }
 
 function populateLinkedDirectoryOptions() {
-  const input = document.getElementById("linkedDirectory");
-  const select = document.getElementById("linkedDirectoryQuickSelect");
-  const suggestions = document.getElementById("linkedDirectorySuggestions");
-  if (!input || !select || !suggestions) return;
-  const currentValue = input.value;
-  const choices = linkedDirectoryChoices();
-  select.innerHTML = "<option value=''>Use existing directory…</option>" + choices.map((choice) =>
-    "<option value='" + escapeHtml(choice.directory) + "'>" + escapeHtml(linkedDirectoryChoiceLabel(choice)) + "</option>"
+  projects = Array.isArray(state.projects) ? state.projects : [];
+  const select = document.getElementById("projectSelect");
+  const hidden = document.getElementById("linkedDirectory");
+  const summary = document.getElementById("selectedProjectSummary");
+  if (!select) return;
+  const selected = selectedProjectId || select.value;
+  select.innerHTML = "<option value=''>Select a Project…</option>" + projects.map((project) =>
+    "<option value='" + escapeHtml(project.id) + "'>" + escapeHtml(projectLabel(project)) + "</option>"
   ).join("");
-  suggestions.innerHTML = choices.map((choice) =>
-    "<option value='" + escapeHtml(choice.directory) + "' label='" + escapeHtml(choice.count + " ticket" + (choice.count === 1 ? "" : "s") + (choice.latestTitle ? " — " + choice.latestTitle : "")) + "'></option>"
-  ).join("");
-  input.value = currentValue;
-  select.value = choices.some((choice) => choice.directory === currentValue) ? currentValue : "";
+  if (projects.some((project) => project.id === selected)) select.value = selected;
+  else select.value = "";
+  selectedProjectId = select.value;
+  const project = projectById(selectedProjectId);
+  if (hidden) hidden.value = project?.path || "";
+  if (summary) summary.textContent = project ? projectLabel(project) + projectGitStatusMessage(project) : (selected ? "Selected Project is no longer configured. Choose another Project before submitting." : "No Project selected.");
+  renderGitBranchControls(project);
+}
+
+function branchOptions(project, selected) {
+  const branches = project?.git?.branches || [];
+  return branches.map((branch) => "<option value='" + escapeHtml(branch) + "'" + (branch === selected ? " selected" : "") + ">" + escapeHtml(branch) + "</option>").join("");
+}
+
+function projectGitStatusMessage(project) {
+  if (!project) return "";
+  if (!project.isGitRepository) return " Branch controls are hidden because this Project is not a git repository.";
+  if (project.git?.error) return " Git branch controls unavailable: " + project.git.error;
+  if (!(project.git?.branches || []).length) return " Git branch controls unavailable: no local branches were detected.";
+  return "";
+}
+
+function renderGitBranchControls(project) {
+  const controls = document.getElementById("git-branch-controls");
+  if (!controls) return;
+  const branches = project?.git?.branches || [];
+  const hasBranchControls = !!(project?.isGitRepository && project?.git && !project.git.error && branches.length);
+  controls.hidden = !hasBranchControls;
+  const validation = document.getElementById("branch-validation-message");
+  const existing = document.getElementById("existingBaseBranch");
+  const base = document.getElementById("newBranchBase");
+  const newBranchName = document.getElementById("newBranchName");
+  const newBranchPanel = document.getElementById("new-branch-panel");
+  if (validation) validation.textContent = "";
+  if (!hasBranchControls) {
+    if (newBranchName?.setCustomValidity) newBranchName.setCustomValidity("");
+    if (existing) existing.disabled = true;
+    if (base) base.disabled = true;
+    if (newBranchName) newBranchName.disabled = true;
+    if (newBranchPanel) newBranchPanel.hidden = true;
+    branchMode = "existing";
+    return;
+  }
+  const selected = project.git.defaultBranch || project.git.currentBranch || branches[0] || "";
+  if (existing && !existing.options.length) existing.innerHTML = branchOptions(project, selected);
+  else if (existing) existing.innerHTML = branchOptions(project, existing.value || selected);
+  if (base && !base.options.length) base.innerHTML = branchOptions(project, selected);
+  else if (base) base.innerHTML = branchOptions(project, base.value || selected);
+  if (newBranchPanel) newBranchPanel.hidden = branchMode !== "new";
+  if (existing) existing.disabled = branchMode === "new";
+  if (base) base.disabled = branchMode !== "new";
+  if (newBranchName) newBranchName.disabled = branchMode !== "new";
+  updateBranchValidationMessage();
+}
+
+function gitBranchNameClientError(branchName) {
+  const name = String(branchName || "").trim();
+  if (!name) return "New branch name is required.";
+  if (name.startsWith("-") || name.startsWith("/") || name.endsWith("/") || name.endsWith(".") || name.includes("//")) return "Invalid branch name: " + name;
+  if (name.includes("..") || name.includes("@{") || name.endsWith(".lock")) return "Invalid branch name: " + name;
+  if (/[\\\s~^:?*[\]\x00-\x20\x7f]/.test(name)) return "Invalid branch name: " + name;
+  return "";
+}
+
+function newBranchValidationError(project, branchName, baseBranch) {
+  if (!project?.isGitRepository || project.git?.error) return "Selected Project does not have available git branches.";
+  const branches = project.git?.branches || [];
+  if (!branches.length) return "Selected Project has no detectable local branches.";
+  if (!baseBranch || !branches.includes(baseBranch)) return "Select a valid base branch for the new branch.";
+  const name = String(branchName || "").trim();
+  const nameError = gitBranchNameClientError(name);
+  if (nameError) return nameError;
+  if (branches.includes(name)) return "Branch already exists: " + name;
+  return "";
+}
+
+function updateBranchValidationMessage() {
+  const message = document.getElementById("branch-validation-message");
+  const input = document.getElementById("newBranchName");
+  const base = document.getElementById("newBranchBase");
+  if (!message || !input || !base) return "";
+  const error = branchMode === "new" ? newBranchValidationError(projectById(selectedProjectId), input.value, base.value) : "";
+  message.textContent = error;
+  if (input.setCustomValidity) input.setCustomValidity(error);
+  return error;
 }
 
 function defaultProfileFromRoleDefaults() {
@@ -1795,9 +1940,11 @@ function updateIssueFormActions() {
 
 function fillIssueForm(issue) {
   document.getElementById("title").value = issue?.title || "";
+  selectedProjectId = issue?.projectId || "";
   document.getElementById("linkedDirectory").value = issue?.linkedDirectory || "";
   document.getElementById("spec").value = issue?.spec || "";
   populateDependencyOptions({ excludeId: issue?.id || null, selectedId: getDependencyIssueId(issue) });
+  populateLinkedDirectoryOptions();
   applyAgentSettings(issue?.agentSettings || profileById(selectedProfileId).agentSettings);
 }
 
@@ -1808,6 +1955,8 @@ function openCreateDrawer(options = {}) {
   selectedProfileId = DEFAULT_PROFILE_ID;
   setDefaultAgentSettings();
   populateDependencyOptions();
+  selectedProjectId = "";
+  branchMode = "existing";
   populateLinkedDirectoryOptions();
   setIssueFormMode("create");
   const drawer = document.getElementById("create-drawer");
@@ -1852,6 +2001,7 @@ function matchingBacklogIssues() {
       issue.title,
       issue.id,
       issue.linkedDirectory,
+      projectDisplay(issue),
       issue.spec,
       getDependencyIssueId(issue),
       getDependencyIssue(issue)?.title,
@@ -1878,7 +2028,7 @@ function renderBacklog() {
         "<button type='button' data-edit-backlog='" + escapeHtml(issue.id) + "'>Edit</button>" +
       "</div>" +
       "<div class='card-badges'>" +
-        "<span class='badge'>" + escapeHtml(compactPath(issue.linkedDirectory || "")) + "</span>" +
+        "<span class='badge'>" + escapeHtml(projectDisplay(issue)) + "</span>" +
         (getDependencyIssueId(issue) ? "<span class='badge " + (hasUnresolvedDependency(issue) ? "active" : "done") + "'>depends on " + escapeHtml(shortId(getDependencyIssueId(issue))) + "</span>" : "") +
         "<span class='badge'>Updated " + escapeHtml(formatDate(issue.updatedAt)) + "</span>" +
       "</div>" +
@@ -1887,14 +2037,91 @@ function renderBacklog() {
   ).join("");
 }
 
+function projectCountsFor(projectId) {
+  return projectCounts[projectId] || { active: 0, completed: 0 };
+}
+
+function renderProjects() {
+  const list = document.getElementById("projects-list");
+  if (!list) return;
+  if (!projects.length) {
+    list.innerHTML = "<div class='empty-state'>No Projects configured yet.</div>";
+    return;
+  }
+  list.innerHTML = projects.map((project) => {
+    const counts = projectCountsFor(project.id);
+    const blocked = counts.active > 0;
+    const git = project.isGitRepository ? ((project.git?.branches || []).length + " branch" + ((project.git?.branches || []).length === 1 ? "" : "es")) : "not a git repository";
+    return "<article class='backlog-item project-item' data-project-id='" + escapeHtml(project.id) + "'>" +
+      "<div class='project-item-head'>" +
+        "<div><div class='backlog-title'>" + escapeHtml(project.name) + "</div><div class='meta mono'>" + escapeHtml(project.path) + "</div></div>" +
+        "<div class='actions'><button type='button' class='secondary' data-edit-project='" + escapeHtml(project.id) + "'>Edit</button>" +
+        "<button type='button' class='bad' data-delete-project='" + escapeHtml(project.id) + "' " + (blocked ? "disabled title='Cannot delete while active tickets are associated with this Project.'" : "title='Delete Project and completed ticket history'") + ">Delete</button></div>" +
+      "</div>" +
+      "<div class='card-badges'><span class='badge'>" + escapeHtml(git) + "</span><span class='badge'>" + escapeHtml(counts.active + " active") + "</span><span class='badge'>" + escapeHtml(counts.completed + " completed") + "</span></div>" +
+      (blocked ? "<div class='small'>Delete is unavailable because active tickets are associated with this Project.</div>" : "") +
+    "</article>";
+  }).join("");
+}
+
+function openProjectDialog(project = null) {
+  document.getElementById("project-dialog-title").textContent = project ? "Edit Project" : "Add Project";
+  document.getElementById("projectFormId").value = project?.id || "";
+  document.getElementById("projectFormName").value = project?.name || "";
+  document.getElementById("projectFormPath").value = project?.path || "";
+  document.getElementById("project-form-message").textContent = "";
+  document.getElementById("project-dialog").hidden = false;
+  setTimeout(() => document.getElementById("projectFormName").focus(), 0);
+}
+
+function closeProjectDialog() {
+  document.getElementById("project-dialog").hidden = true;
+}
+
+async function saveProjectFromForm() {
+  const id = document.getElementById("projectFormId").value;
+  const nameInput = document.getElementById("projectFormName");
+  const pathInput = document.getElementById("projectFormPath");
+  const payload = { name: nameInput.value, path: pathInput.value };
+  const url = id ? "/api/projects/" + encodeURIComponent(id) : "/api/projects";
+  const result = await api(url, { method: "POST", body: JSON.stringify(payload) });
+  const message = document.getElementById("project-form-message");
+  if (result.reused) {
+    document.getElementById("projectFormId").value = result.project?.id || "";
+    nameInput.value = result.project?.name || nameInput.value;
+    pathInput.value = result.project?.path || pathInput.value;
+    message.textContent = "Existing Project reused for that path: " + (result.project?.name || "Unnamed Project") + ".";
+    await load();
+    return;
+  }
+  message.textContent = "Project saved.";
+  await load();
+  closeProjectDialog();
+}
+
+async function saveInlineProject() {
+  const message = document.getElementById("inline-project-message");
+  const result = await api("/api/projects", {
+    method: "POST",
+    body: JSON.stringify({ name: document.getElementById("inlineProjectName").value, path: document.getElementById("inlineProjectPath").value })
+  });
+  selectedProjectId = result.project.id;
+  if (message) message.textContent = result.reused ? "Existing Project selected for that path." : "Project created and selected.";
+  await load();
+  document.getElementById("inline-project-panel").hidden = true;
+}
+
 function renderBoard() {
   renderMetrics();
   renderViewTabs();
   const board = document.getElementById("board");
   const backlog = document.getElementById("backlog-view");
+  const projectsView = document.getElementById("projects-view");
   board.hidden = activeView !== "kanban";
   if (backlog) backlog.hidden = activeView !== "backlog";
+  if (projectsView) projectsView.hidden = activeView !== "projects";
   renderBacklog();
+  renderProjects();
   board.innerHTML = "";
   if (activeView !== "kanban") return;
   for (const lane of KANBAN_LANES) {
@@ -1937,7 +2164,7 @@ function renderBoard() {
           "</div>" +
           "<div class='card-title'>" + escapeHtml(issue.title) + "</div>" +
           "<div class='meta mono'>" + escapeHtml(shortId(issue.id)) + "</div>" +
-          "<div class='card-path'>" + escapeHtml(compactPath(issue.linkedDirectory || "")) + "</div>" +
+          "<div class='card-path'>" + escapeHtml(projectDisplay(issue)) + "</div>" +
           "<div class='card-badges'>" +
             "<span class='badge'>" + escapeHtml(compactPath(branch)) + "</span>" +
             "<span class='badge'>attempts " + escapeHtml(attempts) + "</span>" +
@@ -2437,6 +2664,7 @@ function renderDetail() {
     "</div>" +
     "<div class='inspector-badges'>" +
       "<span class='badge " + badgeClass(issue) + "'>" + escapeHtml(stateLabel(issue)) + "</span>" +
+      "<span class='badge'>" + escapeHtml(projectDisplay(issue)) + "</span>" +
       (issue.git ? "<span class='badge'>" + escapeHtml(compactPath(issue.git.branchName)) + "</span>" : "<span class='badge'>" + escapeHtml(issue.workspace?.kind || "workspace pending") + "</span>") +
       (activeMerge ? "<span class='badge active'>Merge blocked by " + escapeHtml(shortId(activeMerge.id)) + "</span>" : "") +
       (getDependencyIssueId(issue) ? "<span class='badge " + (hasUnresolvedDependency(issue) ? "active" : "done") + "'>depends on " + escapeHtml(shortId(getDependencyIssueId(issue))) + "</span>" : "") +
@@ -2447,6 +2675,7 @@ function renderDetail() {
       statusCell("Active", issue.automation?.activeRole ? issue.automation.activeRole + " " + (issue.automation.activeRunId || "") : "none") +
       statusCell("Attempts", (issue.automation?.planningAttempts || 0) + " planning / " + (issue.automation?.implementationAttempts || 0) + " implementation") +
       statusCell("Dependency", dependencyDisplay(issue)) +
+      statusCell("Worktree base", issue.git?.baseBranch || issue.gitRequest?.baseBranch || "none") +
     "</div>" +
     "<div class='actions'>" +
       actionButtons.join("") +
@@ -2510,8 +2739,10 @@ function renderReport(issue) {
       "",
       "- Lane: " + issue.lane,
       "- Status: " + stateLabel(issue),
+      "- Project: " + projectDisplay(issue),
       "- Linked directory: " + (issue.linkedDirectory || "unknown"),
       "- Workspace: " + (issue.workspace?.path || "not prepared"),
+      "- Worktree base branch: " + (issue.git?.baseBranch || issue.gitRequest?.baseBranch || "none"),
       "- Dependency: " + dependencyDisplay(issue),
     ].join("\n");
   }
@@ -2725,6 +2956,8 @@ async function load() {
   syncCompletedTicketMinimization(nextState);
   syncHumanInterventionNotifications(nextState);
   state = nextState;
+  projects = Array.isArray(nextState.projects) ? nextState.projects : [];
+  projectCounts = nextState.projectCounts || nextState.counts || {};
   if (selectedId && !issueById(selectedId)) selectedId = null;
   populateDependencyOptions(issueFormMode === "edit" ? { excludeId: editingBacklogId } : {});
   populateLinkedDirectoryOptions();
@@ -2781,15 +3014,27 @@ function populateLaneFilter() {
   laneFilter.innerHTML = "<option value='all'>All Kanban lanes</option>" + KANBAN_LANES.map((lane) => "<option value='" + escapeHtml(lane) + "'>" + escapeHtml(lane) + "</option>").join("");
 }
 
-document.getElementById("linkedDirectory").addEventListener("input", (event) => {
-  const select = document.getElementById("linkedDirectoryQuickSelect");
-  const value = event.target.value;
-  select.value = Array.from(select.options).some((option) => option.value === value) ? value : "";
+document.getElementById("projectSelect").addEventListener("change", (event) => {
+  selectedProjectId = event.target.value || "";
+  branchMode = "existing";
+  populateLinkedDirectoryOptions();
 });
 
-document.getElementById("linkedDirectoryQuickSelect").addEventListener("change", (event) => {
-  document.getElementById("linkedDirectory").value = event.target.value || "";
+document.getElementById("toggle-inline-project").addEventListener("click", () => {
+  const panel = document.getElementById("inline-project-panel");
+  panel.hidden = !panel.hidden;
 });
+
+document.getElementById("save-inline-project").addEventListener("click", () => saveInlineProject().catch((error) => {
+  document.getElementById("inline-project-message").textContent = error.message;
+}));
+
+document.getElementById("create-new-branch-mode").addEventListener("click", () => { branchMode = "new"; renderGitBranchControls(projectById(selectedProjectId)); });
+
+document.getElementById("cancel-new-branch-mode").addEventListener("click", () => { branchMode = "existing"; renderGitBranchControls(projectById(selectedProjectId)); });
+
+document.getElementById("newBranchName").addEventListener("input", updateBranchValidationMessage);
+document.getElementById("newBranchBase").addEventListener("change", updateBranchValidationMessage);
 
 const pickDirectoryButton = document.getElementById("pick-directory");
 if (pickDirectoryButton) pickDirectoryButton.addEventListener("click", async () => {
@@ -2799,8 +3044,7 @@ if (pickDirectoryButton) pickDirectoryButton.addEventListener("click", async () 
   button.disabled = true;
   try {
     const result = await api("/api/pick-directory", { method: "POST", body: "{}" });
-    document.getElementById("linkedDirectory").value = result.linkedDirectory || "";
-    populateLinkedDirectoryOptions();
+    document.getElementById("inlineProjectPath").value = result.path || result.linkedDirectory || "";
   } catch (error) {
     alert(error.message);
   } finally {
@@ -2825,9 +3069,30 @@ document.getElementById("issue-form").addEventListener("submit", async (event) =
   const formEl = event.currentTarget;
   const form = new FormData(formEl);
   const action = event.submitter?.value || (issueFormMode === "edit" ? "save" : "create");
+  const project = projectById(selectedProjectId || form.get("projectId"));
+  if (!project) {
+    alert("Select or create a Project before submitting the ticket.");
+    return;
+  }
+  const gitRequest = project.isGitRepository && !project.git?.error ? (branchMode === "new"
+    ? { mode: "new", baseBranch: document.getElementById("newBranchBase").value, newBranchName: document.getElementById("newBranchName").value.trim() }
+    : { mode: "existing", baseBranch: document.getElementById("existingBaseBranch").value }) : null;
+  if (gitRequest?.mode === "existing" && (!(project.git?.branches || []).length || !project.git.branches.includes(gitRequest.baseBranch))) {
+    alert("Select a valid base branch before submitting.");
+    return;
+  }
+  if (gitRequest?.mode === "new") {
+    const branchError = updateBranchValidationMessage();
+    if (branchError) {
+      alert(branchError);
+      return;
+    }
+  }
   const payload = {
     title: form.get("title"),
-    linkedDirectory: form.get("linkedDirectory"),
+    projectId: project.id,
+    linkedDirectory: project.path,
+    gitRequest,
     spec: form.get("spec"),
     dependencyIssueId: form.get("dependencyIssueId") || null,
     agentSettings: readAgentSettings(form)
@@ -2854,6 +3119,8 @@ document.getElementById("issue-form").addEventListener("submit", async (event) =
     if (action === "backlog" || (issue.metadata && issue.metadata.lane === LANE.BACKLOG)) activeView = "backlog";
     else activeView = "kanban";
     formEl.reset();
+    selectedProjectId = "";
+    branchMode = "existing";
     resetSpecWriterState();
     setDefaultAgentSettings();
     populateDependencyOptions();
@@ -2870,9 +3137,25 @@ document.getElementById("enable-notifications").addEventListener("click", () => 
   requestNotificationPermission().catch(() => refreshNotificationPermissionUi());
 });
 document.getElementById("open-share").addEventListener("click", () => openShareDialog().catch((error) => alert(error.message)));
+document.getElementById("open-add-project").addEventListener("click", () => openProjectDialog());
+document.getElementById("open-project-create").addEventListener("click", () => openProjectDialog());
 document.getElementById("close-share").addEventListener("click", closeShareDialog);
 document.getElementById("share-backdrop").addEventListener("click", closeShareDialog);
 document.getElementById("copy-share").addEventListener("click", () => copyShareUrl().catch((error) => alert(error.message)));
+document.getElementById("close-project-dialog").addEventListener("click", closeProjectDialog);
+document.getElementById("project-backdrop").addEventListener("click", closeProjectDialog);
+document.getElementById("project-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  saveProjectFromForm().catch((error) => { document.getElementById("project-form-message").textContent = error.message; });
+});
+document.getElementById("project-pick-directory").addEventListener("click", async () => {
+  try {
+    const result = await api("/api/pick-directory", { method: "POST", body: "{}" });
+    document.getElementById("projectFormPath").value = result.path || result.linkedDirectory || "";
+  } catch (error) {
+    document.getElementById("project-form-message").textContent = error.message;
+  }
+});
 document.getElementById("open-create").addEventListener("click", openCreateDrawer);
 document.getElementById("open-backlog-create").addEventListener("click", () => { activeView = "backlog"; openCreateDrawer(); });
 document.getElementById("close-create").addEventListener("click", closeCreateDrawer);
@@ -2955,6 +3238,23 @@ document.getElementById("backlog-list").addEventListener("click", (event) => {
   if (!edit) return;
   openEditIssueDrawer(issueById(edit.dataset.editBacklog));
 });
+
+document.getElementById("projects-list").addEventListener("click", (event) => {
+  const edit = event.target.closest("[data-edit-project]");
+  if (edit) {
+    openProjectDialog(projectById(edit.dataset.editProject));
+    return;
+  }
+  const del = event.target.closest("[data-delete-project]");
+  if (!del || del.disabled) return;
+  const project = projectById(del.dataset.deleteProject);
+  if (!project) return;
+  const ok = confirm("Delete Project '" + project.name + "'? This will also remove associated completed tickets from history.");
+  if (!ok) return;
+  api("/api/projects/" + encodeURIComponent(project.id) + "/delete", { method: "POST", body: "{}" })
+    .then(() => load())
+    .catch((error) => alert(error.message));
+});
 document.getElementById("detail").addEventListener("click", (event) => {
   const tab = event.target.closest("[data-tab]");
   if (!tab) return;
@@ -2976,6 +3276,7 @@ window.addEventListener("resize", reclampPanelWidths);
 document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
   if (!document.getElementById("share-dialog").hidden) closeShareDialog();
+  else if (!document.getElementById("project-dialog").hidden) closeProjectDialog();
   else if (document.getElementById("create-drawer").classList.contains("open")) closeCreateDrawer();
   else if (selectedId) {
     selectedId = null;

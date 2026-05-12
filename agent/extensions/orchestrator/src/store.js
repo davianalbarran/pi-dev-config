@@ -1,3 +1,4 @@
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
@@ -25,6 +26,7 @@ import {
 	normalizeMetadata,
 	resumeBlockedReason,
 } from "./workflow.js";
+import { getGitProjectInfo } from "./workspace.js";
 
 export function assertSafeRunPathSegment(value, label = "run id") {
 	const segment = String(value || "");
@@ -43,6 +45,7 @@ export class IssueStore {
 		this.sessionsRoot = path.join(this.dataRoot, "sessions");
 		this.internalRunsRoot = path.join(this.dataRoot, "runs");
 		this.profilesPath = path.join(this.dataRoot, "profiles.json");
+		this.projectsPath = path.join(this.dataRoot, "projects.json");
 		this.listeners = new Set();
 		this.watchHandle = null;
 		this.pollTimer = null;
@@ -54,6 +57,251 @@ export class IssueStore {
 		await ensureDir(this.worktreesRoot);
 		await ensureDir(this.sessionsRoot);
 		await ensureDir(this.internalRunsRoot);
+	}
+
+	normalizeProjectPath(pathInput) {
+		if (!String(pathInput || "").trim()) throw new Error("Project path is required.");
+		const normalized = normalizePath(pathInput);
+		return normalized;
+	}
+
+	defaultProjectName(projectPath) {
+		const base = path.basename(String(projectPath || "").replace(/[\\/]+$/, ""));
+		return base || String(projectPath || "Project").trim() || "Project";
+	}
+
+	projectIdForPath(projectPath) {
+		const digest = crypto.createHash("sha1").update(projectPath).digest("hex").slice(0, 12);
+		return `project-${slugify(path.basename(projectPath), "project")}-${digest}`;
+	}
+
+	normalizeProject(raw = {}) {
+		const normalizedPath = this.normalizeProjectPath(raw.path || raw.linkedDirectory || "");
+		const now = nowIso();
+		const id = String(raw.id || "").trim() || this.projectIdForPath(normalizedPath);
+		const name = String(raw.name || raw.title || "").trim() || this.defaultProjectName(normalizedPath);
+		return {
+			id,
+			name,
+			path: normalizedPath,
+			isGitRepository: !!raw.isGitRepository,
+			git: raw.git || null,
+			createdAt: raw.createdAt || now,
+			updatedAt: raw.updatedAt || raw.createdAt || now,
+		};
+	}
+
+	async validateProjectPath(projectPath) {
+		let stat;
+		try {
+			stat = await fsp.stat(projectPath);
+		} catch (error) {
+			throw new Error(`Project path is not accessible: ${projectPath}`);
+		}
+		if (!stat.isDirectory()) throw new Error(`Project path is not a directory: ${projectPath}`);
+	}
+
+	async projectGitMetadata(projectPath) {
+		const info = await getGitProjectInfo(projectPath);
+		return {
+			isGitRepository: !!info.isGitRepository,
+			git: info.isGitRepository
+				? {
+					repoRoot: info.repoRoot,
+					currentBranch: info.currentBranch,
+					defaultBranch: info.defaultBranch,
+					branches: info.branches,
+					error: info.error || null,
+				}
+				: {
+					repoRoot: null,
+					currentBranch: "",
+					defaultBranch: "",
+					branches: [],
+					error: info.error || "Path is not a git repository.",
+				},
+		};
+	}
+
+	async readProjectsRaw() {
+		await this.init();
+		const raw = await readJson(this.projectsPath, []);
+		const input = Array.isArray(raw) ? raw : Array.isArray(raw?.projects) ? raw.projects : [];
+		const projects = [];
+		const seenIds = new Set();
+		const seenPaths = new Set();
+		for (const item of input) {
+			try {
+				const project = this.normalizeProject(item);
+				if (seenIds.has(project.id) || seenPaths.has(project.path)) continue;
+				seenIds.add(project.id);
+				seenPaths.add(project.path);
+				projects.push(project);
+			} catch {
+				// Ignore malformed project records; callers should still get usable projects.
+			}
+		}
+		return projects.sort((a, b) => a.name.localeCompare(b.name) || a.path.localeCompare(b.path));
+	}
+
+	async writeProjects(projects) {
+		await writeJsonAtomic(this.projectsPath, projects);
+	}
+
+	async listProjects({ skipBackfill = false } = {}) {
+		if (!skipBackfill) await this.backfillProjectsFromIssues();
+		return this.readProjectsRaw();
+	}
+
+	async saveProject({ id, name, title, path: projectPath, linkedDirectory } = {}) {
+		await this.init();
+		await this.backfillProjectsFromIssues();
+		const normalizedPath = this.normalizeProjectPath(projectPath || linkedDirectory);
+		await this.validateProjectPath(normalizedPath);
+		const projects = await this.readProjectsRaw();
+		const requestedId = String(id || "").trim();
+		const duplicate = projects.find((project) => project.path === normalizedPath && project.id !== requestedId);
+		if (duplicate) {
+			return { project: duplicate, projects, reused: true, message: `Using existing Project for ${normalizedPath}.` };
+		}
+		const now = nowIso();
+		const existing = requestedId ? projects.find((project) => project.id === requestedId) : null;
+		const gitMetadata = await this.projectGitMetadata(normalizedPath);
+		const project = this.normalizeProject({
+			...(existing || {}),
+			id: requestedId || existing?.id || this.projectIdForPath(normalizedPath),
+			name: String(name ?? title ?? "").trim() || this.defaultProjectName(normalizedPath),
+			path: normalizedPath,
+			...gitMetadata,
+			createdAt: existing?.createdAt || now,
+			updatedAt: now,
+		});
+		const nextProjects = [project, ...projects.filter((item) => item.id !== project.id)].sort((a, b) => a.name.localeCompare(b.name) || a.path.localeCompare(b.path));
+		await this.writeProjects(nextProjects);
+		if (existing) await this.updateIssueProjectSnapshots(project);
+		this.emitChange({ type: "projects_updated", id: project.id });
+		return { project, projects: nextProjects, reused: false };
+	}
+
+	async ensureProjectForPath(projectPath, { name, title } = {}) {
+		const normalizedPath = this.normalizeProjectPath(projectPath);
+		const projects = await this.readProjectsRaw();
+		const existing = projects.find((project) => project.path === normalizedPath);
+		if (existing) return { project: existing, projects, reused: true, message: `Using existing Project for ${normalizedPath}.` };
+		return this.saveProject({ name: name ?? title, path: normalizedPath });
+	}
+
+	async resolveProject(input = {}) {
+		if (input.projectId) {
+			const projects = await this.listProjects();
+			const project = projects.find((item) => item.id === String(input.projectId));
+			if (!project) throw new Error("Selected Project is no longer configured.");
+			return { project, reused: true };
+		}
+		if (input.projectPath || input.path || input.linkedDirectory) {
+			return this.ensureProjectForPath(input.projectPath || input.path || input.linkedDirectory, { name: input.projectName || input.name });
+		}
+		throw new Error("Project is required.");
+	}
+
+	projectSnapshot(project) {
+		return project ? { id: project.id, name: project.name, path: project.path, isGitRepository: !!project.isGitRepository } : null;
+	}
+
+	async projectTicketCounts(projectId) {
+		const issues = await this.listIssues();
+		let active = 0;
+		let completed = 0;
+		for (const issue of issues) {
+			if (issue.metadata.projectId !== projectId) continue;
+			if (issue.metadata.lane === LANE.COMPLETED) completed += 1;
+			else active += 1;
+		}
+		return { active, completed };
+	}
+
+	async updateIssueProjectSnapshots(project) {
+		const issues = await this.listIssues();
+		for (const issue of issues) {
+			if (issue.metadata.projectId !== project.id) continue;
+			await this.writeMetadata(issue.metadata.id, {
+				...issue.metadata,
+				linkedDirectory: project.path,
+				project: this.projectSnapshot(project),
+			});
+		}
+	}
+
+	async deleteProject(id) {
+		await this.backfillProjectsFromIssues();
+		const projectId = String(id || "").trim();
+		const projects = await this.readProjectsRaw();
+		const project = projects.find((item) => item.id === projectId);
+		if (!project) throw new Error("Project is no longer configured.");
+		const counts = await this.projectTicketCounts(projectId);
+		if (counts.active > 0) throw new Error("Cannot delete a Project with active tickets.");
+		const issues = await this.listIssues();
+		const removedIds = [];
+		for (const issue of issues) {
+			if (issue.metadata.projectId === projectId && issue.metadata.lane === LANE.COMPLETED) {
+				await fsp.rm(this.issueDir(issue.metadata.id), { recursive: true, force: true });
+				removedIds.push(issue.metadata.id);
+			}
+		}
+		const nextProjects = projects.filter((item) => item.id !== projectId);
+		await this.writeProjects(nextProjects);
+		this.emitChange({ type: "project_deleted", id: projectId, removedIssueIds: removedIds });
+		return { project, projects: nextProjects, removedIssueIds: removedIds, removedCount: removedIds.length };
+	}
+
+	async backfillProjectsFromIssues() {
+		await this.init();
+		const ids = await this.listIssueIds();
+		if (!ids.length) return { projectsCreated: 0, issuesUpdated: 0 };
+		let projects = await this.readProjectsRaw();
+		let projectsChanged = false;
+		let issuesUpdated = 0;
+		for (const id of ids) {
+			let issue;
+			try {
+				issue = await this.loadIssue(id);
+			} catch {
+				continue;
+			}
+			const metadata = issue.metadata;
+			if (metadata.projectId || !metadata.linkedDirectory) continue;
+			let project;
+			try {
+				const normalizedPath = this.normalizeProjectPath(metadata.linkedDirectory);
+				project = projects.find((item) => item.path === normalizedPath);
+				if (!project) {
+					const gitMetadata = await this.projectGitMetadata(normalizedPath).catch(() => ({ isGitRepository: false, git: null }));
+					project = this.normalizeProject({
+						id: this.projectIdForPath(normalizedPath),
+						name: this.defaultProjectName(normalizedPath),
+						path: normalizedPath,
+						...gitMetadata,
+					});
+					projects.push(project);
+					projectsChanged = true;
+				}
+			} catch {
+				continue;
+			}
+			await this.writeMetadata(id, {
+				...metadata,
+				linkedDirectory: project.path,
+				projectId: project.id,
+				project: this.projectSnapshot(project),
+			});
+			issuesUpdated += 1;
+		}
+		if (projectsChanged) {
+			projects = projects.sort((a, b) => a.name.localeCompare(b.name) || a.path.localeCompare(b.path));
+			await this.writeProjects(projects);
+			this.emitChange({ type: "projects_backfilled" });
+		}
+		return { projectsCreated: projectsChanged ? projects.length : 0, issuesUpdated };
 	}
 
 	defaultProfile() {
@@ -173,10 +421,10 @@ export class IssueStore {
 		return { dependencyId, dependency };
 	}
 
-	async createIssue({ title, spec, linkedDirectory, agentSettings, dependencyIssueId, backlog = false }) {
+	async createIssue({ title, spec, linkedDirectory, projectId, projectName, projectPath, gitRequest, agentSettings, dependencyIssueId, backlog = false }) {
 		if (!title || !String(title).trim()) throw new Error("Title is required.");
-		if (!linkedDirectory || !String(linkedDirectory).trim()) throw new Error("Linked directory is required.");
-		const linkedPath = normalizePath(linkedDirectory);
+		const { project } = await this.resolveProject({ projectId, projectName, projectPath, linkedDirectory });
+		const linkedPath = project.path;
 		const id = makeId(title);
 		const { dependencyId, dependency } = await this.validateDependency(dependencyIssueId);
 		const initialLane = backlog ? LANE.BACKLOG : LANE.CREATED;
@@ -186,6 +434,9 @@ export class IssueStore {
 			title: String(title).trim(),
 			lane: initialLane,
 			linkedDirectory: linkedPath,
+			projectId: project.id,
+			project: this.projectSnapshot(project),
+			gitRequest: gitRequest || null,
 			createdAt,
 			updatedAt: createdAt,
 			automation: createAutomationState(),
@@ -216,17 +467,20 @@ export class IssueStore {
 		return this.loadIssue(id);
 	}
 
-	async updateBacklogIssue(id, { title, spec, linkedDirectory, agentSettings, dependencyIssueId } = {}) {
+	async updateBacklogIssue(id, { title, spec, linkedDirectory, projectId, projectName, projectPath, gitRequest, agentSettings, dependencyIssueId } = {}) {
 		const issue = await this.loadIssue(id);
 		if (issue.metadata.lane !== LANE.BACKLOG) throw new Error("Only Backlog issues can be edited this way.");
 		if (!title || !String(title).trim()) throw new Error("Title is required.");
-		if (!linkedDirectory || !String(linkedDirectory).trim()) throw new Error("Linked directory is required.");
-		const linkedPath = normalizePath(linkedDirectory);
+		const { project } = await this.resolveProject({ projectId, projectName, projectPath, linkedDirectory });
+		const linkedPath = project.path;
 		const { dependencyId, dependency } = await this.validateDependency(dependencyIssueId, { selfId: id });
 		const metadata = await this.writeMetadata(id, {
 			...issue.metadata,
 			title: String(title).trim(),
 			linkedDirectory: linkedPath,
+			projectId: project.id,
+			project: this.projectSnapshot(project),
+			gitRequest: gitRequest || null,
 			agentSettings,
 			dependencies: { issueId: dependencyId, resolvedAt: null },
 		});
@@ -519,6 +773,7 @@ export class IssueStore {
 	}
 
 	async getBoardState() {
+		await this.backfillProjectsFromIssues();
 		const issues = await this.listIssues();
 		const issuesById = new Map(issues.map((issue) => [issue.metadata.id, issue]));
 		const lanes = Object.fromEntries(LANES.map((lane) => [lane, []]));
@@ -544,10 +799,14 @@ export class IssueStore {
 				resume: session,
 			});
 		}
+		const projects = await this.listProjects({ skipBackfill: true });
+		const projectCounts = Object.fromEntries(await Promise.all(projects.map(async (project) => [project.id, await this.projectTicketCounts(project.id)])));
 		return {
 			dataRoot: this.dataRoot,
 			lanes,
 			issues: boardIssues,
+			projects,
+			projectCounts,
 		};
 	}
 

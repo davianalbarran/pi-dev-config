@@ -82,6 +82,57 @@ function dashboardCleanupTestSource(html) {
 	return `${dashboardDraftTestSource(html)}\nglobalThis.__dashboardCleanup = { cleanCompletedTickets, updateCleanCompletedButton, get loading() { return cleanupCompletedLoading; } };\n`;
 }
 
+function dashboardProjectTestSource(html) {
+	return `${dashboardDraftTestSource(html)}\nglobalThis.__dashboardProject = {\n\tsetProjects(nextProjects) { projects = nextProjects; state = { ...state, projects: nextProjects }; },\n\tselectProject(id) { selectedProjectId = id; },\n\tsetBranchMode(mode) { branchMode = mode; },\n\tget branchMode() { return branchMode; },\n\trenderGitBranchControls,\n\tupdateBranchValidationMessage,\n\tsaveProjectFromForm,\n};\n`;
+}
+
+function dashboardProjectVmContext(ids = []) {
+	const elements = new Map();
+	class FakeElement {
+		constructor(id) {
+			this.id = id;
+			this.value = "";
+			this.textContent = "";
+			this.hidden = false;
+			this.disabled = false;
+			this.options = [];
+			this._innerHTML = "";
+			this.validationMessage = "";
+		}
+		set innerHTML(value) {
+			this._innerHTML = String(value);
+			this.options = Array.from(this._innerHTML.matchAll(/<option value='([^']*)'/g), (match) => ({ value: match[1] }));
+			if (this.options.length && !this.value) this.value = this.options[0].value;
+		}
+		get innerHTML() {
+			return this._innerHTML;
+		}
+		setCustomValidity(message) {
+			this.validationMessage = String(message || "");
+		}
+		focus() {}
+	}
+	for (const id of ids) elements.set(id, new FakeElement(id));
+	return {
+		DEFAULT_PROFILE_ID,
+		LANE,
+		ROLE_DEFAULTS,
+		THINKING_LEVELS: ["low", "medium", "high", "xhigh"],
+		document: {
+			getElementById(id) {
+				return elements.get(id) || null;
+			},
+			querySelectorAll() {
+				return [];
+			},
+		},
+		window: { innerWidth: 1200, matchMedia: () => ({ matches: false }) },
+		fetch: async () => { throw new Error("unexpected fetch"); },
+		setTimeout(fn) { fn(); },
+		alert(message) { throw new Error(message); },
+	};
+}
+
 function dashboardDraftVmContext() {
 	const elements = new Map();
 	function classList() {
@@ -525,10 +576,15 @@ test("dashboard renderer injects runtime data", async () => {
 	assert.match(html, /id="open-share"/);
 	assert.match(html, /id="share-dialog"/);
 	assert.match(html, /id="share-qr"/);
-	assert.match(html, /id="linkedDirectory" name="linkedDirectory" list="linkedDirectorySuggestions"/);
-	assert.match(html, /id="linkedDirectoryQuickSelect"/);
+	assert.match(html, /id="open-add-project"/);
+	assert.match(html, /id="projects-tab"/);
+	assert.match(html, /id="projects-view"/);
+	assert.match(html, /id="projectSelect" name="projectId"/);
+	assert.match(html, /id="linkedDirectory" name="linkedDirectory" type="hidden"/);
 	assert.match(html, /class="secondary desktop-directory-picker" id="pick-directory"/);
-	assert.match(html, /id="linkedDirectorySuggestions"/);
+	assert.match(html, /id="inlineProjectName"/);
+	assert.match(html, /id="inlineProjectPath"/);
+	assert.match(html, /id="git-branch-controls"/);
 	assert.match(html, /id="spec-wand"/);
 	assert.match(html, /Improve spec with Spec Writer/);
 	assert.match(html, /id="improved-spec-container" hidden/);
@@ -541,10 +597,15 @@ test("dashboard renderer injects runtime data", async () => {
 	assert.match(html, /function resetSpecWriterState\(\)/);
 	assert.match(html, /function setSpecWriterLoading\(loading\)/);
 	assert.match(html, /function renderImprovedSpec\(\)/);
-	assert.match(html, /function linkedDirectoryChoices\(\)/);
+	assert.match(html, /function projectById\(id\)/);
 	assert.match(html, /function populateLinkedDirectoryOptions\(\)/);
-	assert.match(html, /linkedDirectory"\)\.addEventListener\("input"/);
-	assert.match(html, /linkedDirectoryQuickSelect"\)\.addEventListener\("change"/);
+	assert.match(html, /function projectGitStatusMessage\(project\)/);
+	assert.match(html, /function newBranchValidationError\(project, branchName, baseBranch\)/);
+	assert.match(html, /Selected Project is no longer configured\. Choose another Project before submitting\./);
+	assert.match(html, /Git branch controls unavailable:/);
+	assert.match(html, /Branch already exists: /);
+	assert.match(html, /projectSelect"\)\.addEventListener\("change"/);
+	assert.match(html, /save-inline-project"\)\.addEventListener\("click"/);
 	assert.match(html, /const pickDirectoryButton = document\.getElementById\("pick-directory"\);/);
 	assert.match(html, /style\?\.display === "none"/);
 	assert.match(html, /\/api\/share/);
@@ -697,6 +758,92 @@ test("dashboard event stream ingests live run events without full reload", async
 	assert.equal(ui.loadCalls, 1);
 	ui.handleEventStreamMessage({ data: "not json" });
 	assert.equal(ui.loadCalls, 2);
+});
+
+test("dashboard clears hidden new-branch validation when Project branch controls disappear", async () => {
+	const html = await renderDashboardHtml("test-token");
+	const context = dashboardProjectVmContext([
+		"git-branch-controls",
+		"branch-validation-message",
+		"existingBaseBranch",
+		"newBranchBase",
+		"newBranchName",
+		"new-branch-panel",
+	]);
+	const result = await vm.runInNewContext(`${dashboardProjectTestSource(html)}
+		(() => {
+			const gitProject = { id: "git", name: "Git Project", path: "/tmp/git", isGitRepository: true, git: { branches: ["main"], defaultBranch: "main" } };
+			const nonGitProject = { id: "plain", name: "Plain Project", path: "/tmp/plain", isGitRepository: false, git: { branches: [] } };
+			__dashboardProject.setProjects([gitProject, nonGitProject]);
+			__dashboardProject.selectProject("git");
+			__dashboardProject.setBranchMode("new");
+			document.getElementById("newBranchName").value = "";
+			__dashboardProject.renderGitBranchControls(gitProject);
+			const invalidMessage = document.getElementById("newBranchName").validationMessage;
+			__dashboardProject.selectProject("plain");
+			__dashboardProject.renderGitBranchControls(nonGitProject);
+			return {
+				invalidMessage,
+				clearedMessage: document.getElementById("newBranchName").validationMessage,
+				branchMessage: document.getElementById("branch-validation-message").textContent,
+				controlsHidden: document.getElementById("git-branch-controls").hidden,
+				panelHidden: document.getElementById("new-branch-panel").hidden,
+				newBranchDisabled: document.getElementById("newBranchName").disabled,
+				baseDisabled: document.getElementById("newBranchBase").disabled,
+				existingDisabled: document.getElementById("existingBaseBranch").disabled,
+				branchMode: __dashboardProject.branchMode,
+			};
+		})()
+	`, context);
+
+	assert.match(result.invalidMessage, /New branch name is required/);
+	assert.equal(result.clearedMessage, "");
+	assert.equal(result.branchMessage, "");
+	assert.equal(result.controlsHidden, true);
+	assert.equal(result.panelHidden, true);
+	assert.equal(result.newBranchDisabled, true);
+	assert.equal(result.baseDisabled, true);
+	assert.equal(result.existingDisabled, true);
+	assert.equal(result.branchMode, "existing");
+});
+
+test("dashboard keeps Project dialog open when duplicate path reuses an existing Project", async () => {
+	const html = await renderDashboardHtml("test-token");
+	const context = dashboardProjectVmContext([
+		"projectFormId",
+		"projectFormName",
+		"projectFormPath",
+		"project-form-message",
+		"project-dialog",
+	]);
+	const result = await vm.runInNewContext(`${dashboardProjectTestSource(html)}
+		(async () => {
+			let loadCalls = 0;
+			api = async (url, options) => {
+				return { reused: true, project: { id: "project-existing", name: "Existing App", path: "/work/app" } };
+			};
+			load = async () => { loadCalls += 1; };
+			document.getElementById("project-dialog").hidden = false;
+			document.getElementById("projectFormName").value = "Duplicate title";
+			document.getElementById("projectFormPath").value = "/work/app/";
+			await __dashboardProject.saveProjectFromForm();
+			return {
+				dialogHidden: document.getElementById("project-dialog").hidden,
+				message: document.getElementById("project-form-message").textContent,
+				idValue: document.getElementById("projectFormId").value,
+				nameValue: document.getElementById("projectFormName").value,
+				pathValue: document.getElementById("projectFormPath").value,
+				loadCalls,
+			};
+		})()
+	`, context);
+
+	assert.equal(result.dialogHidden, false);
+	assert.match(result.message, /Existing Project reused for that path: Existing App\./);
+	assert.equal(result.idValue, "project-existing");
+	assert.equal(result.nameValue, "Existing App");
+	assert.equal(result.pathValue, "/work/app");
+	assert.equal(result.loadCalls, 1);
 });
 
 test("dashboard preserves unsent feedback drafts across unrelated ticket refreshes", async () => {
@@ -1169,10 +1316,11 @@ test("server renders token-gated dashboard html", async () => {
 		assert.match(html, /Request Changes/);
 		assert.match(html, /Depends on issue/);
 		assert.match(html, /dependencyIssueId/);
-		assert.match(html, /linkedDirectoryQuickSelect/);
+		assert.match(html, /projects-tab/);
+		assert.match(html, /projectSelect/);
 		assert.match(html, /class="secondary desktop-directory-picker" id="pick-directory"/);
-		assert.match(html, /linkedDirectorySuggestions/);
-		assert.match(html, /function linkedDirectoryChoices\(\)/);
+		assert.match(html, /inlineProjectPath/);
+		assert.match(html, /function projectById\(id\)/);
 		assert.match(html, /populateLinkedDirectoryOptions\(\);/);
 		assert.match(html, /minimizedIssueIds\.has\(id\)/);
 		assert.match(html, /let issueLaneById = new Map\(\);/);
@@ -1414,6 +1562,63 @@ test("server exposes authenticated agent session API", async () => {
 		assert.equal(body.session.messages[0].content, "persisted");
 		const traversal = await fetch(`${base}/api/issues/${encodeURIComponent(issue.metadata.id)}/runs/${encodeURIComponent("../run-api")}?token=session-token`);
 		assert.equal(traversal.status, 400);
+	} finally {
+		await server.stop();
+	}
+});
+
+test("server exposes authenticated project API", async () => {
+	const root = await tempDir();
+	const linked = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const reject = async () => {
+		throw new Error("not used");
+	};
+	const server = new OrchestratorServer({
+		store,
+		token: "project-token",
+		config: { host: "127.0.0.1", port: 0 },
+		actions: {
+			createIssue: reject,
+			comment: reject,
+			approvePlan: reject,
+			requestPlanChanges: reject,
+			approveReview: reject,
+			approveReviewAndMerge: reject,
+			requestReviewChanges: reject,
+		},
+	});
+	const url = await server.start();
+	const base = url.split("?")[0].replace(/\/$/, "");
+	try {
+		const denied = await fetch(`${base}/api/projects`);
+		assert.equal(denied.status, 401);
+
+		const created = await fetch(`${base}/api/projects?token=project-token`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ path: linked }),
+		});
+		assert.equal(created.status, 200);
+		const createdBody = await created.json();
+		assert.equal(createdBody.project.name, path.basename(linked));
+
+		const resolved = await fetch(`${base}/api/projects/resolve-path?token=project-token`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ path: `${linked}/` }),
+		});
+		assert.equal(resolved.status, 200);
+		const resolvedBody = await resolved.json();
+		assert.equal(resolvedBody.reused, true);
+		assert.equal(resolvedBody.project.id, createdBody.project.id);
+
+		const list = await fetch(`${base}/api/projects?token=project-token`);
+		assert.equal(list.status, 200);
+		const listBody = await list.json();
+		assert.equal(listBody.projects.length, 1);
+		assert.deepEqual(listBody.counts[createdBody.project.id], { active: 0, completed: 0 });
 	} finally {
 		await server.stop();
 	}
@@ -1921,6 +2126,66 @@ test("issue store retrieves persisted agent session history", async () => {
 	assert.equal(session.events.length, 2);
 	assert.equal(session.session.messages[0].content, "hello final");
 	assert.equal((await store.getAgentSession(issue.metadata.id, "run-2")).session.messages[0].content, "other run");
+});
+
+test("issue store creates and reuses Projects with default names", async () => {
+	const root = await tempDir();
+	const linked = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+
+	const saved = await store.saveProject({ path: `${linked}/` });
+	assert.equal(saved.reused, false);
+	assert.equal(saved.project.name, path.basename(linked));
+	assert.equal(saved.project.path, linked);
+
+	const duplicate = await store.saveProject({ name: "Duplicate", path: linked });
+	assert.equal(duplicate.reused, true);
+	assert.equal(duplicate.project.id, saved.project.id);
+
+	const issue = await store.createIssue({ title: "Use project", spec: "Work.", projectId: saved.project.id });
+	assert.equal(issue.metadata.projectId, saved.project.id);
+	assert.equal(issue.metadata.linkedDirectory, linked);
+	assert.deepEqual(issue.metadata.project, { id: saved.project.id, name: saved.project.name, path: linked, isGitRepository: false });
+});
+
+test("issue store backfills Projects from legacy linked-directory tickets", async () => {
+	const root = await tempDir();
+	const linked = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const first = await store.createIssue({ title: "Legacy one", spec: "One.", linkedDirectory: linked });
+	const second = await store.createIssue({ title: "Legacy two", spec: "Two.", linkedDirectory: `${linked}/` });
+	await fsp.rm(store.projectsPath, { force: true });
+	await patchIssueMetadata(store, first.metadata.id, { projectId: undefined, project: undefined, linkedDirectory: linked });
+	await patchIssueMetadata(store, second.metadata.id, { projectId: undefined, project: undefined, linkedDirectory: `${linked}/` });
+
+	const state = await store.getBoardState();
+	assert.equal(state.projects.length, 1);
+	assert.equal(state.projects[0].name, path.basename(linked));
+	const reloadedFirst = await store.loadIssue(first.metadata.id);
+	const reloadedSecond = await store.loadIssue(second.metadata.id);
+	assert.equal(reloadedFirst.metadata.projectId, state.projects[0].id);
+	assert.equal(reloadedSecond.metadata.projectId, state.projects[0].id);
+});
+
+test("issue store blocks Project deletion with active tickets and cleans completed history", async () => {
+	const root = await tempDir();
+	const activeDir = await tempDir();
+	const completedDir = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const activeProject = (await store.saveProject({ name: "Active", path: activeDir })).project;
+	await store.createIssue({ title: "Active project ticket", spec: "Keep.", projectId: activeProject.id, backlog: true });
+	await assert.rejects(() => store.deleteProject(activeProject.id), /active tickets/);
+
+	const completedProject = (await store.saveProject({ name: "Done", path: completedDir })).project;
+	const completed = await store.createIssue({ title: "Completed project ticket", spec: "Remove.", projectId: completedProject.id });
+	await store.setLane(completed.metadata.id, LANE.COMPLETED, "test");
+	const result = await store.deleteProject(completedProject.id);
+	assert.deepEqual(result.removedIssueIds, [completed.metadata.id]);
+	assert.equal(await exists(store.issueDir(completed.metadata.id)), false);
+	assert.equal((await store.listProjects()).some((project) => project.id === completedProject.id), false);
 });
 
 test("issue store cleans only old completed tickets into archive", async () => {
@@ -2524,6 +2789,105 @@ test("workspace manager creates a central git worktree and completion commit", a
 	const reloaded = await store.loadIssue(issue.metadata.id);
 	const completed = approveReview(reloaded.metadata);
 	assert.equal(completed.lane, LANE.COMPLETED);
+});
+
+test("workspace manager bases generated worktree branches on selected existing branch without switching checkout", async () => {
+	const root = await tempDir();
+	const repo = await tempDir();
+	await git(["init"], repo);
+	await git(["config", "user.email", "test@example.local"], repo);
+	await git(["config", "user.name", "Test User"], repo);
+	await fsp.writeFile(path.join(repo, "README.md"), "main\n", "utf-8");
+	await git(["add", "README.md"], repo);
+	await git(["commit", "-m", "initial"], repo);
+	const originalBranch = (await git(["branch", "--show-current"], repo)).stdout.trim();
+	await git(["branch", "base-for-ticket"], repo);
+
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const issue = await store.createIssue({
+		title: "Existing base branch",
+		spec: "Use base branch.",
+		linkedDirectory: repo,
+		gitRequest: { mode: "existing", baseBranch: "base-for-ticket" },
+	});
+	const workspace = await ensureIssueWorkspace(store, issue);
+	const prepared = await store.loadIssue(issue.metadata.id);
+
+	assert.equal(workspace.kind, "git-worktree");
+	assert.equal(prepared.metadata.git.baseBranch, "base-for-ticket");
+	assert.equal((await git(["branch", "--show-current"], repo)).stdout.trim(), originalBranch);
+	assert.equal((await git(["branch", "--show-current"], workspace.path)).stdout.trim(), prepared.metadata.git.branchName);
+});
+
+test("workspace manager fails invalid selected base branch without falling back to directory workspace", async () => {
+	const root = await tempDir();
+	const repo = await tempDir();
+	await git(["init"], repo);
+	await git(["config", "user.email", "test@example.local"], repo);
+	await git(["config", "user.name", "Test User"], repo);
+	await fsp.writeFile(path.join(repo, "README.md"), "main\n", "utf-8");
+	await git(["add", "README.md"], repo);
+	await git(["commit", "-m", "initial"], repo);
+	const originalBranch = (await git(["branch", "--show-current"], repo)).stdout.trim();
+
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const issue = await store.createIssue({
+		title: "Missing base branch",
+		spec: "Do not edit in place.",
+		linkedDirectory: repo,
+		gitRequest: { mode: "existing", baseBranch: "not-a-real-base" },
+	});
+
+	await assert.rejects(() => ensureIssueWorkspace(store, issue), /not-a-real-base\^\{commit\}|ambiguous argument|unknown revision/);
+	const reloaded = await store.loadIssue(issue.metadata.id);
+	assert.notEqual(reloaded.metadata.workspace?.kind, "directory");
+	await assert.rejects(() => fsp.access(path.join(root, "worktrees", issue.metadata.id)), /ENOENT/);
+	assert.equal((await git(["branch", "--show-current"], repo)).stdout.trim(), originalBranch);
+});
+
+test("workspace manager creates requested new branch without switching checkout", async () => {
+	const root = await tempDir();
+	const repo = await tempDir();
+	await git(["init"], repo);
+	await git(["config", "user.email", "test@example.local"], repo);
+	await git(["config", "user.name", "Test User"], repo);
+	await fsp.writeFile(path.join(repo, "README.md"), "main\n", "utf-8");
+	await git(["add", "README.md"], repo);
+	await git(["commit", "-m", "initial"], repo);
+	const originalBranch = (await git(["branch", "--show-current"], repo)).stdout.trim();
+
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const issue = await store.createIssue({
+		title: "New branch request",
+		spec: "Create a named branch.",
+		linkedDirectory: repo,
+		gitRequest: { mode: "new", baseBranch: originalBranch, newBranchName: "feature/pi-requested" },
+	});
+	const workspace = await ensureIssueWorkspace(store, issue);
+	const prepared = await store.loadIssue(issue.metadata.id);
+
+	assert.equal(prepared.metadata.git.branchName, "feature/pi-requested");
+	assert.equal((await git(["branch", "--show-current"], repo)).stdout.trim(), originalBranch);
+	assert.equal((await git(["branch", "--show-current"], workspace.path)).stdout.trim(), "feature/pi-requested");
+
+	const duplicate = await store.createIssue({
+		title: "Duplicate branch request",
+		spec: "Fail duplicate.",
+		linkedDirectory: repo,
+		gitRequest: { mode: "new", baseBranch: originalBranch, newBranchName: "feature/pi-requested" },
+	});
+	await assert.rejects(() => ensureIssueWorkspace(store, duplicate), /Branch already exists/);
+	const invalid = await store.createIssue({
+		title: "Invalid branch request",
+		spec: "Fail invalid.",
+		linkedDirectory: repo,
+		gitRequest: { mode: "new", baseBranch: originalBranch, newBranchName: "bad branch name" },
+	});
+	await assert.rejects(() => ensureIssueWorkspace(store, invalid), /Invalid branch name/);
+	assert.equal((await git(["branch", "--show-current"], repo)).stdout.trim(), originalBranch);
 });
 
 test("approve and merge starts merger rpc role and completes after squash merge", async () => {

@@ -10,6 +10,7 @@ export function workspaceSummary(metadata) {
 	const lines = [
 		`Issue ID: ${metadata.id}`,
 		`Title: ${metadata.title}`,
+		`Project: ${metadata.project?.name || metadata.projectId || "(not configured)"}`,
 		`Linked directory: ${metadata.linkedDirectory}`,
 		`Workspace: ${metadata.workspace?.path || "(not prepared)"}`,
 		`Workspace kind: ${metadata.workspace?.kind || "(unknown)"}`,
