@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { readFileSync } from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -51,6 +52,8 @@ import {
 } from "../src/workflow.js";
 
 const execFileAsync = promisify(execFile);
+const DASHBOARD_JS_SOURCE = readFileSync(new URL("../src/ui/dashboard.js", import.meta.url), "utf8");
+const DASHBOARD_CSS_SOURCE = readFileSync(new URL("../src/ui/dashboard.css", import.meta.url), "utf8");
 
 async function tempDir() {
 	return fsp.mkdtemp(path.join(os.tmpdir(), "pi-orchestrator-test-"));
@@ -60,22 +63,20 @@ async function git(args, cwd) {
 	return execFileAsync("git", args, { cwd, maxBuffer: 1024 * 1024 });
 }
 
-function dashboardNotificationTestSource(html) {
-	const laneDeclaration = html.match(/const LANE = .*?;\n/)?.[0];
-	assert.ok(laneDeclaration, "dashboard script declares LANE");
-	const start = html.indexOf("const HUMAN_INTERVENTION_LANES = new Set");
-	const end = html.indexOf("function resetSpecWriterState()", start);
+function dashboardNotificationTestSource() {
+	const start = DASHBOARD_JS_SOURCE.indexOf("const HUMAN_INTERVENTION_LANES = new Set");
+	const end = DASHBOARD_JS_SOURCE.indexOf("function resetSpecWriterState()", start);
 	assert.ok(start !== -1, "dashboard script declares notification state");
 	assert.ok(end > start, "dashboard script keeps notification helpers before spec writer helpers");
-	return laneDeclaration + html.slice(start, end);
+	return DASHBOARD_JS_SOURCE.slice(start, end);
 }
 
-function dashboardDraftTestSource(html) {
-	const start = html.indexOf("let state = { issues: [], lanes: {} };");
-	const end = html.indexOf("function populateLaneFilter()", start);
+function dashboardDraftTestSource() {
+	const start = DASHBOARD_JS_SOURCE.indexOf("let state = { issues: [], lanes: {} };");
+	const end = DASHBOARD_JS_SOURCE.indexOf("function populateLaneFilter()", start);
 	assert.ok(start !== -1, "dashboard script declares mutable state");
 	assert.ok(end > start, "dashboard script exposes load before DOM event bindings");
-	return html.slice(start, end);
+	return DASHBOARD_JS_SOURCE.slice(start, end);
 }
 
 function dashboardCleanupTestSource(html) {
@@ -240,6 +241,7 @@ function notificationVmContext({ permission, requestPermission, supported = true
 	};
 	const context = {
 		DEFAULT_PROFILE_ID: "default",
+		LANE,
 		button,
 		notifications,
 		get permissionRequests() { return permissionRequests; },
@@ -266,35 +268,32 @@ function notificationVmContext({ permission, requestPermission, supported = true
 	return context;
 }
 
-function dashboardResumeTestSource(html) {
-	const laneDeclaration = html.match(/const LANE = .*?;\n/)?.[0];
-	assert.ok(laneDeclaration, "dashboard script declares LANE");
-	const resumeHelpersStart = html.indexOf("function issueById(id)");
-	const resumeHelpersEnd = html.indexOf("function issueState(issue)", resumeHelpersStart);
-	const postResumeStart = html.indexOf("async function postResumeIssue(id)");
-	const escapeStart = html.indexOf("function escapeHtml(value)", postResumeStart);
-	const escapeEnd = html.indexOf("function renderInlineMarkdown(value)", escapeStart);
+function dashboardResumeTestSource() {
+	const resumeHelpersStart = DASHBOARD_JS_SOURCE.indexOf("function issueById(id)");
+	const resumeHelpersEnd = DASHBOARD_JS_SOURCE.indexOf("function issueState(issue)", resumeHelpersStart);
+	const postResumeStart = DASHBOARD_JS_SOURCE.indexOf("async function postResumeIssue(id)");
+	const escapeStart = DASHBOARD_JS_SOURCE.indexOf("function escapeHtml(value)", postResumeStart);
+	const escapeEnd = DASHBOARD_JS_SOURCE.indexOf("function renderInlineMarkdown(value)", escapeStart);
 	assert.ok(resumeHelpersStart !== -1 && resumeHelpersEnd > resumeHelpersStart, "dashboard script declares resume helpers");
 	assert.ok(postResumeStart !== -1 && escapeStart > postResumeStart && escapeEnd > escapeStart, "dashboard script declares resume action helpers");
 	return [
-		laneDeclaration,
 		"let state = { issues: [], lanes: {} };\n",
 		"const pendingResumeIssueIds = new Set();\n",
-		html.slice(resumeHelpersStart, resumeHelpersEnd),
-		html.slice(postResumeStart, escapeEnd),
+		DASHBOARD_JS_SOURCE.slice(resumeHelpersStart, resumeHelpersEnd),
+		DASHBOARD_JS_SOURCE.slice(postResumeStart, escapeEnd),
 		`\nglobalThis.__dashboardResume = {\n\tsetState(next) { state = next; },\n\tresumeEligibility,\n\tresumeDisabledReason,\n\trenderResumeAction,\n\tpostResumeIssue,\n\tisPending(id) { return pendingResumeIssueIds.has(id); },\n};\n`,
 	].join("");
 }
 
-function dashboardAgentSessionTestSource(html) {
-	const agentStart = html.indexOf("function agentSessionKey(issueId, runId)");
-	const agentEnd = html.indexOf("function renderDetail()", agentStart);
-	const timelineStart = html.indexOf("function renderTimeline(issue)");
-	const timelineEnd = html.indexOf("function bindDetailActions(issue)", timelineStart);
-	const eventStart = html.indexOf("function handleEventStreamMessage(message)");
-	const eventEnd = html.indexOf("function updateCleanCompletedButton()", eventStart);
-	const escapeStart = html.indexOf("function escapeHtml(value)");
-	const escapeEnd = html.indexOf("function renderMarkdown(input)", escapeStart);
+function dashboardAgentSessionTestSource() {
+	const agentStart = DASHBOARD_JS_SOURCE.indexOf("function agentSessionKey(issueId, runId)");
+	const agentEnd = DASHBOARD_JS_SOURCE.indexOf("function renderDetail()", agentStart);
+	const timelineStart = DASHBOARD_JS_SOURCE.indexOf("function renderTimeline(issue)");
+	const timelineEnd = DASHBOARD_JS_SOURCE.indexOf("function bindDetailActions(issue)", timelineStart);
+	const eventStart = DASHBOARD_JS_SOURCE.indexOf("function handleEventStreamMessage(message)");
+	const eventEnd = DASHBOARD_JS_SOURCE.indexOf("function updateCleanCompletedButton()", eventStart);
+	const escapeStart = DASHBOARD_JS_SOURCE.indexOf("function escapeHtml(value)");
+	const escapeEnd = DASHBOARD_JS_SOURCE.indexOf("function renderMarkdown(input)", escapeStart);
 	assert.ok(agentStart !== -1 && agentEnd > agentStart, "dashboard script declares agent session helpers");
 	assert.ok(timelineStart !== -1 && timelineEnd > timelineStart, "dashboard script declares timeline renderer");
 	assert.ok(eventStart !== -1 && eventEnd > eventStart, "dashboard script declares event stream handler");
@@ -302,10 +301,10 @@ function dashboardAgentSessionTestSource(html) {
 	return [
 		"const agentSessions = new Map();\nlet activeAgentStream = null;\nlet activeAgentStreamTarget = null;\nlet activeAgentStreamReady = false;\nlet selectedTimelineRunId = null;\nlet selectedTimelineSessionMissing = false;\nlet selectedId = null;\nlet detailTab = 'agent';\nlet renderDetailCalls = 0;\nlet loadCalls = 0;\nlet state = { issues: [] };\nconst TOKEN = 'test-token';\n",
 		"function formatDate(value) { return value || 'unknown'; }\nfunction renderDetail() { renderDetailCalls += 1; }\nasync function load() { loadCalls += 1; }\nfunction issueById(id) { return (state.issues || []).find((issue) => issue.id === id) || null; }\n",
-		html.slice(agentStart, agentEnd),
-		html.slice(timelineStart, timelineEnd),
-		html.slice(eventStart, eventEnd),
-		html.slice(escapeStart, escapeEnd),
+		DASHBOARD_JS_SOURCE.slice(agentStart, agentEnd),
+		DASHBOARD_JS_SOURCE.slice(timelineStart, timelineEnd),
+		DASHBOARD_JS_SOURCE.slice(eventStart, eventEnd),
+		DASHBOARD_JS_SOURCE.slice(escapeStart, escapeEnd),
 		`\nglobalThis.__dashboardAgentSession = {\n\tagentSessionKey,\n\tassembleAgentSessionForUi,\n\tloadAgentSession,\n\tcachedAgentSession,\n\trenderAgentSession,\n\trenderTimeline,\n\thandleEventStreamMessage,\n\thandleAgentStreamMessage,\n\tdesiredAgentStreamTarget,\n\topenAgentStream,\n\tcloseAgentStream,\n\tupdateAgentStreamSubscription,\n\tensureActiveAgentSessionLoaded,\n\tsetPayload(issueId, runId, payload) { agentSessions.set(agentSessionKey(issueId, runId), payload); },\n\tselectTimelineRun(runId) { selectedTimelineRunId = runId; selectedTimelineSessionMissing = false; },\n\tmarkTimelineMissing() { selectedTimelineSessionMissing = true; },\n\tsetSelected(issueId, tab = 'agent', runId = null) { selectedId = issueId; detailTab = tab; selectedTimelineRunId = runId; },\n\tsetState(nextState) { state = nextState; },\n\tget activeAgentStreamTarget() { return activeAgentStreamTarget; },\n\tget activeAgentStreamReady() { return activeAgentStreamReady; },\n\tget renderDetailCalls() { return renderDetailCalls; },\n\tget loadCalls() { return loadCalls; },\n};\n`,
 	].join("");
 }
@@ -568,111 +567,118 @@ test("local QR renderer returns an SVG for a LAN dashboard URL", () => {
 
 test("dashboard renderer injects runtime data", async () => {
 	const html = await renderDashboardHtml("test-token");
+	const source = `${html}\n${DASHBOARD_JS_SOURCE}\n${DASHBOARD_CSS_SOURCE}`;
 
-	assert.match(html, /const TOKEN = "test-token";/);
-	assert.match(html, /const LANES = \["Created","Planning"/);
-	assert.match(html, /"Backlog"/);
-	assert.match(html, /const KANBAN_LANES = \["Created","Planning"/);
-	assert.match(html, /const LANE = \{"CREATED":"Created"/);
-	assert.match(html, /"BACKLOG":"Backlog"/);
-	assert.match(html, /const ROLE_DEFAULTS = \{"planner":/);
-	assert.match(html, /const THINKING_LEVELS = \["low","medium","high","xhigh"\];/);
-	assert.match(html, /const DEFAULT_PROFILE_ID = "default";/);
-	assert.match(html, /id="create-drawer"/);
-	assert.match(html, /id="kanban-tab"/);
-	assert.match(html, /id="backlog-tab"/);
-	assert.match(html, />Kanban<\/button>/);
-	assert.match(html, />Backlog<\/button>/);
-	assert.match(html, /id="backlog-view"/);
-	assert.match(html, /Add to Backlog/);
-	assert.match(html, /Edit Issue/);
-	assert.match(html, /Send to Agent/);
-	assert.match(html, /data-delete-backlog/);
-	assert.match(html, /class='bad' data-delete-backlog=.*Delete/);
-	assert.match(html, /board\.hidden = activeView !== "kanban";/);
-	assert.match(html, /backlog\.hidden = activeView !== "backlog";/);
-	assert.match(html, /if \(activeView !== "kanban"\) return;\s*for \(const lane of KANBAN_LANES\)/);
-	assert.match(html, /for \(const lane of KANBAN_LANES\)/);
-	assert.match(html, /const KANBAN_LANES =/);
-	assert.match(html, /id="enable-notifications"/);
-	assert.match(html, /id="enable-notifications" class="secondary" hidden disabled/);
-	assert.match(html, /id="clean-completed" class="secondary clean-completed-button"/);
-	assert.match(html, /Clean completed tickets/);
-	assert.match(html, /let cleanupCompletedLoading = false;/);
-	assert.match(html, /async function cleanCompletedTickets\(\)/);
-	assert.match(html, /api\("\/api\/issues\/clean-completed", \{ method: "POST", body: "\{\}" \}\)/);
-	assert.match(html, /No old completed tickets to clean\./);
-	assert.match(html, /Cleanup failed:/);
-	assert.match(html, /document\.getElementById\("clean-completed"\)\.addEventListener\("click"/);
-	assert.match(html, /Notification\.permission/);
-	assert.match(html, /Notification\.requestPermission\(\)/);
-	assert.match(html, /new Notification\(/);
-	assert.match(html, /const HUMAN_INTERVENTION_LANES = new Set\(\[LANE\.PLAN_REVIEW, LANE\.IN_REVIEW\]\);/);
-	assert.match(html, /function syncHumanInterventionNotifications\(nextState\)/);
-	assert.match(html, /id="open-share"/);
-	assert.match(html, /id="share-dialog"/);
-	assert.match(html, /id="share-qr"/);
-	assert.match(html, /id="open-add-project"/);
-	assert.match(html, /id="projects-tab"/);
-	assert.match(html, /id="projects-view"/);
-	assert.match(html, /id="projectSelect" name="projectId"/);
-	assert.match(html, /id="linkedDirectory" name="linkedDirectory" type="hidden"/);
-	assert.match(html, /class="secondary desktop-directory-picker" id="pick-directory"/);
-	assert.match(html, /id="inlineProjectName"/);
-	assert.match(html, /id="inlineProjectPath"/);
-	assert.match(html, /id="git-branch-controls"/);
-	assert.match(html, /id="spec-wand"/);
-	assert.match(html, /Improve spec with Spec Writer/);
-	assert.match(html, /id="improved-spec-container" hidden/);
-	assert.match(html, />Improved Spec<\/h3>/);
-	assert.match(html, /id="accept-improved-spec"/);
-	assert.match(html, /id="reject-improved-spec"/);
-	assert.match(html, /id="refine-improved-spec"/);
-	assert.match(html, /class="spinner"/);
-	assert.match(html, /\/api\/spec\/improve/);
-	assert.match(html, /function resetSpecWriterState\(\)/);
-	assert.match(html, /function setSpecWriterLoading\(loading\)/);
-	assert.match(html, /function renderImprovedSpec\(\)/);
-	assert.match(html, /function projectById\(id\)/);
-	assert.match(html, /function populateLinkedDirectoryOptions\(\)/);
-	assert.match(html, /function projectGitStatusMessage\(project\)/);
-	assert.match(html, /function newBranchValidationError\(project, branchName, baseBranch\)/);
-	assert.match(html, /Selected Project is no longer configured\. Choose another Project before submitting\./);
-	assert.match(html, /Git branch controls unavailable:/);
-	assert.match(html, /Branch already exists: /);
-	assert.match(html, /projectSelect"\)\.addEventListener\("change"/);
-	assert.match(html, /save-inline-project"\)\.addEventListener\("click"/);
-	assert.match(html, /const pickDirectoryButton = document\.getElementById\("pick-directory"\);/);
-	assert.match(html, /style\?\.display === "none"/);
-	assert.match(html, /\/api\/share/);
-	assert.match(html, /\/api\/share\.svg/);
-	assert.match(html, /function shareSvgUrl\(cacheKey = Date\.now\(\)\)/);
-	assert.match(html, /"&_=" \+ encodeURIComponent\(cacheKey\)/);
-	assert.match(html, /qr\.alt = "Loading dashboard QR code…";/);
-	assert.match(html, /qr\.onerror = \(\) => \{/);
-	assert.match(html, /QR code failed to load\. Use the URL above or refresh the dialog\./);
-	assert.match(html, /<div class="brand-mark" aria-label="Pi">π<\/div>/);
-	assert.doesNotMatch(html, /<div class="brand-mark">PI<\/div>/);
-	assert.match(html, /const feedbackDraftsByIssueId = new Map\(\);/);
-	assert.match(html, /function captureFeedbackDraft\(issueId = currentFeedbackDraftKey\(\)\)/);
-	assert.match(html, /if \(feedback\) feedback\.value = feedbackDraft\(issue\.id\);/);
-	assert.match(html, /feedback\.addEventListener\("input", \(\) => feedbackDraftsByIssueId\.set\(issue\.id, feedback\.value\)\)/);
-	assert.match(html, /const minimizedIssueIds = new Set\(\);/);
-	assert.match(html, /const pendingResumeIssueIds = new Set\(\);/);
-	assert.match(html, /let issueLaneById = new Map\(\);/);
-	assert.match(html, /function minimizedTitle\(title\)/);
-	assert.match(html, /function syncCompletedTicketMinimization\(nextState\)/);
-	assert.match(html, /issue\.lane === LANE\.COMPLETED && previousLane !== LANE\.COMPLETED/);
-	assert.match(html, /minimizedIssueIds\.add\(issue\.id\);/);
-	assert.match(html, /issueLaneById = nextIssueLaneById;/);
-	assert.match(html, /const nextState = await api\("\/api\/state"\);/);
-	assert.match(html, /const nextState = await api\("\/api\/state"\);\s*captureFeedbackDraft\(\);\s*syncCompletedTicketMinimization\(nextState\);\s*syncHumanInterventionNotifications\(nextState\);\s*state = nextState;/);
-	const cardActionsStart = html.indexOf("\"<div class='card-actions'>\" +");
-	const cardHeadBeforeActions = html.lastIndexOf("\"<div class='card-head'>\" +", cardActionsStart);
-	const badgeInCardActions = html.indexOf("\"<span class='badge \" + badgeClass(issue) + \"'>\" + escapeHtml(stateLabel(issue)) + \"</span>\" +", cardActionsStart);
-	const toggleInCardActions = html.indexOf("toggleButton +", badgeInCardActions);
-	const expandedTitleAfterActions = html.indexOf("\"<div class='card-title'>\" + escapeHtml(issue.title) + \"</div>\" +", toggleInCardActions);
-	const expandedHeadClose = html.lastIndexOf("\"</div>\" +", expandedTitleAfterActions);
+	assert.match(html, /<link rel="stylesheet" href="\/ui\/dashboard\.css">/);
+	assert.match(html, /<script src="\/ui\/dashboard\.js"[\s\S]*data-token="&quot;test-token&quot;"[\s\S]*><\/script>/);
+	assert.doesNotMatch(html, /<style>[\s\S]*<\/style>/);
+	assert.doesNotMatch(html, /<script>\s*[\s\S]*?<\/script>/);
+
+	assert.match(html, /data-token="&quot;test-token&quot;"/);
+	assert.match(html, /data-lanes="\[&quot;Created&quot;,&quot;Planning&quot;/);
+	assert.match(html, /&quot;Backlog&quot;/);
+	assert.match(html, /data-kanban-lanes="\[&quot;Created&quot;,&quot;Planning&quot;/);
+	assert.match(html, /data-lane="\{&quot;CREATED&quot;:&quot;Created&quot;/);
+	assert.match(html, /&quot;BACKLOG&quot;:&quot;Backlog&quot;/);
+	assert.match(html, /data-role-defaults="\{&quot;planner&quot;:/);
+	assert.match(html, /data-thinking-levels="\[&quot;low&quot;,&quot;medium&quot;,&quot;high&quot;,&quot;xhigh&quot;\]"/);
+	assert.match(html, /data-default-profile-id="&quot;default&quot;"/);
+	assert.match(source, /const TOKEN = readDashboardConfig\("token"\);/);
+	assert.match(source, /id="create-drawer"/);
+	assert.match(source, /id="kanban-tab"/);
+	assert.match(source, /id="backlog-tab"/);
+	assert.match(source, />Kanban<\/button>/);
+	assert.match(source, />Backlog<\/button>/);
+	assert.match(source, /id="backlog-view"/);
+	assert.match(source, /Add to Backlog/);
+	assert.match(source, /Edit Issue/);
+	assert.match(source, /Send to Agent/);
+	assert.match(source, /data-delete-backlog/);
+	assert.match(source, /class='bad' data-delete-backlog=.*Delete/);
+	assert.match(source, /board\.hidden = activeView !== "kanban";/);
+	assert.match(source, /backlog\.hidden = activeView !== "backlog";/);
+	assert.match(source, /if \(activeView !== "kanban"\) return;\s*for \(const lane of KANBAN_LANES\)/);
+	assert.match(source, /for \(const lane of KANBAN_LANES\)/);
+	assert.match(source, /const KANBAN_LANES =/);
+	assert.match(source, /id="enable-notifications"/);
+	assert.match(source, /id="enable-notifications" class="secondary" hidden disabled/);
+	assert.match(source, /id="clean-completed" class="secondary clean-completed-button"/);
+	assert.match(source, /Clean completed tickets/);
+	assert.match(source, /let cleanupCompletedLoading = false;/);
+	assert.match(source, /async function cleanCompletedTickets\(\)/);
+	assert.match(source, /api\("\/api\/issues\/clean-completed", \{ method: "POST", body: "\{\}" \}\)/);
+	assert.match(source, /No old completed tickets to clean\./);
+	assert.match(source, /Cleanup failed:/);
+	assert.match(source, /document\.getElementById\("clean-completed"\)\.addEventListener\("click"/);
+	assert.match(source, /Notification\.permission/);
+	assert.match(source, /Notification\.requestPermission\(\)/);
+	assert.match(source, /new Notification\(/);
+	assert.match(source, /const HUMAN_INTERVENTION_LANES = new Set\(\[LANE\.PLAN_REVIEW, LANE\.IN_REVIEW\]\);/);
+	assert.match(source, /function syncHumanInterventionNotifications\(nextState\)/);
+	assert.match(source, /id="open-share"/);
+	assert.match(source, /id="share-dialog"/);
+	assert.match(source, /id="share-qr"/);
+	assert.match(source, /id="open-add-project"/);
+	assert.match(source, /id="projects-tab"/);
+	assert.match(source, /id="projects-view"/);
+	assert.match(source, /id="projectSelect" name="projectId"/);
+	assert.match(source, /id="linkedDirectory" name="linkedDirectory" type="hidden"/);
+	assert.match(source, /class="secondary desktop-directory-picker" id="pick-directory"/);
+	assert.match(source, /id="inlineProjectName"/);
+	assert.match(source, /id="inlineProjectPath"/);
+	assert.match(source, /id="git-branch-controls"/);
+	assert.match(source, /id="spec-wand"/);
+	assert.match(source, /Improve spec with Spec Writer/);
+	assert.match(source, /id="improved-spec-container" hidden/);
+	assert.match(source, />Improved Spec<\/h3>/);
+	assert.match(source, /id="accept-improved-spec"/);
+	assert.match(source, /id="reject-improved-spec"/);
+	assert.match(source, /id="refine-improved-spec"/);
+	assert.match(source, /class="spinner"/);
+	assert.match(source, /\/api\/spec\/improve/);
+	assert.match(source, /function resetSpecWriterState\(\)/);
+	assert.match(source, /function setSpecWriterLoading\(loading\)/);
+	assert.match(source, /function renderImprovedSpec\(\)/);
+	assert.match(source, /function projectById\(id\)/);
+	assert.match(source, /function populateLinkedDirectoryOptions\(\)/);
+	assert.match(source, /function projectGitStatusMessage\(project\)/);
+	assert.match(source, /function newBranchValidationError\(project, branchName, baseBranch\)/);
+	assert.match(source, /Selected Project is no longer configured\. Choose another Project before submitting\./);
+	assert.match(source, /Git branch controls unavailable:/);
+	assert.match(source, /Branch already exists: /);
+	assert.match(source, /projectSelect"\)\.addEventListener\("change"/);
+	assert.match(source, /save-inline-project"\)\.addEventListener\("click"/);
+	assert.match(source, /const pickDirectoryButton = document\.getElementById\("pick-directory"\);/);
+	assert.match(source, /style\?\.display === "none"/);
+	assert.match(source, /\/api\/share/);
+	assert.match(source, /\/api\/share\.svg/);
+	assert.match(source, /function shareSvgUrl\(cacheKey = Date\.now\(\)\)/);
+	assert.match(source, /"&_=" \+ encodeURIComponent\(cacheKey\)/);
+	assert.match(source, /qr\.alt = "Loading dashboard QR code…";/);
+	assert.match(source, /qr\.onerror = \(\) => \{/);
+	assert.match(source, /QR code failed to load\. Use the URL above or refresh the dialog\./);
+	assert.match(source, /<div class="brand-mark" aria-label="Pi">π<\/div>/);
+	assert.doesNotMatch(source, /<div class="brand-mark">PI<\/div>/);
+	assert.match(source, /const feedbackDraftsByIssueId = new Map\(\);/);
+	assert.match(source, /function captureFeedbackDraft\(issueId = currentFeedbackDraftKey\(\)\)/);
+	assert.match(source, /if \(feedback\) feedback\.value = feedbackDraft\(issue\.id\);/);
+	assert.match(source, /feedback\.addEventListener\("input", \(\) => feedbackDraftsByIssueId\.set\(issue\.id, feedback\.value\)\)/);
+	assert.match(source, /const minimizedIssueIds = new Set\(\);/);
+	assert.match(source, /const pendingResumeIssueIds = new Set\(\);/);
+	assert.match(source, /let issueLaneById = new Map\(\);/);
+	assert.match(source, /function minimizedTitle\(title\)/);
+	assert.match(source, /function syncCompletedTicketMinimization\(nextState\)/);
+	assert.match(source, /issue\.lane === LANE\.COMPLETED && previousLane !== LANE\.COMPLETED/);
+	assert.match(source, /minimizedIssueIds\.add\(issue\.id\);/);
+	assert.match(source, /issueLaneById = nextIssueLaneById;/);
+	assert.match(source, /const nextState = await api\("\/api\/state"\);/);
+	assert.match(source, /const nextState = await api\("\/api\/state"\);\s*captureFeedbackDraft\(\);\s*syncCompletedTicketMinimization\(nextState\);\s*syncHumanInterventionNotifications\(nextState\);\s*state = nextState;/);
+	const cardActionsStart = DASHBOARD_JS_SOURCE.indexOf("\"<div class='card-actions'>\" +");
+	const cardHeadBeforeActions = DASHBOARD_JS_SOURCE.lastIndexOf("\"<div class='card-head'>\" +", cardActionsStart);
+	const badgeInCardActions = DASHBOARD_JS_SOURCE.indexOf("\"<span class='badge \" + badgeClass(issue) + \"'>\" + escapeHtml(stateLabel(issue)) + \"</span>\" +", cardActionsStart);
+	const toggleInCardActions = DASHBOARD_JS_SOURCE.indexOf("toggleButton +", badgeInCardActions);
+	const expandedTitleAfterActions = DASHBOARD_JS_SOURCE.indexOf("\"<div class='card-title'>\" + escapeHtml(issue.title) + \"</div>\" +", toggleInCardActions);
+	const expandedHeadClose = DASHBOARD_JS_SOURCE.lastIndexOf("\"</div>\" +", expandedTitleAfterActions);
 	assert.ok(cardHeadBeforeActions !== -1, "expanded card renders an actions row");
 	assert.ok(cardActionsStart !== -1, "expanded card renders a card actions container");
 	assert.ok(badgeInCardActions !== -1, "expanded card actions render the state badge");
@@ -680,36 +686,37 @@ test("dashboard renderer injects runtime data", async () => {
 	assert.ok(badgeInCardActions < toggleInCardActions, "expanded card actions render the badge before the minimize button");
 	assert.ok(expandedHeadClose > toggleInCardActions, "expanded card closes the actions row before rendering the title");
 	assert.ok(expandedTitleAfterActions > expandedHeadClose, "expanded card title renders outside and after the card head");
-	const minimizedBranchStart = html.indexOf("if (minimized) {");
-	const minimizedHeadStart = html.indexOf("\"<div class='card-head'>\" +", minimizedBranchStart);
-	const minimizedToggle = html.indexOf("toggleButton +", minimizedHeadStart);
-	const minimizedHeadClose = html.indexOf("\"</div>\" +", minimizedToggle);
-	const minimizedTitleAfterHead = html.indexOf("\"<div class='card-title'>\" + escapeHtml(minimizedTitle(issue.title)) + \"</div>\"", minimizedHeadClose);
+	const minimizedBranchStart = DASHBOARD_JS_SOURCE.indexOf("if (minimized) {");
+	const minimizedHeadStart = DASHBOARD_JS_SOURCE.indexOf("\"<div class='card-head'>\" +", minimizedBranchStart);
+	const minimizedToggle = DASHBOARD_JS_SOURCE.indexOf("toggleButton +", minimizedHeadStart);
+	const minimizedHeadClose = DASHBOARD_JS_SOURCE.indexOf("\"</div>\" +", minimizedToggle);
+	const minimizedTitleAfterHead = DASHBOARD_JS_SOURCE.indexOf("\"<div class='card-title'>\" + escapeHtml(minimizedTitle(issue.title)) + \"</div>\"", minimizedHeadClose);
 	assert.ok(minimizedToggle > minimizedHeadStart, "minimized card renders the restore button in the card head");
 	assert.ok(minimizedTitleAfterHead > minimizedHeadClose, "minimized card title renders outside and after the card head");
-	assert.match(html, /data-minimize-toggle/);
-	assert.match(html, /aria-expanded='/);
-	assert.match(html, /Resume from last session/);
-	assert.match(html, /function resumeEligibility\(issue\)/);
-	assert.match(html, /function resumeDisabledReason\(issue\)/);
-	assert.match(html, /async function postResumeIssue\(id\)/);
-	assert.match(html, /pendingResumeIssueIds\.has\(id\)/);
-	assert.match(html, /api\("\/api\/issues\/" \+ encodeURIComponent\(id\) \+ "\/resume"/);
-	assert.match(html, /Resume request failed:/);
-	assert.match(html, /data-resume-issue=/);
-	assert.match(html, /diffs-section/);
-	assert.match(html, /function loadDiffsForSelectedIssue\(issue = issueById\(selectedId\), options = \{\}\)/);
-	assert.match(html, /data-diff-section-toggle/);
-	assert.match(html, /data-diff-file/);
-	assert.match(html, /renderUnifiedDiff/);
-	assert.match(html, /data-resize-panel="create"/);
-	assert.match(html, /data-resize-panel="detail"/);
-	assert.match(html, /function applyCreateDrawerWidth\(\)/);
-	assert.match(html, /function applyDetailPanelWidth\(\)/);
-	assert.match(html, /Agent Output/);
-	assert.match(html, /selectedId = issue\.metadata\.id;\n    detailTab = "report";\n    selectedTimelineRunId = null;/);
-	assert.match(html, /data-view-run/);
-	assert.doesNotMatch(html, /__(TOKEN|LANES|KANBAN_LANES|LANE|ROLE_DEFAULTS|THINKING_LEVELS|DEFAULT_PROFILE_ID)_JSON__/);
+	assert.match(source, /data-minimize-toggle/);
+	assert.match(source, /aria-expanded='/);
+	assert.match(source, /Resume from last session/);
+	assert.match(source, /function resumeEligibility\(issue\)/);
+	assert.match(source, /function resumeDisabledReason\(issue\)/);
+	assert.match(source, /async function postResumeIssue\(id\)/);
+	assert.match(source, /pendingResumeIssueIds\.has\(id\)/);
+	assert.match(source, /api\("\/api\/issues\/" \+ encodeURIComponent\(id\) \+ "\/resume"/);
+	assert.match(source, /Resume request failed:/);
+	assert.match(source, /data-resume-issue=/);
+	assert.match(source, /diffs-section/);
+	assert.match(source, /function loadDiffsForSelectedIssue\(issue = issueById\(selectedId\), options = \{\}\)/);
+	assert.match(source, /data-diff-section-toggle/);
+	assert.match(source, /data-diff-file/);
+	assert.match(source, /renderUnifiedDiff/);
+	assert.match(source, /data-resize-panel="create"/);
+	assert.match(source, /data-resize-panel="detail"/);
+	assert.match(source, /function applyCreateDrawerWidth\(\)/);
+	assert.match(source, /function applyDetailPanelWidth\(\)/);
+	assert.match(source, /Agent Output/);
+	assert.match(source, /selectedId = issue\.metadata\.id;\n    detailTab = "report";\n    selectedTimelineRunId = null;/);
+	assert.match(source, /data-view-run/);
+	assert.doesNotMatch(html, /__(TOKEN|LANES|KANBAN_LANES|LANE|ROLE_DEFAULTS|THINKING_LEVELS|DEFAULT_PROFILE_ID)_JSON(?:_ATTR)?__/);
+	assert.doesNotMatch(source, /__(TOKEN|LANES|KANBAN_LANES|LANE|ROLE_DEFAULTS|THINKING_LEVELS|DEFAULT_PROFILE_ID)_JSON__/);
 });
 
 test("dashboard renders agent sessions and timeline history states", async () => {
@@ -1196,6 +1203,7 @@ test("dashboard clean completed tickets action handles nothing-to-clean and fail
 test("dashboard resume helpers enable and disable blocked ticket actions", async () => {
 	const html = await renderDashboardHtml("test-token");
 	const context = {
+		LANE,
 		renderBoard() {},
 		renderDetail() {},
 		api: async () => ({}),
@@ -1250,6 +1258,7 @@ test("dashboard resume request prevents duplicates and reloads on success", asyn
 	let renderDetailCalls = 0;
 	const alerts = [];
 	const context = {
+		LANE,
 		renderBoard() { renderBoardCalls += 1; },
 		renderDetail() { renderDetailCalls += 1; },
 		api: async (url, options) => {
@@ -1285,6 +1294,7 @@ test("dashboard resume request surfaces failures and leaves retry available", as
 	const html = await renderDashboardHtml("test-token");
 	const alerts = [];
 	const context = {
+		LANE,
 		renderBoard() {},
 		renderDetail() {},
 		api: async () => { throw new Error("The last worker session file is unavailable."); },
@@ -1411,19 +1421,21 @@ test("dashboard notification permission states are graceful", async () => {
 
 test("dashboard css keeps the desktop board compact and stacks it on mobile", async () => {
 	const html = await renderDashboardHtml("test-token");
+	const css = DASHBOARD_CSS_SOURCE;
 
-	assert.match(html, /body \{[^}]*min-width: 0;[^}]*overflow-x: hidden;/);
-	assert.match(html, /\[hidden\] \{ display: none !important; \}/);
-	assert.doesNotMatch(html, /body \{[^}]*width: 100vw;/);
-	assert.match(html, /\.topbar \{[^}]*width: 100%;[^}]*min-width: 0;/);
-	assert.match(html, /\.top-actions \{[^}]*justify-content: flex-end;[^}]*min-width: 0;/);
-	assert.doesNotMatch(html, /\.top-actions \{[^}]*position: fixed;/);
-	assert.match(html, /\.app-shell \{[\s\S]*grid-template-rows: auto auto;[\s\S]*align-content: start;[\s\S]*min-height: calc\(100vh - 64px\);[\s\S]*width: 100%;/);
-	assert.doesNotMatch(html, /grid-template-rows: auto minmax\(0, auto\);/);
-	assert.match(html, /\.board \{[\s\S]*overflow-x: auto;[\s\S]*padding: 10px 18px 18px;/);
-	assert.match(html, /\.card-head \{[^}]*justify-content: flex-end;[^}]*margin-bottom: 6px;[^}]*min-width: 0;/);
-	assert.match(html, /\.card-title \{[^}]*display: block;[^}]*width: 100%;[^}]*overflow-wrap: anywhere;/);
-	const cardActionCss = html.match(/\.card-action \{([^}]*)\}/)?.[1] || "";
+	assert.match(html, /<link rel="stylesheet" href="\/ui\/dashboard\.css">/);
+	assert.match(css, /body \{[^}]*min-width: 0;[^}]*overflow-x: hidden;/);
+	assert.match(css, /\[hidden\] \{ display: none !important; \}/);
+	assert.doesNotMatch(css, /body \{[^}]*width: 100vw;/);
+	assert.match(css, /\.topbar \{[^}]*width: 100%;[^}]*min-width: 0;/);
+	assert.match(css, /\.top-actions \{[^}]*justify-content: flex-end;[^}]*min-width: 0;/);
+	assert.doesNotMatch(css, /\.top-actions \{[^}]*position: fixed;/);
+	assert.match(css, /\.app-shell \{[\s\S]*grid-template-rows: auto auto;[\s\S]*align-content: start;[\s\S]*min-height: calc\(100vh - 64px\);[\s\S]*width: 100%;/);
+	assert.doesNotMatch(css, /grid-template-rows: auto minmax\(0, auto\);/);
+	assert.match(css, /\.board \{[\s\S]*overflow-x: auto;[\s\S]*padding: 10px 18px 18px;/);
+	assert.match(css, /\.card-head \{[^}]*justify-content: flex-end;[^}]*margin-bottom: 6px;[^}]*min-width: 0;/);
+	assert.match(css, /\.card-title \{[^}]*display: block;[^}]*width: 100%;[^}]*overflow-wrap: anywhere;/);
+	const cardActionCss = css.match(/\.card-action \{([^}]*)\}/)?.[1] || "";
 	assert.ok(cardActionCss, "dashboard card action CSS rule exists");
 	assert.match(cardActionCss, /width: 26px;/);
 	assert.match(cardActionCss, /height: 26px;/);
@@ -1435,10 +1447,10 @@ test("dashboard css keeps the desktop board compact and stacks it on mobile", as
 	assert.match(cardActionCss, /align-self: center;/);
 	assert.doesNotMatch(cardActionCss, /height: 24px;/);
 	assert.doesNotMatch(cardActionCss, /padding: 0 7px;/);
-	assert.match(html, /\.minimized \.card-title \{ margin-bottom: 0; \}/);
-	assert.doesNotMatch(html, /\.card-head \{[^}]*justify-content: space-between;/);
-	assert.match(html, /@media \(max-width: 640px\) \{[\s\S]*\.desktop-directory-picker \{ display: none; \}[\s\S]*\.board \{[\s\S]*grid-template-columns: 1fr;[\s\S]*overflow-x: visible;[\s\S]*\}[\s\S]*\.lane \{ min-height: 180px; \}/);
-	assert.match(html, /@media \(hover: none\) and \(pointer: coarse\) \{\s*\.desktop-directory-picker \{ display: none; \}\s*\}/);
+	assert.match(css, /\.minimized \.card-title \{ margin-bottom: 0; \}/);
+	assert.doesNotMatch(css, /\.card-head \{[^}]*justify-content: space-between;/);
+	assert.match(css, /@media \(max-width: 640px\) \{[\s\S]*\.desktop-directory-picker \{ display: none; \}[\s\S]*\.board \{[\s\S]*grid-template-columns: 1fr;[\s\S]*overflow-x: visible;[\s\S]*\}[\s\S]*\.lane \{ min-height: 180px; \}/);
+	assert.match(css, /@media \(hover: none\) and \(pointer: coarse\) \{\s*\.desktop-directory-picker \{ display: none; \}\s*\}/);
 });
 
 test("server renders token-gated dashboard html", async () => {
@@ -1469,66 +1481,81 @@ test("server renders token-gated dashboard html", async () => {
 		const allowed = await fetch(url);
 		assert.equal(allowed.status, 200);
 		const html = await allowed.text();
-		assert.match(html, /const TOKEN = "test-token";/);
-		assert.match(html, /create-drawer/);
-		assert.match(html, /renderMarkdown/);
-		assert.match(html, /Plan Review Report/);
-		assert.match(html, /\.markdown :not\(pre\) > code \{[\s\S]*overflow-wrap: anywhere;[\s\S]*word-break: break-word;/);
-		assert.match(html, /\.app-shell \{[\s\S]*min-height: calc\(100vh - 64px\);[\s\S]*width: 100%;/);
-		assert.match(html, /\.board \{[\s\S]*align-items: start;[\s\S]*overflow-x: auto;/);
-		assert.match(html, /@media \(max-width: 640px\) \{[\s\S]*\.desktop-directory-picker \{ display: none; \}[\s\S]*\.board \{[\s\S]*grid-template-columns: 1fr;[\s\S]*overflow-x: visible;/);
-		assert.match(html, /@media \(hover: none\) and \(pointer: coarse\) \{\s*\.desktop-directory-picker \{ display: none; \}\s*\}/);
-		assert.match(html, /\.lane \{[\s\S]*min-height: 430px;[\s\S]*height: fit-content;/);
-		assert.match(html, /\.panel-resize-handle/);
-		assert.match(html, /--create-drawer-default-width: 460px;/);
-		assert.match(html, /--detail-panel-default-width: 520px;/);
-		assert.equal(html.includes("body { overflow: hidden; }"), false);
-		assert.match(html, /Approve and merge/);
-		assert.match(html, /function mergeTargetKey\(issue\)/);
-		assert.match(html, /function activeMergeForIssue\(issue\)/);
-		assert.match(html, /Merge blocked by/);
-		assert.match(html, /until its active merge is done/);
-		assert.match(html, /Approve and leave in worktree/);
-		assert.match(html, /Request Changes/);
-		assert.match(html, /Depends on issue/);
-		assert.match(html, /dependencyIssueId/);
-		assert.match(html, /projects-tab/);
-		assert.match(html, /projectSelect/);
-		assert.match(html, /class="secondary desktop-directory-picker" id="pick-directory"/);
-		assert.match(html, /inlineProjectPath/);
-		assert.match(html, /function projectById\(id\)/);
-		assert.match(html, /populateLinkedDirectoryOptions\(\);/);
-		assert.match(html, /minimizedIssueIds\.has\(id\)/);
-		assert.match(html, /let issueLaneById = new Map\(\);/);
-		assert.match(html, /function syncCompletedTicketMinimization\(nextState\)/);
-		assert.match(html, /syncCompletedTicketMinimization\(nextState\);/);
-		assert.match(html, /escapeHtml\(minimizedTitle\(issue\.title\)\)/);
-		assert.match(html, /event\.target\.closest\("\[data-minimize-toggle\]"\)/);
-		assert.match(html, /Minimize ticket/);
-		assert.match(html, /Restore ticket/);
-		const formElCapture = html.indexOf("const formEl = event.currentTarget;");
-		const createApiCall = html.indexOf('await api("/api/issues"');
+		assert.match(html, /<link rel="stylesheet" href="\/ui\/dashboard\.css">/);
+		assert.match(html, /<script src="\/ui\/dashboard\.js"[\s\S]*data-token="&quot;test-token&quot;"[\s\S]*><\/script>/);
+		assert.doesNotMatch(html, /<style>[\s\S]*<\/style>/);
+		assert.doesNotMatch(html, /<script>\s*[\s\S]*?<\/script>/);
+
+		const base = url.split("?")[0].replace(/\/$/, "");
+		const cssResponse = await fetch(`${base}/ui/dashboard.css`);
+		assert.equal(cssResponse.status, 200);
+		assert.match(cssResponse.headers.get("content-type") || "", /text\/css/);
+		const css = await cssResponse.text();
+		const jsResponse = await fetch(`${base}/ui/dashboard.js`);
+		assert.equal(jsResponse.status, 200);
+		assert.match(jsResponse.headers.get("content-type") || "", /text\/javascript/);
+		const js = await jsResponse.text();
+		const source = `${html}\n${css}\n${js}`;
+		assert.match(html, /data-token="&quot;test-token&quot;"/);
+		assert.match(source, /create-drawer/);
+		assert.match(source, /renderMarkdown/);
+		assert.match(source, /Plan Review Report/);
+		assert.match(source, /\.markdown :not\(pre\) > code \{[\s\S]*overflow-wrap: anywhere;[\s\S]*word-break: break-word;/);
+		assert.match(source, /\.app-shell \{[\s\S]*min-height: calc\(100vh - 64px\);[\s\S]*width: 100%;/);
+		assert.match(source, /\.board \{[\s\S]*align-items: start;[\s\S]*overflow-x: auto;/);
+		assert.match(source, /@media \(max-width: 640px\) \{[\s\S]*\.desktop-directory-picker \{ display: none; \}[\s\S]*\.board \{[\s\S]*grid-template-columns: 1fr;[\s\S]*overflow-x: visible;/);
+		assert.match(source, /@media \(hover: none\) and \(pointer: coarse\) \{\s*\.desktop-directory-picker \{ display: none; \}\s*\}/);
+		assert.match(source, /\.lane \{[\s\S]*min-height: 430px;[\s\S]*height: fit-content;/);
+		assert.match(source, /\.panel-resize-handle/);
+		assert.match(source, /--create-drawer-default-width: 460px;/);
+		assert.match(source, /--detail-panel-default-width: 520px;/);
+		assert.equal(source.includes("body { overflow: hidden; }"), false);
+		assert.match(source, /Approve and merge/);
+		assert.match(source, /function mergeTargetKey\(issue\)/);
+		assert.match(source, /function activeMergeForIssue\(issue\)/);
+		assert.match(source, /Merge blocked by/);
+		assert.match(source, /until its active merge is done/);
+		assert.match(source, /Approve and leave in worktree/);
+		assert.match(source, /Request Changes/);
+		assert.match(source, /Depends on issue/);
+		assert.match(source, /dependencyIssueId/);
+		assert.match(source, /projects-tab/);
+		assert.match(source, /projectSelect/);
+		assert.match(source, /class="secondary desktop-directory-picker" id="pick-directory"/);
+		assert.match(source, /inlineProjectPath/);
+		assert.match(source, /function projectById\(id\)/);
+		assert.match(source, /populateLinkedDirectoryOptions\(\);/);
+		assert.match(source, /minimizedIssueIds\.has\(id\)/);
+		assert.match(source, /let issueLaneById = new Map\(\);/);
+		assert.match(source, /function syncCompletedTicketMinimization\(nextState\)/);
+		assert.match(source, /syncCompletedTicketMinimization\(nextState\);/);
+		assert.match(source, /escapeHtml\(minimizedTitle\(issue\.title\)\)/);
+		assert.match(source, /event\.target\.closest\("\[data-minimize-toggle\]"\)/);
+		assert.match(source, /Minimize ticket/);
+		assert.match(source, /Restore ticket/);
+		const formElCapture = source.indexOf("const formEl = event.currentTarget;");
+		const createApiCall = source.indexOf('await api("/api/issues"');
 		assert.ok(formElCapture !== -1, "issue form submit handler captures currentTarget before async work");
 		assert.ok(createApiCall !== -1, "issue form submit handler creates issues through the API");
 		assert.ok(formElCapture < createApiCall, "issue form stores currentTarget before awaiting issue creation");
-		assert.match(html, /const form = new FormData\(formEl\);/);
-		assert.match(html, /formEl\.reset\(\);/);
-		assert.doesNotMatch(html, /event\.currentTarget\.reset\(\);/);
-		assert.match(html, /profileSelect/);
-		assert.match(html, /Settings differ from selected profile/);
-		assert.match(html, /Save to selected profile/);
-		assert.match(html, /Save as new profile/);
-		assert.match(html, /Diffs appear once work reaches In Progress/);
-		assert.match(html, /\/api\/issues\/" \+ encodeURIComponent\(issue\.id\) \+ "\/diffs/);
-		assert.match(html, /diff-file-toggle/);
-		assert.match(html, /Agent Output/);
-		assert.match(html, /function renderAgentSession\(issue, runId/);
-		assert.match(html, /data-view-run/);
-		assert.match(html, /\/api\/issues\/" \+ encodeURIComponent\(issueId\) \+ "\/runs\//);
-		assert.match(html, /partialResult/);
-		assert.match(html, /toolEventIsError/);
-		assert.match(html, /isError/);
-		assert.match(html, /handleEventStreamMessage/);
+		assert.match(source, /const form = new FormData\(formEl\);/);
+		assert.match(source, /formEl\.reset\(\);/);
+		assert.doesNotMatch(source, /event\.currentTarget\.reset\(\);/);
+		assert.match(source, /profileSelect/);
+		assert.match(source, /Settings differ from selected profile/);
+		assert.match(source, /Save to selected profile/);
+		assert.match(source, /Save as new profile/);
+		assert.match(source, /Diffs appear once work reaches In Progress/);
+		assert.match(source, /\/api\/issues\/" \+ encodeURIComponent\(issue\.id\) \+ "\/diffs/);
+		assert.match(source, /diff-file-toggle/);
+		assert.match(source, /Agent Output/);
+		assert.match(source, /function renderAgentSession\(issue, runId/);
+		assert.match(source, /data-view-run/);
+		assert.match(source, /\/api\/issues\/" \+ encodeURIComponent\(issueId\) \+ "\/runs\//);
+		assert.match(source, /partialResult/);
+		assert.match(source, /toolEventIsError/);
+		assert.match(source, /isError/);
+		assert.match(source, /handleEventStreamMessage/);
 	} finally {
 		await server.stop();
 	}

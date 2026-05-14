@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import * as http from "node:http";
 import * as os from "node:os";
 import { execFile } from "node:child_process";
@@ -10,6 +11,8 @@ import { renderDashboardHtml } from "./ui.js";
 import { assertSafeRunPathSegment } from "./store.js";
 
 const execFileAsync = promisify(execFile);
+const dashboardCssUrl = new URL("./ui/dashboard.css", import.meta.url);
+const dashboardJsUrl = new URL("./ui/dashboard.js", import.meta.url);
 
 export function isAuthorized(reqUrl, headers, token) {
 	const url = new URL(reqUrl, "http://127.0.0.1");
@@ -311,6 +314,14 @@ export class OrchestratorServer {
 				return sendText(res, 401, "Missing or invalid orchestrator token.");
 			}
 			return sendText(res, 200, await renderDashboardHtml(this.token), "text/html; charset=utf-8");
+		}
+
+		if (pathname === "/ui/dashboard.css" && req.method === "GET") {
+			return sendText(res, 200, await readFile(dashboardCssUrl, "utf-8"), "text/css; charset=utf-8");
+		}
+
+		if (pathname === "/ui/dashboard.js" && req.method === "GET") {
+			return sendText(res, 200, await readFile(dashboardJsUrl, "utf-8"), "text/javascript; charset=utf-8");
 		}
 
 		if (!pathname.startsWith("/api/")) {
