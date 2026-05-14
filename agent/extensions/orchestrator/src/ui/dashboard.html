@@ -2028,7 +2028,10 @@ function renderBacklog() {
           "<div class='backlog-title'>" + escapeHtml(issue.title) + "</div>" +
           "<div class='meta mono'>" + escapeHtml(shortId(issue.id)) + "</div>" +
         "</div>" +
-        "<button type='button' data-edit-backlog='" + escapeHtml(issue.id) + "'>Edit</button>" +
+        "<div class='actions'>" +
+          "<button type='button' data-edit-backlog='" + escapeHtml(issue.id) + "'>Edit</button>" +
+          "<button type='button' class='bad' data-delete-backlog='" + escapeHtml(issue.id) + "'>Delete</button>" +
+        "</div>" +
       "</div>" +
       "<div class='card-badges'>" +
         "<span class='badge'>" + escapeHtml(projectDisplay(issue)) + "</span>" +
@@ -3345,10 +3348,37 @@ document.getElementById("board").addEventListener("keydown", (event) => {
   renderBoard();
   renderDetail();
 });
-document.getElementById("backlog-list").addEventListener("click", (event) => {
+document.getElementById("backlog-list").addEventListener("click", async (event) => {
   const edit = event.target.closest("[data-edit-backlog]");
-  if (!edit) return;
-  openEditIssueDrawer(issueById(edit.dataset.editBacklog));
+  if (edit) {
+    openEditIssueDrawer(issueById(edit.dataset.editBacklog));
+    return;
+  }
+  const del = event.target.closest("[data-delete-backlog]");
+  if (!del || del.disabled) return;
+  const issue = issueById(del.dataset.deleteBacklog);
+  if (!issue) return;
+  const ok = confirm("Delete backlog issue \"" + issue.title + "\"? This cannot be undone.");
+  if (!ok) return;
+  try {
+    await api("/api/issues/" + encodeURIComponent(issue.id) + "/delete-backlog", { method: "POST", body: "{}" });
+    if (selectedId === issue.id || editingBacklogId === issue.id) {
+      selectedId = null;
+      selectedTimelineRunId = null;
+      detailTab = "report";
+    }
+    if (editingBacklogId === issue.id) {
+      const form = document.getElementById("issue-form");
+      if (form) form.reset();
+      selectedProjectId = "";
+      branchMode = "existing";
+      setIssueFormMode("create");
+      closeCreateDrawer();
+    }
+    await load();
+  } catch (error) {
+    alert(error.message);
+  }
 });
 
 document.getElementById("projects-list").addEventListener("click", (event) => {

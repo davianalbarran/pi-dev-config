@@ -386,6 +386,7 @@ export class OrchestratorRuntime {
 				return issue;
 			},
 			updateBacklogIssue: async (id, body) => this.store.updateBacklogIssue(id, body),
+			deleteBacklogIssue: async (id) => this.store.deleteBacklogIssue(id),
 			saveProject: async (body) => this.store.saveProject(body),
 			deleteProject: async (id) => this.store.deleteProject(id),
 			resolveProjectPath: async (body) => this.store.ensureProjectForPath(body.path || body.linkedDirectory, { name: body.name || body.title }),

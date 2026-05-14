@@ -587,6 +587,8 @@ test("dashboard renderer injects runtime data", async () => {
 	assert.match(html, /Add to Backlog/);
 	assert.match(html, /Edit Issue/);
 	assert.match(html, /Send to Agent/);
+	assert.match(html, /data-delete-backlog/);
+	assert.match(html, /class='bad' data-delete-backlog=.*Delete/);
 	assert.match(html, /board\.hidden = activeView !== "kanban";/);
 	assert.match(html, /backlog\.hidden = activeView !== "backlog";/);
 	assert.match(html, /if \(activeView !== "kanban"\) return;\s*for \(const lane of KANBAN_LANES\)/);
@@ -1862,7 +1864,7 @@ test("server exposes authenticated project API", async () => {
 	}
 });
 
-test("server routes backlog create, update, and send actions", async () => {
+test("server routes backlog create, update, delete, and send actions", async () => {
 	const root = await tempDir();
 	const store = new IssueStore({ dataRoot: root });
 	await store.init();
@@ -1886,6 +1888,10 @@ test("server routes backlog create, update, and send actions", async () => {
 			sendBacklogIssueToAgent: async (id) => {
 				calls.push(["send", id]);
 				return { metadata: { id, lane: LANE.CREATED } };
+			},
+			deleteBacklogIssue: async (id) => {
+				calls.push(["delete", id]);
+				return { id, removed: true };
 			},
 			comment: reject,
 			approvePlan: reject,
@@ -1925,6 +1931,14 @@ test("server routes backlog create, update, and send actions", async () => {
 		});
 		assert.equal(sent.status, 200);
 		assert.deepEqual(calls[2], ["send", "PI-backlog"]);
+
+		const deleted = await fetch(`${base}/api/issues/PI-backlog/delete-backlog?token=backlog-token`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: "{}",
+		});
+		assert.equal(deleted.status, 200);
+		assert.deepEqual(calls[3], ["delete", "PI-backlog"]);
 	} finally {
 		await server.stop();
 	}
@@ -2046,6 +2060,10 @@ test("runtime creates backlog issues without scheduling until they are sent", as
 
 	const sent = await actions.sendBacklogIssueToAgent(backlog.metadata.id);
 	assert.equal(sent.metadata.lane, LANE.CREATED);
+	assert.equal(queued, 1);
+
+	const removable = await actions.createIssue({ title: "Runtime removable backlog", spec: "Delete later.", linkedDirectory: linked, backlog: true });
+	assert.deepEqual(await actions.deleteBacklogIssue(removable.metadata.id), { id: removable.metadata.id, removed: true });
 	assert.equal(queued, 1);
 });
 
@@ -2877,6 +2895,37 @@ test("issue store creates, updates, and sends backlog issues", async () => {
 	state = await store.getBoardState();
 	assert.deepEqual(state.lanes[LANE.BACKLOG], []);
 	assert.deepEqual(state.lanes[LANE.CREATED], [issue.metadata.id]);
+});
+
+test("issue store deletes only backlog issues", async () => {
+	const root = await tempDir();
+	const linked = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const events = [];
+	store.onChange((event) => events.push(event));
+	const backlog = await store.createIssue({ title: "Delete backlog idea", spec: "Remove later.", linkedDirectory: linked, backlog: true });
+	await store.appendRunEvent(backlog.metadata.id, "run-delete-backlog", { type: "message_update", delta: "transient" });
+	await fsp.mkdir(path.join(root, "sessions", backlog.metadata.id), { recursive: true });
+	await fsp.writeFile(path.join(root, "sessions", backlog.metadata.id, "run.jsonl"), "{}\n", "utf-8");
+
+	await assert.rejects(() => store.deleteBacklogIssue(`../issues/${backlog.metadata.id}`), /Invalid issue id/);
+	assert.equal(await exists(store.issueDir(backlog.metadata.id)), true);
+	assert.equal(await exists(path.join(root, "sessions", backlog.metadata.id)), true);
+	assert.equal(events.some((event) => event.type === "backlog_issue_deleted"), false);
+
+	const result = await store.deleteBacklogIssue(backlog.metadata.id);
+	assert.deepEqual(result, { id: backlog.metadata.id, removed: true });
+	assert.equal(await exists(store.issueDir(backlog.metadata.id)), false);
+	assert.equal(await exists(path.join(root, "sessions", backlog.metadata.id)), false);
+	const state = await store.getBoardState();
+	assert.equal(state.issues.some((issue) => issue.id === backlog.metadata.id), false);
+	assert.equal(state.lanes[LANE.BACKLOG].includes(backlog.metadata.id), false);
+	assert.deepEqual(events.at(-1), { type: "backlog_issue_deleted", id: backlog.metadata.id });
+
+	const active = await store.createIssue({ title: "Keep active issue", spec: "Do not delete.", linkedDirectory: linked });
+	await assert.rejects(() => store.deleteBacklogIssue(active.metadata.id), /Only Backlog issues can be deleted this way/);
+	assert.equal(await exists(store.issueDir(active.metadata.id)), true);
 });
 
 test("issue store rejects sending a backlog issue blocked by another backlog issue", async () => {

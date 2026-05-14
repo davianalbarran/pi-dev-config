@@ -519,6 +519,16 @@ export class IssueStore {
 		return this.loadIssue(id);
 	}
 
+	async deleteBacklogIssue(id) {
+		const safeId = assertSafeRunPathSegment(id, "issue id");
+		const issue = await this.loadIssue(safeId);
+		if (issue.metadata.lane !== LANE.BACKLOG) throw new Error("Only Backlog issues can be deleted this way.");
+		await fsp.rm(this.issueDir(safeId), { recursive: true, force: true });
+		await this.removeIssueAgentStreamData(safeId);
+		this.emitChange({ type: "backlog_issue_deleted", id: safeId });
+		return { id: safeId, removed: true };
+	}
+
 	async sendBacklogIssueToAgent(id) {
 		const issue = await this.loadIssue(id);
 		if (issue.metadata.lane !== LANE.BACKLOG) throw new Error("Only Backlog issues can be sent to the agent.");
