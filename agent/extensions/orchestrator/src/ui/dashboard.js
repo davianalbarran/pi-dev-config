@@ -434,11 +434,18 @@ function issueById(id) {
   return state.issues.find((issue) => issue.id === id);
 }
 
+function mergeTargetBranch(issue) {
+  const request = issue?.git?.request || issue?.gitRequest || null;
+  const requestedNewBranch = String(request?.newBranchName || "").trim();
+  if (request?.mode === "new" && requestedNewBranch) return requestedNewBranch;
+  return String(issue?.git?.baseBranch || request?.baseBranch || "").trim();
+}
+
 function mergeTargetKey(issue) {
   const repoRoot = String(issue?.git?.repoRoot || "").trim();
-  const baseBranch = String(issue?.git?.baseBranch || "").trim();
-  if (!repoRoot || !baseBranch) return "";
-  return JSON.stringify([repoRoot, baseBranch]);
+  const targetBranch = mergeTargetBranch(issue);
+  if (!repoRoot || !targetBranch) return "";
+  return JSON.stringify([repoRoot, targetBranch]);
 }
 
 function activeMergeForIssue(issue) {
@@ -1882,7 +1889,7 @@ function renderDetail() {
       statusCell("Active", issue.automation?.activeRole ? issue.automation.activeRole + " " + (issue.automation.activeRunId || "") : "none") +
       statusCell("Attempts", (issue.automation?.planningAttempts || 0) + " planning / " + (issue.automation?.implementationAttempts || 0) + " implementation") +
       statusCell("Dependency", dependencyDisplay(issue)) +
-      statusCell("Worktree base", issue.git?.baseBranch || issue.gitRequest?.baseBranch || "none") +
+      statusCell("Merge target", mergeTargetBranch(issue) || "none") +
     "</div>" +
     "<div class='actions'>" +
       actionButtons.join("") +
@@ -1947,7 +1954,7 @@ function renderReport(issue) {
       "- Project: " + projectDisplay(issue),
       "- Linked directory: " + (issue.linkedDirectory || "unknown"),
       "- Workspace: " + (issue.workspace?.path || "not prepared"),
-      "- Worktree base branch: " + (issue.git?.baseBranch || issue.gitRequest?.baseBranch || "none"),
+      "- Merge target branch: " + (mergeTargetBranch(issue) || "none"),
       "- Dependency: " + dependencyDisplay(issue),
     ].join("\n");
   }

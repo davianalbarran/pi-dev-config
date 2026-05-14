@@ -151,12 +151,15 @@ export async function ensureIssueWorkspace(store, issue) {
 	}
 
 	const isNewBranchMode = gitRequest?.mode === "new";
-	const branchName = metadata.git?.branchName || (isNewBranchMode ? String(gitRequest?.newBranchName || "").trim() : branchNameForIssue(metadata.id, metadata.title));
+	const requestedNewBranch = String(gitRequest?.newBranchName || "").trim();
+	const mergeTargetBranch = isNewBranchMode ? requestedNewBranch : detected.git.baseBranch;
+	const branchName = metadata.git?.branchName || branchNameForIssue(metadata.id, metadata.title);
+	if (isNewBranchMode && !requestedNewBranch) throw new Error("New branch name is required.");
 	if (!branchName) throw new Error("New branch name is required.");
 	const worktreePath = metadata.git?.worktreePath || path.join(store.worktreesRoot, metadata.id);
 	const git = {
 		repoRoot: detected.git.repoRoot,
-		baseBranch: detected.git.baseBranch,
+		baseBranch: mergeTargetBranch,
 		baseSha: detected.git.baseSha,
 		branchName,
 		worktreePath,
@@ -167,8 +170,12 @@ export async function ensureIssueWorkspace(store, issue) {
 	await ensureDir(store.worktreesRoot);
 	if (!(await pathExists(worktreePath))) {
 		if (isNewBranchMode) {
-			await createBranchWithoutCheckout(git.repoRoot, branchName, git.baseSha);
-			await execGit(["-C", git.repoRoot, "worktree", "add", worktreePath, branchName], git.repoRoot);
+			const worktreeBranchValidation = await validateBranchName(git.repoRoot, branchName);
+			if (!worktreeBranchValidation.valid) throw new Error(worktreeBranchValidation.error);
+			if (mergeTargetBranch === branchName) throw new Error(`New branch name conflicts with generated worktree branch: ${branchName}`);
+			if (await branchExists(git.repoRoot, branchName)) throw new Error(`Branch already exists: ${branchName}`);
+			await createBranchWithoutCheckout(git.repoRoot, mergeTargetBranch, git.baseSha);
+			await execGit(["-C", git.repoRoot, "worktree", "add", "-b", branchName, worktreePath, mergeTargetBranch], git.repoRoot);
 		} else if (await branchExists(git.repoRoot, branchName)) {
 			await execGit(["-C", git.repoRoot, "worktree", "add", worktreePath, branchName], git.repoRoot);
 		} else {

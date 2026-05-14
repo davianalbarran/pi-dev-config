@@ -6,6 +6,17 @@ export function formatComments(comments, phase = null) {
 		.join("\n");
 }
 
+function gitRequestFor(metadata) {
+	return metadata?.git?.request || metadata?.gitRequest || null;
+}
+
+function mergeTargetBranchFor(metadata) {
+	const request = gitRequestFor(metadata);
+	const requestedNewBranch = String(request?.newBranchName || "").trim();
+	if (request?.mode === "new" && requestedNewBranch) return requestedNewBranch;
+	return String(metadata?.git?.baseBranch || "").trim();
+}
+
 export function workspaceSummary(metadata) {
 	const lines = [
 		`Issue ID: ${metadata.id}`,
@@ -16,10 +27,13 @@ export function workspaceSummary(metadata) {
 		`Workspace kind: ${metadata.workspace?.kind || "(unknown)"}`,
 	];
 	if (metadata.git) {
+		const request = gitRequestFor(metadata);
+		const mergeTargetBranch = mergeTargetBranchFor(metadata) || metadata.git.baseBranch;
 		lines.push(`Git repo: ${metadata.git.repoRoot}`);
-		lines.push(`Base branch: ${metadata.git.baseBranch}`);
-		lines.push(`Base SHA: ${metadata.git.baseSha}`);
-		lines.push(`Issue branch: ${metadata.git.branchName}`);
+		if (request?.mode === "new" && request.baseBranch) lines.push(`Starting branch: ${request.baseBranch}`);
+		lines.push(`Merge target branch: ${mergeTargetBranch}`);
+		lines.push(`Merge target base SHA: ${metadata.git.baseSha}`);
+		lines.push(`Issue worktree branch: ${metadata.git.branchName}`);
 		lines.push(`Worktree: ${metadata.git.worktreePath}`);
 	}
 	if (metadata.dependencies?.issueId) {
@@ -290,23 +304,23 @@ export function buildMergerPrompt(issue) {
 		.join("\n");
 	return [
 		"You are the merger agent for a local Pi orchestrator issue.",
-		"The user selected Approve and merge. Integrate the reviewed worktree branch into the base branch recorded below.",
+		"The user selected Approve and merge. Integrate the reviewed issue worktree branch into the merge target branch recorded below.",
 		"Do not push. Do not delete branches or worktrees. Keep any edits limited to resolving merge conflicts created by this merge.",
 		"",
 		"Required merge workflow:",
 		"1. Inspect the issue worktree and base repository status before changing anything.",
 		"2. If the issue worktree has uncommitted changes, stage and commit them on the issue branch with a concise Conventional Commit message.",
-		"3. Switch the base repository to the recorded base branch if needed, and ensure its working tree is clean before merging.",
-		"4. Pull the base branch with --ff-only when it has a configured upstream. If no upstream exists, continue with the local base branch and note that.",
-		"5. Run `git merge --squash <issue-branch>` from the recorded base branch. Resolve conflicts carefully if they occur.",
-		"6. Create exactly one base-branch commit for the squash merge. The final base-branch commit must be a Conventional Commit (for example, `feat(orchestrator): summarize issue changes`) with a body summarizing key changes made by the agents, using the issue spec, approved plan, human review report, and recent events below.",
+		"3. Switch the base repository to the recorded merge target branch if needed, and ensure its working tree is clean before merging.",
+		"4. Pull the merge target branch with --ff-only when it has a configured upstream. If no upstream exists, continue with the local merge target branch and note that.",
+		"5. Run `git merge --squash <issue-worktree-branch>` from the recorded merge target branch. Resolve conflicts carefully if they occur.",
+		"6. Create exactly one merge-target-branch commit for the squash merge. The final merge-target-branch commit must be a Conventional Commit (for example, `feat(orchestrator): summarize issue changes`) with a body summarizing key changes made by the agents, using the issue spec, approved plan, human review report, and recent events below.",
 		"7. Run the most relevant available verification command if it is obvious and reasonably scoped.",
 		"",
 		"Your first non-empty line must be exactly one of:",
 		"MERGE_RESULT: MERGED",
 		"MERGE_RESULT: BLOCKED",
 		"",
-		"Use MERGED only after the squash commit has been created on the recorded base branch. Use BLOCKED if the squash merge cannot be completed safely.",
+		"Use MERGED only after the squash commit has been created on the recorded merge target branch. Use BLOCKED if the squash merge cannot be completed safely.",
 		"After that line, include a concise Markdown summary with the squash commit created, verification run, and any follow-up needed.",
 		"",
 		"Workspace metadata:",

@@ -45,15 +45,26 @@ function errorMessage(error) {
 	return error instanceof Error ? error.message : String(error);
 }
 
+function gitRequestFor(metadata) {
+	return metadata?.git?.request || metadata?.gitRequest || null;
+}
+
+function mergeTargetBranch(metadata) {
+	const request = gitRequestFor(metadata);
+	const requestedNewBranch = String(request?.newBranchName || "").trim();
+	if (request?.mode === "new" && requestedNewBranch) return requestedNewBranch;
+	return String(metadata?.git?.baseBranch || "").trim();
+}
+
 function mergeTargetKey(metadata) {
 	const repoRoot = String(metadata?.git?.repoRoot || "").trim();
-	const baseBranch = String(metadata?.git?.baseBranch || "").trim();
-	if (!repoRoot || !baseBranch) return null;
-	return JSON.stringify([repoRoot, baseBranch]);
+	const targetBranch = mergeTargetBranch(metadata);
+	if (!repoRoot || !targetBranch) return null;
+	return JSON.stringify([repoRoot, targetBranch]);
 }
 
 function mergeTargetError(metadata) {
-	return new Error(`Another merge is already active for ${metadata.git.baseBranch} in ${metadata.git.repoRoot}.`);
+	return new Error(`Another merge is already active for ${mergeTargetBranch(metadata)} in ${metadata.git.repoRoot}.`);
 }
 
 function safeFeatureSuggestorScope(projectId) {
@@ -75,6 +86,22 @@ function isActiveMerger(metadata) {
 	return metadata?.automation?.activeRole === "merger" && !!metadata?.automation?.activeRunId;
 }
 
+function unsafeNewBranchMergeTopology(metadata) {
+	const request = gitRequestFor(metadata);
+	if (request?.mode !== "new") return false;
+	const targetBranch = mergeTargetBranch(metadata);
+	const issueBranch = String(metadata?.git?.branchName || "").trim();
+	return !!targetBranch && !!issueBranch && targetBranch === issueBranch;
+}
+
+function assertSafeMergeTopology(metadata) {
+	if (!unsafeNewBranchMergeTopology(metadata)) return;
+	throw new Error(
+		`New-branch merge target ${mergeTargetBranch(metadata)} matches the issue worktree branch. ` +
+		"Recreate the ticket so the worktree uses an isolated orchestrator branch before approving and merging.",
+	);
+}
+
 async function validDirectoryOrNull(value) {
 	const dir = String(value || "").trim();
 	if (!dir) return null;
@@ -87,17 +114,18 @@ async function validDirectoryOrNull(value) {
 }
 
 async function verifyIssueBranchMerged(metadata) {
-	if (!metadata.git?.repoRoot || !metadata.git?.branchName || !metadata.git?.baseBranch) return null;
+	const targetBranch = mergeTargetBranch(metadata);
+	if (!metadata.git?.repoRoot || !metadata.git?.branchName || !targetBranch) return null;
 	const branchHead = (
 		await execGit(["rev-parse", "--verify", `refs/heads/${metadata.git.branchName}^{commit}`], metadata.git.repoRoot)
 	).stdout.trim();
-	const baseHead = (
-		await execGit(["rev-parse", "--verify", `refs/heads/${metadata.git.baseBranch}^{commit}`], metadata.git.repoRoot)
+	const targetHead = (
+		await execGit(["rev-parse", "--verify", `refs/heads/${targetBranch}^{commit}`], metadata.git.repoRoot)
 	).stdout.trim();
 	return {
 		finalCommitSha: branchHead,
-		mergedToBranch: metadata.git.baseBranch,
-		mergeCommitSha: baseHead,
+		mergedToBranch: targetBranch,
+		mergeCommitSha: targetHead,
 		mergedAt: nowIso(),
 	};
 }
@@ -212,9 +240,10 @@ export class OrchestratorRuntime {
 	async approveReviewAndMerge(id) {
 		const issue = await this.store.loadIssue(id);
 		approveReview(issue.metadata);
-		if (!issue.metadata.git?.repoRoot || !issue.metadata.git?.branchName || !issue.metadata.git?.baseBranch) {
+		if (!issue.metadata.git?.repoRoot || !issue.metadata.git?.branchName || !mergeTargetBranch(issue.metadata)) {
 			throw new Error("Approve and merge requires a git-backed issue worktree.");
 		}
+		assertSafeMergeTopology(issue.metadata);
 		const mergeKey = mergeTargetKey(issue.metadata);
 		if ((await this.activeMergeForTarget(mergeKey, id)) || this.activeMergeKeys.has(mergeKey)) {
 			throw mergeTargetError(issue.metadata);
@@ -449,6 +478,7 @@ export class OrchestratorRuntime {
 		try {
 			let issue = await this.store.loadIssue(id);
 			mergeKey = mergeTargetKey(issue.metadata);
+			assertSafeMergeTopology(issue.metadata);
 			const result = await this.runner.run({
 				issueId: id,
 				role: "merger",

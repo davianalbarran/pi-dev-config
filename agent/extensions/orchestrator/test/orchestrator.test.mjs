@@ -3411,9 +3411,9 @@ test("merger prompt requires squash merge and Conventional Commits", () => {
 		events: [],
 	});
 
-	assert.match(prompt, /git merge --squash <issue-branch>/);
+	assert.match(prompt, /git merge --squash <issue-worktree-branch>/);
 	assert.match(prompt, /Conventional Commit/);
-	assert.match(prompt, /final base-branch commit must be a Conventional Commit/);
+	assert.match(prompt, /final merge-target-branch commit must be a Conventional Commit/);
 	assert.match(prompt, /squash commit created/);
 });
 
@@ -3827,9 +3827,15 @@ test("workspace manager creates requested new branch without switching checkout"
 	const workspace = await ensureIssueWorkspace(store, issue);
 	const prepared = await store.loadIssue(issue.metadata.id);
 
-	assert.equal(prepared.metadata.git.branchName, "feature/pi-requested");
+	assert.equal(prepared.metadata.git.baseBranch, "feature/pi-requested");
+	assert.equal(prepared.metadata.git.request.baseBranch, originalBranch);
+	assert.equal(prepared.metadata.git.request.newBranchName, "feature/pi-requested");
+	assert.match(prepared.metadata.git.branchName, /^pi-orchestrator\/pi-/);
+	assert.notEqual(prepared.metadata.git.branchName, "feature/pi-requested");
 	assert.equal((await git(["branch", "--show-current"], repo)).stdout.trim(), originalBranch);
-	assert.equal((await git(["branch", "--show-current"], workspace.path)).stdout.trim(), "feature/pi-requested");
+	assert.equal((await git(["branch", "--show-current"], workspace.path)).stdout.trim(), prepared.metadata.git.branchName);
+	assert.equal((await git(["rev-parse", "feature/pi-requested"], repo)).stdout.trim(), (await git(["rev-parse", originalBranch], repo)).stdout.trim());
+	assert.equal((await git(["rev-parse", prepared.metadata.git.branchName], repo)).stdout.trim(), (await git(["rev-parse", "feature/pi-requested"], repo)).stdout.trim());
 
 	const duplicate = await store.createIssue({
 		title: "Duplicate branch request",
@@ -3911,6 +3917,118 @@ test("approve and merge starts merger rpc role and completes after squash merge"
 	assert.equal(issueBranchIsAncestor, false, "squash-merged issue branch should not need to be a base ancestor");
 	assert.equal(await fsp.readFile(path.join(repo, "README.md"), "utf-8"), "after\n");
 	assert.equal(completed.events.some((event) => event.type === "review_approved_and_merged"), true);
+});
+
+test("approve and merge targets requested new branch and leaves selected base unchanged", async () => {
+	const root = await tempDir();
+	const repo = await tempDir();
+	await git(["init"], repo);
+	await git(["config", "user.email", "test@example.local"], repo);
+	await git(["config", "user.name", "Test User"], repo);
+	await fsp.writeFile(path.join(repo, "README.md"), "before\n", "utf-8");
+	await git(["add", "README.md"], repo);
+	await git(["commit", "-m", "initial"], repo);
+	const baseBranch = (await git(["branch", "--show-current"], repo)).stdout.trim();
+	const baseSha = (await git(["rev-parse", baseBranch], repo)).stdout.trim();
+	const requestedBranch = "feature/pi-requested-merge";
+
+	const runtime = createOrchestratorRuntime({ dataRoot: root });
+	await runtime.store.init();
+	const issue = await runtime.store.createIssue({
+		title: "Merge into requested branch",
+		spec: "Update the readme and merge it into the requested feature branch.",
+		linkedDirectory: repo,
+		gitRequest: { mode: "new", baseBranch, newBranchName: requestedBranch },
+	});
+	const workspace = await ensureIssueWorkspace(runtime.store, issue);
+	await runtime.store.writePlan(issue.metadata.id, "Update README.md.");
+	await runtime.store.writeReviewReport(issue.metadata.id, "Human review says this is ready.");
+	await fsp.writeFile(path.join(workspace.path, "README.md"), "after\n", "utf-8");
+	await runtime.store.setLane(issue.metadata.id, LANE.IN_REVIEW, "test");
+	const prepared = await runtime.store.loadIssue(issue.metadata.id);
+	const calls = [];
+	runtime.runner = {
+		run: async ({ role, cwd, prompt, onRunStarted }) => {
+			calls.push({ role, cwd, prompt });
+			assert.equal(role, "merger");
+			assert.equal(await fsp.realpath(cwd), await fsp.realpath(repo));
+			assert.match(prompt, new RegExp(`Merge target branch: ${escapeRegExp(requestedBranch)}`));
+			assert.match(prompt, new RegExp(`Issue worktree branch: ${escapeRegExp(prepared.metadata.git.branchName)}`));
+			assert.doesNotMatch(prompt, /Base branch:/);
+			if (onRunStarted) await onRunStarted("new-branch-merge-run");
+			await git(["add", "-A"], workspace.path);
+			await git(["commit", "-m", "chore(orchestrator): complete requested branch merge"], workspace.path);
+			await git(["checkout", requestedBranch], repo);
+			await git(["merge", "--squash", prepared.metadata.git.branchName], repo);
+			await git(["commit", "-m", "feat: update requested branch readme"], repo);
+			return { runId: "new-branch-merge-run", text: "MERGE_RESULT: MERGED\nSquash commit created on the requested branch." };
+		},
+		stopAll: async () => {},
+	};
+
+	await runtime.createActions().approveReviewAndMerge(issue.metadata.id);
+	await waitFor(async () => (await runtime.store.loadIssue(issue.metadata.id)).metadata.lane === LANE.COMPLETED);
+
+	const completed = await runtime.store.loadIssue(issue.metadata.id);
+	assert.equal(calls.length, 1);
+	assert.equal(prepared.metadata.git.baseBranch, requestedBranch);
+	assert.equal(completed.metadata.git.mergedToBranch, requestedBranch);
+	assert.equal(completed.metadata.git.mergeCommitSha, (await git(["rev-parse", requestedBranch], repo)).stdout.trim());
+	assert.equal((await git(["rev-parse", baseBranch], repo)).stdout.trim(), baseSha);
+	assert.equal((await git(["show", `${requestedBranch}:README.md`], repo)).stdout, "after\n");
+});
+
+test("approve and merge rejects unsafe legacy new-branch metadata before starting merger", async () => {
+	const root = await tempDir();
+	const repo = await tempDir();
+	await git(["init"], repo);
+	await git(["config", "user.email", "test@example.local"], repo);
+	await git(["config", "user.name", "Test User"], repo);
+	await fsp.writeFile(path.join(repo, "README.md"), "before\n", "utf-8");
+	await git(["add", "README.md"], repo);
+	await git(["commit", "-m", "initial"], repo);
+	const baseBranch = (await git(["branch", "--show-current"], repo)).stdout.trim();
+	const baseSha = (await git(["rev-parse", baseBranch], repo)).stdout.trim();
+	const requestedBranch = "feature/legacy-new-branch";
+
+	const runtime = createOrchestratorRuntime({ dataRoot: root });
+	await runtime.store.init();
+	const issue = await runtime.store.createIssue({
+		title: "Legacy unsafe branch",
+		spec: "Reject unsafe legacy metadata.",
+		linkedDirectory: repo,
+	});
+	await runtime.store.writeMetadata(issue.metadata.id, {
+		...issue.metadata,
+		lane: LANE.IN_REVIEW,
+		workspace: { kind: "git-worktree", path: repo, editInPlace: false },
+		git: {
+			repoRoot: repo,
+			baseBranch,
+			baseSha,
+			branchName: requestedBranch,
+			worktreePath: repo,
+			finalCommitSha: null,
+			request: { mode: "new", baseBranch, newBranchName: requestedBranch },
+		},
+	});
+	let calls = 0;
+	runtime.runner = {
+		run: async () => {
+			calls += 1;
+			return { runId: "should-not-run", text: "MERGE_RESULT: MERGED" };
+		},
+		stopAll: async () => {},
+	};
+
+	await assert.rejects(
+		() => runtime.createActions().approveReviewAndMerge(issue.metadata.id),
+		/matches the issue worktree branch/,
+	);
+	const unchanged = await runtime.store.loadIssue(issue.metadata.id);
+	assert.equal(calls, 0);
+	assert.equal(unchanged.metadata.lane, LANE.IN_REVIEW);
+	assert.equal(unchanged.metadata.automation.activeRunId, null);
 });
 
 test("approve and merge rejects another active merge targeting the same repo and base branch", async () => {
