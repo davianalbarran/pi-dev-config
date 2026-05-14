@@ -16,7 +16,7 @@ import {
 	writeFileAtomic,
 	writeJsonAtomic,
 } from "./utils.js";
-import { assembleAgentSession } from "./agent-session.js";
+import { assembleAgentSession, sanitizeAgentStreamEvent } from "./agent-session.js";
 import {
 	createApprovalState,
 	createAutomationState,
@@ -27,6 +27,20 @@ import {
 	resumeBlockedReason,
 } from "./workflow.js";
 import { getGitProjectInfo } from "./workspace.js";
+
+const MAX_DASHBOARD_RUN_EVENT_BYTES = 64 * 1024;
+
+function compactDashboardRunEvent(event) {
+	const serialized = JSON.stringify(event);
+	if (Buffer.byteLength(serialized, "utf8") <= MAX_DASHBOARD_RUN_EVENT_BYTES) return event;
+	return {
+		type: event.type || "oversized_event",
+		...(event.at ? { at: event.at } : {}),
+		...(event.timestamp ? { timestamp: event.timestamp } : {}),
+		truncated: true,
+		originalBytes: Buffer.byteLength(serialized, "utf8"),
+	};
+}
 
 export function assertSafeRunPathSegment(value, label = "run id") {
 	const segment = String(value || "");
@@ -245,6 +259,7 @@ export class IssueStore {
 		for (const issue of issues) {
 			if (issue.metadata.projectId === projectId && issue.metadata.lane === LANE.COMPLETED) {
 				await fsp.rm(this.issueDir(issue.metadata.id), { recursive: true, force: true });
+				await this.removeIssueAgentStreamData(issue.metadata.id);
 				removedIds.push(issue.metadata.id);
 			}
 		}
@@ -383,6 +398,14 @@ export class IssueStore {
 
 	runPath(id, runId) {
 		return path.join(this.issueDir(assertSafeRunPathSegment(id, "issue id")), "runs", `${assertSafeRunPathSegment(runId)}.jsonl`);
+	}
+
+	async removeIssueAgentStreamData(id, { issueDir = this.issueDir(id) } = {}) {
+		const safeId = assertSafeRunPathSegment(id, "issue id");
+		await Promise.all([
+			fsp.rm(path.join(issueDir, "runs"), { recursive: true, force: true }),
+			fsp.rm(path.join(this.sessionsRoot, safeId), { recursive: true, force: true }),
+		]);
 	}
 
 	internalRunPath(scope, runId) {
@@ -621,7 +644,7 @@ export class IssueStore {
 			}
 			throw error;
 		}
-		await Promise.all(cleanedIds.map((id) => fsp.rm(path.join(this.sessionsRoot, id), { recursive: true, force: true })));
+		await Promise.all(moved.map((move, index) => this.removeIssueAgentStreamData(cleanedIds[index], { issueDir: move.archiveDir })));
 		this.emitChange({ type: "completed_tickets_cleaned", cleanedIds, cleanedCount: cleanedIds.length, retentionDays: COMPLETED_TICKET_CLEANUP_RETENTION_DAYS });
 		return { cleanedCount: cleanedIds.length, cleanedIds, retentionDays: COMPLETED_TICKET_CLEANUP_RETENTION_DAYS };
 	}
@@ -695,10 +718,12 @@ export class IssueStore {
 	}
 
 	async appendRunEvent(id, runId, event) {
-		const payload = {
+		const sanitized = sanitizeAgentStreamEvent({
 			...event,
 			at: nowIso(),
-		};
+		});
+		if (!sanitized) return null;
+		const payload = compactDashboardRunEvent(sanitized);
 		await appendJsonLine(this.runPath(id, runId), payload);
 		this.emitChange({ type: "run_event", id, runId, event: payload });
 		return payload;
@@ -709,7 +734,7 @@ export class IssueStore {
 	}
 
 	async getAgentSession(id, runId) {
-		const events = await this.readRunEvents(id, runId);
+		const events = (await this.readRunEvents(id, runId)).map((event) => sanitizeAgentStreamEvent(event)).filter(Boolean);
 		return { issueId: id, runId, events, session: assembleAgentSession(events) };
 	}
 

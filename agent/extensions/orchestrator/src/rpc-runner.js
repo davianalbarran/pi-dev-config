@@ -69,7 +69,7 @@ export class RpcAgentRunner {
 				if (line) await fsp.appendFile(runLogPath, line, "utf-8");
 				return { ...event };
 			}
-			return this.store.appendRunEvent(issueId, runId, compactRunEvent(event));
+			return this.store.appendRunEvent(issueId, runId, event);
 		};
 		await appendLifecycleEvent({
 			type: "run_started",
@@ -121,7 +121,7 @@ export class RpcAgentRunner {
 					if (line) await fsp.appendFile(runLogPath, line, "utf-8");
 					return;
 				}
-				await this.store.appendRunEvent(issueId, runId, compactRunEvent(event));
+				await this.store.appendRunEvent(issueId, runId, event);
 			});
 			return appendQueue;
 		};

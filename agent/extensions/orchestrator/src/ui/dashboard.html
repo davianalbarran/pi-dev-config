@@ -1055,6 +1055,9 @@ let selectedId = null;
 const feedbackDraftsByIssueId = new Map();
 let detailTab = "report";
 const agentSessions = new Map();
+let activeAgentStream = null;
+let activeAgentStreamTarget = null;
+let activeAgentStreamReady = false;
 let selectedTimelineRunId = null;
 let selectedTimelineSessionMissing = false;
 let filters = { query: "", lane: "all", state: "all" };
@@ -2455,24 +2458,55 @@ function eventText(event, lifecycleType) {
   };
 }
 
-function stringifyAgentValue(value) {
-  if (value === undefined || value === null) return "";
-  if (typeof value === "string") return value;
-  const contentText = toolResultText(value);
-  if (contentText) return contentText;
-  try { return JSON.stringify(value, null, 2); } catch (_) { return String(value); }
+function truncateAgentValue(value, maxLength = 4000) {
+  const text = String(value || "");
+  return text.length > maxLength ? text.slice(0, maxLength) + "…" : text;
 }
 
-function toolEventError(event, tool) {
-  const result = (event?.result && typeof event.result === "object") ? event.result : (tool?.result && typeof tool.result === "object" ? tool.result : null);
-  const partialResult = (event?.partialResult && typeof event.partialResult === "object") ? event.partialResult : (tool?.partialResult && typeof tool.partialResult === "object" ? tool.partialResult : null);
-  return event?.error || event?.errorMessage || result?.error || result?.errorMessage || partialResult?.error || partialResult?.errorMessage || tool?.error || tool?.errorMessage || "";
+function stringifyAgentValue(value) {
+  if (value === undefined || value === null) return "";
+  if (typeof value === "string") return truncateAgentValue(value);
+  const contentText = toolResultText(value);
+  if (contentText) return truncateAgentValue(contentText);
+  try { return truncateAgentValue(JSON.stringify(value, null, 2)); } catch (_) { return truncateAgentValue(String(value)); }
 }
 
 function toolEventIsError(event, tool) {
   const result = (event?.result && typeof event.result === "object") ? event.result : (tool?.result && typeof tool.result === "object" ? tool.result : null);
   const partialResult = (event?.partialResult && typeof event.partialResult === "object") ? event.partialResult : (tool?.partialResult && typeof tool.partialResult === "object" ? tool.partialResult : null);
-  return event?.isError === true || result?.isError === true || partialResult?.isError === true || tool?.isError === true;
+  return event?.isError === true || !!event?.error || !!event?.errorMessage || result?.isError === true || partialResult?.isError === true || tool?.isError === true || !!tool?.error || !!tool?.errorMessage;
+}
+
+function normalizeToolEventType(type) {
+  return ({ tool_execution_start: "tool_call_start", tool_execution_update: "tool_call_update", tool_execution_end: "tool_call_end" })[type] || type;
+}
+
+function sanitizeAgentStreamEventForUi(event) {
+  if (!event || typeof event !== "object") return null;
+  const type = normalizeToolEventType(event.type);
+  if (type === "message_start" || type === "message_update" || type === "message_end") return { ...event };
+  if (type !== "tool_call_start" && type !== "tool_call_update" && type !== "tool_call_end") return null;
+  const tool = event.toolCall || event.tool_call || event.toolExecution || event.tool_execution || event.call || event.execution || {};
+  const id = event.toolCallId || event.tool_call_id || event.toolExecutionId || event.tool_execution_id || event.callId || event.call_id || tool.id || tool.callId || tool.call_id || tool.toolCallId || tool.tool_call_id || tool.toolExecutionId || tool.tool_execution_id || "";
+  const name = event.toolName || event.tool_name || event.name || event.tool || tool.name || tool.toolName || tool.tool_name || tool.command || "";
+  const input = stringifyAgentValue(event.input ?? event.arguments ?? event.args ?? event.parameters ?? tool.input ?? tool.arguments ?? tool.args ?? tool.parameters);
+  const status = event.status || tool.status || "";
+  const isError = toolEventIsError(event, tool);
+  const success = typeof event.success === "boolean" ? event.success : undefined;
+  const hasRenderableToolData = !!(name || input || status || isError || success !== undefined || (id && type === "tool_call_end"));
+  if (!hasRenderableToolData) return null;
+  const sanitized = { type: event.type };
+  if (event.at) sanitized.at = event.at;
+  if (event.timestamp) sanitized.timestamp = event.timestamp;
+  if (id) sanitized.toolCallId = id;
+  if (name) sanitized.toolName = name;
+  if (input) sanitized.input = input;
+  if (status) sanitized.status = status;
+  if (isError) sanitized.isError = true;
+  if (success !== undefined) sanitized.success = success;
+  if (!sanitized.status && type === "tool_call_end") sanitized.status = isError || success === false ? "error" : "complete";
+  if (!sanitized.status && type === "tool_call_start") sanitized.status = "running";
+  return sanitized;
 }
 
 function assembleAgentSessionForUi(events) {
@@ -2482,7 +2516,9 @@ function assembleAgentSessionForUi(events) {
   let currentMessage = null;
   let messageCount = 0;
   let toolCount = 0;
-  for (const event of Array.isArray(events) ? events : []) {
+  for (const originalEvent of Array.isArray(events) ? events : []) {
+    const event = sanitizeAgentStreamEventForUi(originalEvent);
+    if (!event) continue;
     const type = event?.type;
     if (type === "message_start" || type === "message_update" || type === "message_end") {
       let id = event.messageId || event.message_id || event.message?.id || event.assistantMessageEvent?.messageId || event.assistantMessageEvent?.message_id || event.assistantMessageEvent?.id || "";
@@ -2514,27 +2550,25 @@ function assembleAgentSessionForUi(events) {
       }
       continue;
     }
-    const toolType = ({ tool_execution_start: "tool_call_start", tool_execution_update: "tool_call_update", tool_execution_end: "tool_call_end" })[type] || type;
+    const toolType = normalizeToolEventType(type);
     if (toolType === "tool_call_start" || toolType === "tool_call_update" || toolType === "tool_call_end") {
       const tool = event.toolCall || event.tool_call || event.toolExecution || event.tool_execution || event.call || event.execution || {};
-      const id = event.toolCallId || event.tool_call_id || event.toolExecutionId || event.tool_execution_id || event.callId || tool.id || tool.callId || tool.toolCallId || tool.tool_call_id || "tool-" + (++toolCount);
+      const id = event.toolCallId || event.tool_call_id || event.toolExecutionId || event.tool_execution_id || event.callId || event.call_id || tool.id || tool.callId || tool.call_id || tool.toolCallId || tool.tool_call_id || tool.toolExecutionId || tool.tool_execution_id || "tool-" + (++toolCount);
+      const input = stringifyAgentValue(event.input ?? event.arguments ?? event.args ?? event.parameters ?? tool.input ?? tool.arguments ?? tool.args ?? tool.parameters);
+      const name = event.toolName || event.tool_name || event.name || event.tool || tool.name || tool.toolName || tool.tool_name || tool.command || "";
       let item = tools.get(id);
+      if (!item && !name && !input) continue;
       if (!item) {
-        item = { kind: "tool", id, name: event.toolName || event.tool_name || event.name || event.tool || tool.name || tool.toolName || tool.command || "tool", input: "", updates: [], output: "", error: "", status: "running", startedAt: event.at, updatedAt: event.at };
+        item = { kind: "tool", id, name: name || "tool", input: "", status: "running", startedAt: event.at, updatedAt: event.at };
         tools.set(id, item);
         items.push(item);
       }
-      if (!item.input) item.input = stringifyAgentValue(event.input ?? event.arguments ?? event.args ?? event.parameters ?? tool.input ?? tool.arguments ?? tool.args ?? tool.parameters);
+      if (!item.input) item.input = input;
       item.updatedAt = event.at || item.updatedAt;
-      const output = stringifyAgentValue(event.partialResult ?? event.output ?? event.result ?? event.stdout ?? event.stderr ?? event.text ?? event.delta ?? tool.partialResult ?? tool.output ?? tool.result ?? tool.stdout ?? tool.stderr);
       const isError = toolEventIsError(event, tool);
-      if (toolType === "tool_call_update" && output) item.updates.push({ at: event.at, text: output });
       if (isError) item.status = "error";
       if (toolType === "tool_call_end") {
-        item.output = output || item.output;
-        item.error = toolEventError(event, tool);
-        if (isError && !item.error) item.error = "Tool returned an error.";
-        item.status = item.error || isError || event.success === false ? "error" : (event.status || tool.status || "complete");
+        item.status = isError || event.success === false ? "error" : (event.status || tool.status || "complete");
         item.endedAt = event.at || item.updatedAt;
       } else if (event.status && !isError) {
         item.status = event.status;
@@ -2550,13 +2584,15 @@ function agentEventFingerprint(event) {
 }
 
 function mergeAgentSessionEvents(primaryEvents, secondaryEvents) {
-  const events = Array.isArray(primaryEvents) ? [...primaryEvents] : [];
-  const seen = new Set(events.map(agentEventFingerprint));
-  for (const event of Array.isArray(secondaryEvents) ? secondaryEvents : []) {
-    const fingerprint = agentEventFingerprint(event);
+  const events = [];
+  const seen = new Set();
+  for (const event of [...(Array.isArray(primaryEvents) ? primaryEvents : []), ...(Array.isArray(secondaryEvents) ? secondaryEvents : [])]) {
+    const sanitized = sanitizeAgentStreamEventForUi(event);
+    if (!sanitized) continue;
+    const fingerprint = agentEventFingerprint(sanitized);
     if (seen.has(fingerprint)) continue;
     seen.add(fingerprint);
-    events.push(event);
+    events.push(sanitized);
   }
   return events;
 }
@@ -2569,6 +2605,18 @@ function updateAgentSessionCache(issueId, runId, payload) {
   return next;
 }
 
+function markAgentSessionNeedsRefresh(issueId, runId) {
+  if (!issueId || !runId) return;
+  const key = agentSessionKey(issueId, runId);
+  const cached = agentSessions.get(key);
+  if (!cached) return;
+  agentSessions.set(key, { ...cached, loadedFromApi: false, needsRefreshFromApi: true });
+}
+
+function isViewingAgentStreamTarget(issueId, runId) {
+  return agentStreamTargetMatches(desiredAgentStreamTarget(), issueId, runId);
+}
+
 async function loadAgentSession(issueId, runId) {
   if (!issueId || !runId) return null;
   const key = agentSessionKey(issueId, runId);
@@ -2578,7 +2626,8 @@ async function loadAgentSession(issueId, runId) {
     const payload = await api("/api/issues/" + encodeURIComponent(issueId) + "/runs/" + encodeURIComponent(runId));
     const latest = agentSessions.get(key) || before;
     const events = mergeAgentSessionEvents(payload.events || [], latest.events || []);
-    const next = updateAgentSessionCache(issueId, runId, { ...payload, events, session: payload.session && events.length === (payload.events || []).length ? payload.session : assembleAgentSessionForUi(events), loadedFromApi: true, loadingFromApi: false, error: "" });
+    const keepRefreshNeeded = !!latest.needsRefreshFromApi && !isViewingAgentStreamTarget(issueId, runId);
+    const next = updateAgentSessionCache(issueId, runId, { ...payload, events, session: payload.session && events.length === (payload.events || []).length ? payload.session : assembleAgentSessionForUi(events), loadedFromApi: !keepRefreshNeeded, needsRefreshFromApi: keepRefreshNeeded, loadingFromApi: false, error: "" });
     selectedTimelineSessionMissing = false;
     return next;
   } catch (error) {
@@ -2611,10 +2660,7 @@ function renderAgentSessionItem(item) {
   if (item.kind === "tool") {
     return "<article class='tool-call-card " + escapeHtml(item.status || "") + "'>" +
       "<div class='tool-call-title'>Tool / " + escapeHtml(item.name || "tool") + " / " + escapeHtml(item.status || "running") + "</div>" +
-      (item.input ? "<div class='tool-call-body mono'>Input\n" + escapeHtml(item.input) + "</div>" : "") +
-      (item.updates || []).map((update) => "<div class='tool-call-update mono'>" + escapeHtml(update.text || "") + "</div>").join("") +
-      (item.output ? "<div class='tool-call-update mono'>Output\n" + escapeHtml(item.output) + "</div>" : "") +
-      (item.error ? "<div class='tool-call-update error'>" + escapeHtml(item.error) + "</div>" : "") +
+      (item.input ? "<div class='tool-call-body mono'>Arguments\n" + escapeHtml(item.input) + "</div>" : "") +
     "</article>";
   }
   return "<article class='agent-message " + (item.incomplete ? "incomplete" : "") + "'>" +
@@ -2623,10 +2669,87 @@ function renderAgentSessionItem(item) {
   "</article>";
 }
 
+function desiredAgentStreamTarget() {
+  const issue = issueById(selectedId);
+  const runId = issue?.automation?.activeRunId || null;
+  if (!issue || detailTab !== "agent" || !runId) return null;
+  return { issueId: issue.id, runId };
+}
+
+function agentStreamTargetMatches(target, issueId, runId) {
+  return !!target && target.issueId === issueId && target.runId === runId;
+}
+
+function closeAgentStream() {
+  const previousTarget = activeAgentStreamTarget;
+  if (activeAgentStream) activeAgentStream.close();
+  activeAgentStream = null;
+  activeAgentStreamTarget = null;
+  activeAgentStreamReady = false;
+  if (previousTarget) markAgentSessionNeedsRefresh(previousTarget.issueId, previousTarget.runId);
+}
+
+function handleAgentStreamMessage(message) {
+  let payload;
+  try { payload = JSON.parse(message.data || "{}"); } catch (_) { return; }
+  const storeEvent = payload?.type === "run_event" ? payload.event : payload?.event;
+  if (storeEvent?.type !== "run_event" || !storeEvent.id || !storeEvent.runId || !storeEvent.event) return;
+  if (!agentStreamTargetMatches(activeAgentStreamTarget, storeEvent.id, storeEvent.runId)) return;
+  const cached = agentSessions.get(agentSessionKey(storeEvent.id, storeEvent.runId)) || { issueId: storeEvent.id, runId: storeEvent.runId, events: [], session: { items: [] }, loadedFromApi: false, loadingFromApi: false };
+  const events = mergeAgentSessionEvents(cached.events || [], [storeEvent.event]);
+  if (events.length === (cached.events || []).length) return;
+  cached.events = events;
+  delete cached.error;
+  cached.session = assembleAgentSessionForUi(cached.events);
+  agentSessions.set(agentSessionKey(storeEvent.id, storeEvent.runId), cached);
+  if (selectedId === storeEvent.id && detailTab === "agent") renderDetail();
+}
+
+function openAgentStream(issueId, runId) {
+  if (!issueId || !runId) return closeAgentStream();
+  if (agentStreamTargetMatches(activeAgentStreamTarget, issueId, runId)) return;
+  closeAgentStream();
+  activeAgentStreamTarget = { issueId, runId };
+  if (typeof EventSource !== "function") {
+    activeAgentStreamReady = true;
+    return;
+  }
+  activeAgentStreamReady = false;
+  const source = new EventSource("/api/issues/" + encodeURIComponent(issueId) + "/runs/" + encodeURIComponent(runId) + "/events?token=" + encodeURIComponent(TOKEN));
+  activeAgentStream = source;
+  const handleReady = () => {
+    if (!agentStreamTargetMatches(activeAgentStreamTarget, issueId, runId)) return;
+    activeAgentStreamReady = true;
+    const issue = issueById(issueId);
+    if (!issue || detailTab !== "agent") return;
+    ensureActiveAgentSessionLoaded(issue, runId);
+  };
+  if (typeof source.addEventListener === "function") source.addEventListener("ready", handleReady);
+  else activeAgentStreamReady = true;
+  source.onmessage = handleAgentStreamMessage;
+  source.onerror = () => { if (agentStreamTargetMatches(activeAgentStreamTarget, issueId, runId)) document.getElementById("status").textContent = "Agent stream disconnected"; };
+}
+
+function updateAgentStreamSubscription() {
+  const target = desiredAgentStreamTarget();
+  if (!target) return closeAgentStream();
+  openAgentStream(target.issueId, target.runId);
+}
+
+function ensureActiveAgentSessionLoaded(issue, activeRunId) {
+  const activeSessionPayload = activeRunId ? cachedAgentSession(issue.id, activeRunId) : null;
+  if (detailTab === "agent" && activeRunId && (!activeSessionPayload?.loadedFromApi || activeSessionPayload?.needsRefreshFromApi) && !activeSessionPayload?.loadingFromApi) {
+    if (agentStreamTargetMatches(activeAgentStreamTarget, issue.id, activeRunId) && !activeAgentStreamReady) return null;
+    return loadAgentSession(issue.id, activeRunId).then(() => { if (selectedId === issue.id && detailTab === "agent") renderDetail(); }).catch(() => { if (selectedId === issue.id && detailTab === "agent") renderDetail(); });
+  }
+  return null;
+}
+
 function renderDetail() {
   const detail = document.getElementById("detail");
   const issue = issueById(selectedId);
   if (!issue) {
+    closeAgentStream();
     detail.classList.remove("open");
     detail.innerHTML = "";
     return;
@@ -2653,7 +2776,7 @@ function renderDetail() {
     actionButtons.push("<button id='change-review' class='warn' " + (activeRunId ? "disabled" : "") + ">Request Changes</button>");
   }
   const tabs = ["agent", "report", "plan", "spec", "workspace", "comments", "timeline"];
-  if (!tabs.includes(detailTab)) detailTab = activeRunId ? "agent" : "report";
+  if (!tabs.includes(detailTab)) detailTab = "report";
   detail.innerHTML =
     '<button type="button" class="panel-resize-handle panel-resize-handle-left" aria-label="Resize ticket inspector panel" data-resize-panel="detail"></button>' +
     "<div class='detail-header'>" +
@@ -2686,10 +2809,8 @@ function renderDetail() {
     "<div class='tabs'>" + tabs.map((tab) => "<button type='button' class='tab " + (detailTab === tab ? "active" : "") + "' data-tab='" + tab + "'>" + escapeHtml(tabLabel(tab)) + "</button>").join("") + "</div>" +
     "<div class='tab-panel'>" + renderTabContent(issue) + "</div>";
   applyDetailPanelWidth();
-  const activeSessionPayload = activeRunId ? cachedAgentSession(issue.id, activeRunId) : null;
-  if (activeRunId && !activeSessionPayload?.loadedFromApi && !activeSessionPayload?.loadingFromApi) {
-    loadAgentSession(issue.id, activeRunId).then(() => { if (selectedId === issue.id) renderDetail(); }).catch(() => { if (selectedId === issue.id) renderDetail(); });
-  }
+  updateAgentStreamSubscription();
+  ensureActiveAgentSessionLoaded(issue, activeRunId);
   const feedback = document.getElementById("feedback");
   if (feedback) feedback.value = feedbackDraft(issue.id);
   bindDetailActions(issue);
@@ -2969,16 +3090,7 @@ function handleEventStreamMessage(message) {
   let payload;
   try { payload = JSON.parse(message.data || "{}"); } catch (_) { load().catch(() => {}); return; }
   const event = payload?.event;
-  if (payload?.type === "store" && event?.type === "run_event" && event.id && event.runId) {
-    const key = agentSessionKey(event.id, event.runId);
-    const cached = agentSessions.get(key) || { issueId: event.id, runId: event.runId, events: [], session: { items: [] }, loadedFromApi: false, loadingFromApi: false };
-    cached.events = mergeAgentSessionEvents(cached.events || [], [event.event]);
-    delete cached.error;
-    cached.session = assembleAgentSessionForUi(cached.events);
-    agentSessions.set(key, cached);
-    if (selectedId === event.id && (detailTab === "agent" || (detailTab === "timeline" && selectedTimelineRunId === event.runId))) renderDetail();
-    return;
-  }
+  if (payload?.type === "store" && event?.type === "run_event") return;
   load().catch(() => {});
 }
 
@@ -3116,6 +3228,8 @@ document.getElementById("issue-form").addEventListener("submit", async (event) =
       });
     }
     selectedId = issue.metadata.id;
+    detailTab = "report";
+    selectedTimelineRunId = null;
     if (action === "backlog" || (issue.metadata && issue.metadata.lane === LANE.BACKLOG)) activeView = "backlog";
     else activeView = "kanban";
     formEl.reset();
@@ -3215,8 +3329,7 @@ document.getElementById("board").addEventListener("click", (event) => {
   if (!card) return;
   selectedId = card.dataset.id;
   selectedTimelineRunId = null;
-  const selectedIssue = issueById(selectedId);
-  detailTab = selectedIssue?.automation?.activeRunId ? "agent" : (needsReview(selectedIssue) ? "report" : detailTab);
+  detailTab = "report";
   renderBoard();
   renderDetail();
 });
@@ -3228,8 +3341,7 @@ document.getElementById("board").addEventListener("keydown", (event) => {
   event.preventDefault();
   selectedId = card.dataset.id;
   selectedTimelineRunId = null;
-  const selectedIssue = issueById(selectedId);
-  if (selectedIssue?.automation?.activeRunId) detailTab = "agent";
+  detailTab = "report";
   renderBoard();
   renderDetail();
 });

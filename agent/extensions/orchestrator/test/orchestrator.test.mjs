@@ -7,7 +7,7 @@ import vm from "node:vm";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
-import { assembleAgentSession } from "../src/agent-session.js";
+import { assembleAgentSession, sanitizeAgentStreamEvent } from "../src/agent-session.js";
 import { COMPLETED_TICKET_CLEANUP_RETENTION_DAYS, DEFAULT_PROFILE_ID, KANBAN_LANES, LANE, LANES, ROLE_DEFAULTS, ROLE_TOOLS } from "../src/constants.js";
 import { getIssueDiffs } from "../src/diffs.js";
 import {
@@ -300,13 +300,13 @@ function dashboardAgentSessionTestSource(html) {
 	assert.ok(eventStart !== -1 && eventEnd > eventStart, "dashboard script declares event stream handler");
 	assert.ok(escapeStart !== -1 && escapeEnd > escapeStart, "dashboard script declares markdown helpers");
 	return [
-		"const agentSessions = new Map();\nlet selectedTimelineRunId = null;\nlet selectedTimelineSessionMissing = false;\nlet selectedId = null;\nlet detailTab = 'agent';\nlet renderDetailCalls = 0;\nlet loadCalls = 0;\n",
-		"function formatDate(value) { return value || 'unknown'; }\nfunction renderDetail() { renderDetailCalls += 1; }\nasync function load() { loadCalls += 1; }\n",
+		"const agentSessions = new Map();\nlet activeAgentStream = null;\nlet activeAgentStreamTarget = null;\nlet activeAgentStreamReady = false;\nlet selectedTimelineRunId = null;\nlet selectedTimelineSessionMissing = false;\nlet selectedId = null;\nlet detailTab = 'agent';\nlet renderDetailCalls = 0;\nlet loadCalls = 0;\nlet state = { issues: [] };\nconst TOKEN = 'test-token';\n",
+		"function formatDate(value) { return value || 'unknown'; }\nfunction renderDetail() { renderDetailCalls += 1; }\nasync function load() { loadCalls += 1; }\nfunction issueById(id) { return (state.issues || []).find((issue) => issue.id === id) || null; }\n",
 		html.slice(agentStart, agentEnd),
 		html.slice(timelineStart, timelineEnd),
 		html.slice(eventStart, eventEnd),
 		html.slice(escapeStart, escapeEnd),
-		`\nglobalThis.__dashboardAgentSession = {\n\tagentSessionKey,\n\tassembleAgentSessionForUi,\n\tloadAgentSession,\n\tcachedAgentSession,\n\trenderAgentSession,\n\trenderTimeline,\n\thandleEventStreamMessage,\n\tsetPayload(issueId, runId, payload) { agentSessions.set(agentSessionKey(issueId, runId), payload); },\n\tselectTimelineRun(runId) { selectedTimelineRunId = runId; selectedTimelineSessionMissing = false; },\n\tmarkTimelineMissing() { selectedTimelineSessionMissing = true; },\n\tsetSelected(issueId, tab = 'agent', runId = null) { selectedId = issueId; detailTab = tab; selectedTimelineRunId = runId; },\n\tget renderDetailCalls() { return renderDetailCalls; },\n\tget loadCalls() { return loadCalls; },\n};\n`,
+		`\nglobalThis.__dashboardAgentSession = {\n\tagentSessionKey,\n\tassembleAgentSessionForUi,\n\tloadAgentSession,\n\tcachedAgentSession,\n\trenderAgentSession,\n\trenderTimeline,\n\thandleEventStreamMessage,\n\thandleAgentStreamMessage,\n\tdesiredAgentStreamTarget,\n\topenAgentStream,\n\tcloseAgentStream,\n\tupdateAgentStreamSubscription,\n\tensureActiveAgentSessionLoaded,\n\tsetPayload(issueId, runId, payload) { agentSessions.set(agentSessionKey(issueId, runId), payload); },\n\tselectTimelineRun(runId) { selectedTimelineRunId = runId; selectedTimelineSessionMissing = false; },\n\tmarkTimelineMissing() { selectedTimelineSessionMissing = true; },\n\tsetSelected(issueId, tab = 'agent', runId = null) { selectedId = issueId; detailTab = tab; selectedTimelineRunId = runId; },\n\tsetState(nextState) { state = nextState; },\n\tget activeAgentStreamTarget() { return activeAgentStreamTarget; },\n\tget activeAgentStreamReady() { return activeAgentStreamReady; },\n\tget renderDetailCalls() { return renderDetailCalls; },\n\tget loadCalls() { return loadCalls; },\n};\n`,
 	].join("");
 }
 
@@ -390,8 +390,8 @@ test("agent session assembler tracks Pi RPC tool execution lifecycle aliases", (
 	assert.equal(session.tools[0].id, "t1");
 	assert.equal(session.tools[0].name, "bash");
 	assert.match(session.tools[0].input, /echo hi/);
-	assert.deepEqual(session.tools[0].updates, [{ at: null, text: "hi" }]);
-	assert.equal(session.tools[0].output, "done");
+	assert.equal("updates" in session.tools[0], false);
+	assert.equal("output" in session.tools[0], false);
 	assert.equal(session.tools[0].status, "complete");
 });
 
@@ -402,19 +402,53 @@ test("agent session assembler marks Pi RPC isError tool results as errors", () =
 		{ type: "tool_execution_end", toolExecutionId: "t2", result: { content: [{ type: "text", text: "permission denied" }], isError: true } },
 	]);
 	assert.equal(session.tools.length, 1);
-	assert.equal(session.tools[0].updates[0].text, "permission denied");
-	assert.equal(session.tools[0].output, "permission denied");
+	assert.equal("updates" in session.tools[0], false);
+	assert.equal("output" in session.tools[0], false);
+	assert.equal("error" in session.tools[0], false);
 	assert.equal(session.tools[0].status, "error");
-	assert.match(session.tools[0].error, /Tool returned an error/);
+});
+
+test("agent stream sanitizer strips tool outputs while preserving messages and tool arguments", () => {
+	assert.deepEqual(sanitizeAgentStreamEvent({ type: "message_update", messageId: "m1", assistantMessageEvent: { type: "thinking_delta", delta: "hmm" } }), {
+		type: "message_update",
+		messageId: "m1",
+		assistantMessageEvent: { type: "thinking_delta", delta: "hmm" },
+	});
+	const sanitized = sanitizeAgentStreamEvent({
+		type: "tool_execution_end",
+		toolExecutionId: "t1",
+		toolName: "bash",
+		arguments: { command: "echo hi" },
+		result: { content: [{ type: "text", text: "large output" }], isError: false },
+		stdout: "large output",
+		text: "large output",
+	});
+	assert.deepEqual(sanitized, {
+		type: "tool_execution_end",
+		toolCallId: "t1",
+		toolName: "bash",
+		input: "{\n  \"command\": \"echo hi\"\n}",
+		status: "complete",
+	});
+	assert.equal(sanitizeAgentStreamEvent({ type: "tool_execution_update", toolExecutionId: "t1", output: "only output" }), null);
+	assert.equal(sanitizeAgentStreamEvent({ type: "tool_execution_end", result: { content: [{ type: "text", text: "only output" }] } }), null);
+	assert.deepEqual(sanitizeAgentStreamEvent({ type: "tool_call_start", tool_call: { tool_call_id: "snake-1", tool_name: "grep", arguments: { pattern: "TODO" } } }), {
+		type: "tool_call_start",
+		toolCallId: "snake-1",
+		toolName: "grep",
+		input: "{\n  \"pattern\": \"TODO\"\n}",
+		status: "running",
+	});
 });
 
 test("agent session assembler handles malformed and interrupted streams", () => {
 	const session = assembleAgentSession([
 		null,
 		{ type: "message_update", text: "partial" },
+		{ type: "tool_call_end", toolCallId: "legacy-output-only", output: "large legacy output" },
 		{ type: "tool_call_end", name: "read", error: "missing file" },
 	]);
-	assert.equal(session.ignoredCount, 1);
+	assert.equal(session.ignoredCount, 2);
 	assert.equal(session.messages[0].content, "partial");
 	assert.equal(session.messages[0].incomplete, true);
 	assert.equal(session.tools[0].status, "error");
@@ -671,6 +705,7 @@ test("dashboard renderer injects runtime data", async () => {
 	assert.match(html, /function applyCreateDrawerWidth\(\)/);
 	assert.match(html, /function applyDetailPanelWidth\(\)/);
 	assert.match(html, /Agent Output/);
+	assert.match(html, /selectedId = issue\.metadata\.id;\n    detailTab = "report";\n    selectedTimelineRunId = null;/);
 	assert.match(html, /data-view-run/);
 	assert.doesNotMatch(html, /__(TOKEN|LANES|KANBAN_LANES|LANE|ROLE_DEFAULTS|THINKING_LEVELS|DEFAULT_PROFILE_ID)_JSON__/);
 });
@@ -706,7 +741,11 @@ test("dashboard renders agent sessions and timeline history states", async () =>
 	assert.match(rendered, /agent-message/);
 	assert.match(rendered, /Hello final/);
 	assert.match(rendered, /tool-call-card/);
+	assert.match(rendered, /Arguments/);
 	assert.match(rendered, /echo hi/);
+	assert.doesNotMatch(rendered, /Output/);
+	assert.doesNotMatch(rendered, /done/);
+	assert.equal("updates" in ui.cachedAgentSession(issue.id, "run-1").session.items.find((item) => item.kind === "tool"), false);
 
 	const piStream = ui.assembleAgentSessionForUi([
 		{ type: "message_start", message: { id: "m-pi", role: "assistant", content: [] } },
@@ -727,37 +766,172 @@ test("dashboard renders agent sessions and timeline history states", async () =>
 	assert.match(ui.renderTimeline(issue), /No persisted history was found/);
 });
 
-test("dashboard event stream ingests live run events without full reload", async () => {
+test("dashboard opens live agent streams only for the active Agent tab and ignores global run events", async () => {
 	const html = await renderDashboardHtml("test-token");
-	const context = { api: async () => ({ issueId: "PI-agent", runId: "run-live", events: [], session: { items: [] } }) };
+	const opened = [];
+	class FakeEventSource {
+		constructor(url) {
+			this.url = url;
+			this.closed = false;
+			opened.push(this);
+		}
+		close() { this.closed = true; }
+	}
+	const context = { api: async () => ({ issueId: "PI-agent", runId: "run-live", events: [], session: { items: [] } }), EventSource: FakeEventSource, document: { getElementById: () => ({ textContent: "" }) } };
 	vm.runInNewContext(dashboardAgentSessionTestSource(html), context);
 	const ui = context.__dashboardAgentSession;
+	ui.setState({ issues: [
+		{ id: "PI-agent", automation: { activeRunId: "run-live" } },
+		{ id: "PI-other", automation: { activeRunId: "run-other" } },
+	] });
+
+	ui.setSelected("PI-agent", "report");
+	ui.updateAgentStreamSubscription();
+	assert.equal(opened.length, 0);
+	assert.equal(ui.activeAgentStreamTarget, null);
 
 	ui.setSelected("PI-agent", "agent");
-	ui.handleEventStreamMessage({
-		data: JSON.stringify({
-			type: "store",
-			event: { type: "run_event", id: "PI-agent", runId: "run-live", event: { type: "message_update", messageId: "m-live", delta: "Hello" } },
-		}),
-	});
-	assert.equal(ui.loadCalls, 0);
-	assert.equal(ui.renderDetailCalls, 1);
-	assert.equal(ui.cachedAgentSession("PI-agent", "run-live").session.items[0].content, "Hello");
+	ui.updateAgentStreamSubscription();
+	ui.updateAgentStreamSubscription();
+	assert.equal(opened.length, 1);
+	assert.match(opened[0].url, /\/api\/issues\/PI-agent\/runs\/run-live\/events\?token=test-token/);
+	assert.equal(ui.activeAgentStreamTarget.issueId, "PI-agent");
+	assert.equal(ui.activeAgentStreamTarget.runId, "run-live");
 
-	ui.setSelected("PI-agent", "timeline", "run-live");
-	ui.handleEventStreamMessage({
-		data: JSON.stringify({
-			type: "store",
-			event: { type: "run_event", id: "PI-agent", runId: "run-live", event: { type: "message_update", messageId: "m-live", delta: " world" } },
-		}),
-	});
-	assert.equal(ui.renderDetailCalls, 2);
-	assert.equal(ui.cachedAgentSession("PI-agent", "run-live").session.items[0].content, "Hello world");
+	opened[0].onmessage({ data: JSON.stringify({ type: "run_event", event: { type: "run_event", id: "PI-agent", runId: "run-live", event: { type: "message_update", messageId: "m-live", delta: "Hello" } } }) });
+	assert.equal(ui.cachedAgentSession("PI-agent", "run-live").session.items[0].content, "Hello");
+	assert.equal(ui.renderDetailCalls, 1);
+
+	ui.handleEventStreamMessage({ data: JSON.stringify({ type: "store", event: { type: "run_event", id: "PI-agent", runId: "run-live", event: { type: "message_update", delta: "ignored" } } }) });
+	assert.equal(ui.cachedAgentSession("PI-agent", "run-live").session.items[0].content, "Hello");
+	assert.equal(ui.loadCalls, 0);
+
+	ui.setSelected("PI-agent", "report");
+	ui.updateAgentStreamSubscription();
+	assert.equal(opened[0].closed, true);
+	assert.equal(ui.activeAgentStreamTarget, null);
+
+	ui.setSelected("PI-agent", "agent");
+	ui.updateAgentStreamSubscription();
+	ui.setSelected("PI-other", "agent");
+	ui.updateAgentStreamSubscription();
+	assert.equal(opened.length, 3);
+	assert.equal(opened[1].closed, true);
+	assert.equal(opened[2].closed, false);
+	opened[2].onmessage({ data: JSON.stringify({ type: "run_event", event: { type: "run_event", id: "PI-agent", runId: "run-live", event: { type: "message_update", messageId: "m-live", delta: " ignored" } } }) });
+	assert.equal(ui.cachedAgentSession("PI-agent", "run-live").session.items[0].content, "Hello");
 
 	ui.handleEventStreamMessage({ data: JSON.stringify({ type: "store", event: { type: "metadata_updated", id: "PI-agent" } }) });
 	assert.equal(ui.loadCalls, 1);
 	ui.handleEventStreamMessage({ data: "not json" });
 	assert.equal(ui.loadCalls, 2);
+});
+
+test("dashboard waits for live stream ready before loading Agent tab snapshot", async () => {
+	const html = await renderDashboardHtml("test-token");
+	const opened = [];
+	class FakeEventSource {
+		constructor(url) {
+			this.url = url;
+			this.closed = false;
+			this.listeners = new Map();
+			opened.push(this);
+		}
+		addEventListener(type, listener) { this.listeners.set(type, listener); }
+		dispatch(type) { this.listeners.get(type)?.({ data: "{}" }); }
+		close() { this.closed = true; }
+	}
+	let apiCalls = 0;
+	const context = {
+		api: async () => {
+			apiCalls += 1;
+			return { issueId: "PI-agent", runId: "run-live", events: [{ type: "message_update", messageId: "m-live", delta: "Snapshot" }] };
+		},
+		EventSource: FakeEventSource,
+		document: { getElementById: () => ({ textContent: "" }) },
+	};
+	vm.runInNewContext(dashboardAgentSessionTestSource(html), context);
+	const ui = context.__dashboardAgentSession;
+	const issue = { id: "PI-agent", automation: { activeRunId: "run-live" } };
+	ui.setState({ issues: [issue] });
+	ui.setSelected("PI-agent", "agent");
+
+	ui.updateAgentStreamSubscription();
+	const loadBeforeReady = ui.ensureActiveAgentSessionLoaded(issue, "run-live");
+	assert.equal(loadBeforeReady, null);
+	assert.equal(apiCalls, 0);
+	assert.equal(opened.length, 1);
+	assert.equal(ui.activeAgentStreamReady, false);
+
+	opened[0].dispatch("ready");
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	assert.equal(apiCalls, 1);
+	assert.equal(ui.activeAgentStreamReady, true);
+	assert.equal(ui.cachedAgentSession("PI-agent", "run-live").session.items[0].content, "Snapshot");
+});
+
+
+test("dashboard refreshes missed agent stream events when re-entering Agent tab", async () => {
+	const html = await renderDashboardHtml("test-token");
+	const opened = [];
+	class FakeEventSource {
+		constructor(url) {
+			this.url = url;
+			this.closed = false;
+			opened.push(this);
+		}
+		close() { this.closed = true; }
+	}
+	let apiCalls = 0;
+	const apiResponses = [
+		[{ type: "message_update", messageId: "m-live", delta: "Initial " }],
+		[
+			{ type: "message_update", messageId: "m-live", delta: "Initial " },
+			{ type: "message_update", messageId: "m-live", delta: "Missed" },
+		],
+	];
+	const context = {
+		api: async () => ({ issueId: "PI-agent", runId: "run-live", events: apiResponses[Math.min(apiCalls++, apiResponses.length - 1)] }),
+		EventSource: FakeEventSource,
+		document: { getElementById: () => ({ textContent: "" }) },
+	};
+	vm.runInNewContext(dashboardAgentSessionTestSource(html), context);
+	const ui = context.__dashboardAgentSession;
+	const issue = { id: "PI-agent", automation: { activeRunId: "run-live" } };
+	ui.setState({ issues: [issue] });
+
+	ui.setSelected("PI-agent", "agent");
+	await ui.ensureActiveAgentSessionLoaded(issue, "run-live");
+	ui.updateAgentStreamSubscription();
+	ui.updateAgentStreamSubscription();
+	assert.equal(apiCalls, 1);
+	assert.equal(opened.length, 1);
+	assert.equal(ui.cachedAgentSession("PI-agent", "run-live").session.items[0].content, "Initial ");
+
+	ui.setSelected("PI-agent", "report");
+	ui.updateAgentStreamSubscription();
+	assert.equal(opened[0].closed, true);
+	assert.equal(ui.activeAgentStreamTarget, null);
+	assert.equal(ui.cachedAgentSession("PI-agent", "run-live").loadedFromApi, false);
+	assert.equal(ui.cachedAgentSession("PI-agent", "run-live").needsRefreshFromApi, true);
+
+	ui.handleEventStreamMessage({ data: JSON.stringify({ type: "store", event: { type: "run_event", id: "PI-agent", runId: "run-live", event: { type: "message_update", messageId: "m-live", delta: "Missed" } } }) });
+	assert.equal(ui.cachedAgentSession("PI-agent", "run-live").session.items[0].content, "Initial ");
+
+	ui.setSelected("PI-agent", "agent");
+	const refreshPromise = ui.ensureActiveAgentSessionLoaded(issue, "run-live");
+	ui.updateAgentStreamSubscription();
+	ui.updateAgentStreamSubscription();
+	await refreshPromise;
+	assert.equal(apiCalls, 2);
+	assert.equal(opened.length, 2);
+	assert.equal(opened[1].closed, false);
+	assert.equal(ui.cachedAgentSession("PI-agent", "run-live").loadedFromApi, true);
+	assert.equal(ui.cachedAgentSession("PI-agent", "run-live").needsRefreshFromApi, false);
+	assert.equal(ui.cachedAgentSession("PI-agent", "run-live").session.items[0].content, "Initial Missed");
+
+	opened[1].onmessage({ data: JSON.stringify({ type: "run_event", event: { type: "run_event", id: "PI-agent", runId: "run-live", event: { type: "message_update", messageId: "m-live", delta: " Live" } } }) });
+	assert.equal(ui.cachedAgentSession("PI-agent", "run-live").session.items[0].content, "Initial Missed Live");
 });
 
 test("dashboard clears hidden new-branch validation when Project branch controls disappear", async () => {
@@ -1567,6 +1741,70 @@ test("server exposes authenticated agent session API", async () => {
 	}
 });
 
+test("server routes run events only to matching per-run streams", async () => {
+	const root = await tempDir();
+	const linked = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const issue = await store.createIssue({ title: "SSE session", spec: "Stream run output.", linkedDirectory: linked });
+	const reject = async () => { throw new Error("not used"); };
+	const server = new OrchestratorServer({
+		store,
+		token: "stream-token",
+		config: { host: "127.0.0.1", port: 0 },
+		actions: {
+			createIssue: reject,
+			comment: reject,
+			updateBacklogIssue: reject,
+			sendBacklogIssueToAgent: reject,
+			approvePlan: reject,
+			requestPlanChanges: reject,
+			approveReview: reject,
+			approveReviewAndMerge: reject,
+			requestReviewChanges: reject,
+			resumeBlockedIssue: reject,
+			improveSpec: reject,
+		},
+	});
+	const url = await server.start();
+	const base = url.split("?")[0].replace(/\/$/, "");
+	const decoder = new TextDecoder();
+	async function readUntil(reader, pattern) {
+		let text = "";
+		const timeout = new Promise((_, rejectTimeout) => setTimeout(() => rejectTimeout(new Error(`Timed out waiting for ${pattern}`)), 1500));
+		const read = (async () => {
+			while (!pattern.test(text)) {
+				const { value, done } = await reader.read();
+				if (done) break;
+				text += decoder.decode(value, { stream: true });
+			}
+			return text;
+		})();
+		return Promise.race([read, timeout]);
+	}
+	const globalResponse = await fetch(`${base}/api/events?token=stream-token`);
+	const streamResponse = await fetch(`${base}/api/issues/${encodeURIComponent(issue.metadata.id)}/runs/run-sse/events?token=stream-token`);
+	assert.equal(globalResponse.status, 200);
+	assert.equal(streamResponse.status, 200);
+	const globalReader = globalResponse.body.getReader();
+	const streamReader = streamResponse.body.getReader();
+	try {
+		await readUntil(globalReader, /event: ready/);
+		await readUntil(streamReader, /event: ready/);
+		await store.appendRunEvent(issue.metadata.id, "run-sse", { type: "message_update", messageId: "m1", delta: "streamed" });
+		const runChunk = await readUntil(streamReader, /streamed/);
+		assert.match(runChunk, /"type":"run_event"/);
+		store.emitChange({ type: "metadata_updated", id: issue.metadata.id });
+		const globalChunk = await readUntil(globalReader, /metadata_updated|run_event/);
+		assert.match(globalChunk, /metadata_updated/);
+		assert.doesNotMatch(globalChunk, /run_event/);
+	} finally {
+		await globalReader.cancel().catch(() => {});
+		await streamReader.cancel().catch(() => {});
+		await server.stop();
+	}
+});
+
 test("server exposes authenticated project API", async () => {
 	const root = await tempDir();
 	const linked = await tempDir();
@@ -2128,6 +2366,32 @@ test("issue store retrieves persisted agent session history", async () => {
 	assert.equal((await store.getAgentSession(issue.metadata.id, "run-2")).session.messages[0].content, "other run");
 });
 
+test("issue store sanitizes persisted dashboard run events", async () => {
+	const root = await tempDir();
+	const linked = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const issue = await store.createIssue({ title: "Sanitize session", spec: "Persist less output.", linkedDirectory: linked });
+	const ignored = await store.appendRunEvent(issue.metadata.id, "run-sanitize", { type: "tool_execution_update", output: "x".repeat(10000) });
+	assert.equal(ignored, null);
+	await store.appendRunEvent(issue.metadata.id, "run-sanitize", { type: "tool_execution_start", toolExecutionId: "t1", toolName: "bash", input: { command: "echo hi" }, stdout: "x".repeat(10000) });
+	await store.appendRunEvent(issue.metadata.id, "run-sanitize", { type: "tool_execution_end", toolExecutionId: "t1", result: { content: [{ type: "text", text: "x".repeat(10000) }], isError: false } });
+	const persisted = await fsp.readFile(store.runPath(issue.metadata.id, "run-sanitize"), "utf-8");
+	assert.doesNotMatch(persisted, /xxxxx/);
+	assert.doesNotMatch(persisted, /stdout/);
+	assert.doesNotMatch(persisted, /result/);
+	assert.match(persisted, /echo hi/);
+
+	await fsp.appendFile(store.runPath(issue.metadata.id, "run-sanitize"), `${JSON.stringify({ type: "tool_execution_update", toolExecutionId: "t1", partialResult: { content: [{ type: "text", text: "legacy large output" }] } })}\n`, "utf-8");
+	const session = await store.getAgentSession(issue.metadata.id, "run-sanitize");
+	assert.equal(session.events.some((event) => JSON.stringify(event).includes("legacy large output")), false);
+	const tool = session.session.tools[0];
+	assert.equal(tool.name, "bash");
+	assert.match(tool.input, /echo hi/);
+	assert.equal("updates" in tool, false);
+	assert.equal("output" in tool, false);
+});
+
 test("issue store creates and reuses Projects with default names", async () => {
 	const root = await tempDir();
 	const linked = await tempDir();
@@ -2182,9 +2446,13 @@ test("issue store blocks Project deletion with active tickets and cleans complet
 	const completedProject = (await store.saveProject({ name: "Done", path: completedDir })).project;
 	const completed = await store.createIssue({ title: "Completed project ticket", spec: "Remove.", projectId: completedProject.id });
 	await store.setLane(completed.metadata.id, LANE.COMPLETED, "test");
+	await store.appendRunEvent(completed.metadata.id, "run-delete", { type: "message_update", delta: "delete me" });
+	await fsp.mkdir(path.join(root, "sessions", completed.metadata.id), { recursive: true });
+	await fsp.writeFile(path.join(root, "sessions", completed.metadata.id, "run.jsonl"), "{}\n", "utf-8");
 	const result = await store.deleteProject(completedProject.id);
 	assert.deepEqual(result.removedIssueIds, [completed.metadata.id]);
 	assert.equal(await exists(store.issueDir(completed.metadata.id)), false);
+	assert.equal(await exists(path.join(root, "sessions", completed.metadata.id)), false);
 	assert.equal((await store.listProjects()).some((project) => project.id === completedProject.id), false);
 });
 
@@ -2206,6 +2474,8 @@ test("issue store cleans only old completed tickets into archive", async () => {
 	const recentCompleted = await store.createIssue({ title: "Recent completed cleanup", spec: "Keep recent.", linkedDirectory: linked });
 	await store.setLane(recentCompleted.metadata.id, LANE.COMPLETED, "test");
 	await patchIssueMetadata(store, recentCompleted.metadata.id, { updatedAt: "2026-05-01T00:00:00.000Z" });
+	await store.appendRunEvent(oldCompleted.metadata.id, "run-clean", { type: "message_update", delta: "archived output" });
+	await store.appendRunEvent(oldInProgress.metadata.id, "run-keep", { type: "message_update", delta: "active output" });
 	await fsp.mkdir(path.join(root, "sessions", oldCompleted.metadata.id), { recursive: true });
 	await fsp.writeFile(path.join(root, "sessions", oldCompleted.metadata.id, "run.jsonl"), "{}\n", "utf-8");
 	await fsp.mkdir(path.join(root, "sessions", oldInProgress.metadata.id), { recursive: true });
@@ -2216,7 +2486,9 @@ test("issue store cleans only old completed tickets into archive", async () => {
 	assert.equal(result.retentionDays, COMPLETED_TICKET_CLEANUP_RETENTION_DAYS);
 	assert.equal(await exists(path.join(root, "issues", oldCompleted.metadata.id)), false);
 	assert.equal(await exists(path.join(root, "issues", "__archived_completed__", oldCompleted.metadata.id, "metadata.json")), true);
+	assert.equal(await exists(path.join(root, "issues", "__archived_completed__", oldCompleted.metadata.id, "runs")), false);
 	assert.equal(await exists(path.join(root, "issues", oldInProgress.metadata.id, "metadata.json")), true);
+	assert.equal(await exists(path.join(root, "issues", oldInProgress.metadata.id, "runs", "run-keep.jsonl")), true);
 	assert.equal(await exists(path.join(root, "issues", recentCompleted.metadata.id, "metadata.json")), true);
 	assert.equal(await exists(path.join(root, "sessions", oldCompleted.metadata.id)), false);
 	assert.equal(await exists(path.join(root, "sessions", oldInProgress.metadata.id)), true);
@@ -3063,8 +3335,10 @@ test("rpc runner rejects a process that exits before agent_end", async () => {
 	);
 
 	const runs = await fsp.readdir(path.join(root, "issues", issue.metadata.id, "runs"));
-	const log = await fsp.readFile(path.join(root, "issues", issue.metadata.id, "runs", runs[0]), "utf-8");
-	assert.match(log, /"type":"process_exit"/);
+	for (const run of runs) {
+		const log = await fsp.readFile(path.join(root, "issues", issue.metadata.id, "runs", run), "utf-8");
+		assert.doesNotMatch(log, /"type":"process_exit"/);
+	}
 });
 
 test("rpc runner can reuse an existing session file", async () => {
@@ -3177,6 +3451,69 @@ test("rpc runner persists streaming lifecycle events with oversized payload trun
 	const events = log.trim().split("\n").map((line) => JSON.parse(line));
 	assert.equal(events.some((event) => event.type === "message_update" && event.truncated), true);
 	assert.equal(events.some((event) => event.type === "message_end"), true);
+});
+
+test("rpc runner sanitizes oversized tool events before dashboard compaction", async () => {
+	const root = await tempDir();
+	const linked = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const issue = await store.createIssue({
+		title: "Oversized tool event",
+		spec: "Keep concise tool metadata.",
+		linkedDirectory: linked,
+	});
+	const fakeRpc = path.join(root, "fake-rpc.mjs");
+	await fsp.writeFile(
+		fakeRpc,
+		[
+			"#!/usr/bin/env node",
+			"let buffer = '';",
+			"const emit = (event) => new Promise((resolve) => process.stdout.write(JSON.stringify(event) + '\\n', resolve));",
+			"process.stdin.setEncoding('utf8');",
+			"process.stdin.on('data', async (chunk) => {",
+			"  buffer += chunk;",
+			"  const index = buffer.indexOf('\\n');",
+			"  if (index === -1) return;",
+			"  const command = JSON.parse(buffer.slice(0, index));",
+			"  await emit({ id: command.id, type: 'response', command: command.type, success: true });",
+			"  await emit({ type: 'tool_execution_start', toolExecutionId: 'tool-big', toolName: 'bash', input: { command: 'echo start' } });",
+			"  await emit({ type: 'tool_execution_end', toolExecutionId: 'tool-big', toolName: 'bash', input: { command: 'echo ' + 'a'.repeat(70 * 1024) }, status: 'complete', stdout: 'z'.repeat(70 * 1024), result: { content: [{ type: 'text', text: 'z'.repeat(70 * 1024) }], isError: false } });",
+			"  const message = { role: 'assistant', content: [{ type: 'text', text: 'finished' }] };",
+			"  await emit({ type: 'message_end', message });",
+			"  await emit({ type: 'agent_end', messages: [message] });",
+			"  process.exit(0);",
+			"});",
+			"",
+		].join("\n"),
+		"utf-8",
+	);
+	await fsp.chmod(fakeRpc, 0o755);
+
+	const runner = new RpcAgentRunner({ store, command: fakeRpc, timeoutMs: 2000, idleTimeoutMs: 0 });
+	await runner.run({
+		issueId: issue.metadata.id,
+		role: "worker",
+		cwd: linked,
+		prompt: "hello",
+	});
+
+	const runs = await fsp.readdir(path.join(root, "issues", issue.metadata.id, "runs"));
+	const logPath = path.join(root, "issues", issue.metadata.id, "runs", runs[0]);
+	const log = await fsp.readFile(logPath, "utf-8");
+	const stats = await fsp.stat(logPath);
+	const events = log.trim().split("\n").map((line) => JSON.parse(line));
+	const endEvent = events.find((event) => event.type === "tool_execution_end");
+	assert.ok(endEvent, "oversized tool end event should survive sanitization");
+	assert.equal(endEvent.toolCallId, "tool-big");
+	assert.equal(endEvent.toolName, "bash");
+	assert.equal(endEvent.status, "complete");
+	assert.match(endEvent.input, /echo aaa/);
+	assert.equal(endEvent.input.length <= 4001, true);
+	assert.equal("stdout" in endEvent, false);
+	assert.equal("result" in endEvent, false);
+	assert.doesNotMatch(log, /zzzzz/);
+	assert.ok(stats.size < 16 * 1024, `dashboard run log should stay compact, got ${stats.size} bytes`);
 });
 
 test("scheduler startup recovers interrupted active runs", async () => {

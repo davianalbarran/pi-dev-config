@@ -223,6 +223,7 @@ export class OrchestratorServer {
 		this.url = null;
 		this.shareInfo = null;
 		this.clients = new Set();
+		this.streamClients = new Map();
 		this.unsubscribe = null;
 	}
 
@@ -233,7 +234,10 @@ export class OrchestratorServer {
 				sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
 			});
 		});
-		this.unsubscribe = this.store.onChange((event) => this.broadcast({ type: "store", event }));
+		this.unsubscribe = this.store.onChange((event) => {
+			if (event?.type === "run_event") this.broadcastRunEvent(event);
+			else this.broadcast({ type: "store", event });
+		});
 		await new Promise((resolve, reject) => {
 			this.server.once("error", reject);
 			this.server.listen(this.config.port, this.config.host, () => {
@@ -257,6 +261,10 @@ export class OrchestratorServer {
 		this.unsubscribe = null;
 		for (const client of this.clients) client.end();
 		this.clients.clear();
+		for (const clients of this.streamClients.values()) {
+			for (const client of clients) client.end();
+		}
+		this.streamClients.clear();
 		if (!this.server) return;
 		await new Promise((resolve) => this.server.close(resolve));
 		this.server = null;
@@ -266,6 +274,32 @@ export class OrchestratorServer {
 	broadcast(event) {
 		const payload = `data: ${JSON.stringify(event)}\n\n`;
 		for (const client of this.clients) client.write(payload);
+	}
+
+	streamKey(issueId, runId) {
+		return `${issueId}\0${runId}`;
+	}
+
+	broadcastRunEvent(event) {
+		if (!event?.id || !event?.runId) return;
+		const clients = this.streamClients.get(this.streamKey(event.id, event.runId));
+		if (!clients?.size) return;
+		const payload = `data: ${JSON.stringify({ type: "run_event", event })}\n\n`;
+		for (const client of clients) client.write(payload);
+	}
+
+	addStreamClient(issueId, runId, res) {
+		const key = this.streamKey(issueId, runId);
+		let clients = this.streamClients.get(key);
+		if (!clients) {
+			clients = new Set();
+			this.streamClients.set(key, clients);
+		}
+		clients.add(res);
+		return () => {
+			clients.delete(res);
+			if (!clients.size) this.streamClients.delete(key);
+		};
 	}
 
 	async handle(req, res) {
@@ -380,6 +414,27 @@ export class OrchestratorServer {
 		if (diffMatch && req.method === "GET") {
 			const issue = await this.store.loadIssue(decodeURIComponent(diffMatch[1]));
 			return sendJson(res, 200, await getIssueDiffs(issue));
+		}
+
+		const runEventsMatch = pathname.match(/^\/api\/issues\/([^/]+)\/runs\/([^/]+)\/events$/);
+		if (runEventsMatch && req.method === "GET") {
+			const id = decodeURIComponent(runEventsMatch[1]);
+			const runId = decodeURIComponent(runEventsMatch[2]);
+			try {
+				assertSafeRunPathSegment(id, "issue id");
+				assertSafeRunPathSegment(runId);
+			} catch (error) {
+				return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+			}
+			res.writeHead(200, {
+				"content-type": "text/event-stream",
+				"cache-control": "no-store",
+				connection: "keep-alive",
+			});
+			res.write("event: ready\ndata: {}\n\n");
+			const remove = this.addStreamClient(id, runId, res);
+			req.on("close", remove);
+			return;
 		}
 
 		const runMatch = pathname.match(/^\/api\/issues\/([^/]+)\/runs\/([^/]+)$/);

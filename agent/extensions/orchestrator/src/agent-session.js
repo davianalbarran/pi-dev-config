@@ -1,4 +1,5 @@
 const MESSAGE_EVENT_TYPES = new Set(["message_start", "message_update", "message_end"]);
+const MAX_TOOL_ARGUMENT_CHARS = 4000;
 const TOOL_EVENT_ALIASES = new Map([
 	["tool_call_start", "tool_call_start"],
 	["tool_call_update", "tool_call_update"],
@@ -46,15 +47,20 @@ function textFromToolResult(value) {
 	return firstString(object.output, object.stdout, object.stderr, object.result, object.value);
 }
 
+function truncateValue(value, maxLength = MAX_TOOL_ARGUMENT_CHARS) {
+	const text = String(value || "");
+	return text.length > maxLength ? `${text.slice(0, maxLength)}…` : text;
+}
+
 function stringifyValue(value) {
 	if (value === undefined || value === null) return "";
-	if (typeof value === "string") return value;
+	if (typeof value === "string") return truncateValue(value);
 	const contentText = textFromToolResult(value);
-	if (contentText) return contentText;
+	if (contentText) return truncateValue(contentText);
 	try {
-		return JSON.stringify(value, null, 2);
+		return truncateValue(JSON.stringify(value, null, 2));
 	} catch {
-		return String(value);
+		return truncateValue(String(value));
 	}
 }
 
@@ -105,12 +111,12 @@ function toolPayload(event) {
 
 function toolIdFromEvent(event) {
 	const tool = toolPayload(event);
-	return firstString(event.toolCallId, event.tool_call_id, event.toolExecutionId, event.tool_execution_id, event.callId, tool.id, tool.callId, tool.toolCallId);
+	return firstString(event.toolCallId, event.tool_call_id, event.toolExecutionId, event.tool_execution_id, event.callId, event.call_id, tool.id, tool.callId, tool.call_id, tool.toolCallId, tool.tool_call_id, tool.toolExecutionId, tool.tool_execution_id);
 }
 
 function toolNameFromEvent(event) {
 	const tool = toolPayload(event);
-	return firstString(event.toolName, event.tool_name, event.name, event.tool, tool.name, tool.toolName, tool.command);
+	return firstString(event.toolName, event.tool_name, event.name, event.tool, tool.name, tool.toolName, tool.tool_name, tool.command);
 }
 
 function toolInputFromEvent(event) {
@@ -118,23 +124,17 @@ function toolInputFromEvent(event) {
 	return stringifyValue(event.input ?? event.arguments ?? event.args ?? event.parameters ?? tool.input ?? tool.arguments ?? tool.args ?? tool.parameters);
 }
 
-function toolOutputFromEvent(event) {
+function toolStatusFromEvent(event) {
 	const tool = toolPayload(event);
-	return stringifyValue(event.partialResult ?? event.output ?? event.result ?? event.stdout ?? event.stderr ?? event.text ?? event.delta ?? tool.partialResult ?? tool.output ?? tool.result ?? tool.stdout ?? tool.stderr);
+	return firstString(event.status, tool.status);
 }
 
-function toolErrorFromEvent(event) {
-	const tool = toolPayload(event);
-	const result = asObject(event.result) || asObject(tool.result);
-	const partialResult = asObject(event.partialResult) || asObject(tool.partialResult);
-	return firstString(event.error, event.errorMessage, result?.error, result?.errorMessage, partialResult?.error, partialResult?.errorMessage, tool.error, tool.errorMessage);
-}
 
 function toolIsErrorFromEvent(event) {
 	const tool = toolPayload(event);
 	const result = asObject(event.result) || asObject(tool.result);
 	const partialResult = asObject(event.partialResult) || asObject(tool.partialResult);
-	return event.isError === true || result?.isError === true || partialResult?.isError === true || tool.isError === true;
+	return event.isError === true || !!event.error || !!event.errorMessage || result?.isError === true || partialResult?.isError === true || tool.isError === true || !!tool.error || !!tool.errorMessage;
 }
 
 function normalizeType(type) {
@@ -142,8 +142,39 @@ function normalizeType(type) {
 	return TOOL_EVENT_ALIASES.get(type) || "";
 }
 
-export function normalizeAgentSessionEvent(event, index = 0) {
+export function sanitizeAgentStreamEvent(event) {
 	const object = asObject(event);
+	if (!object) return null;
+	const type = normalizeType(object.type);
+	if (!type) return null;
+	if (type.startsWith("message_")) return { ...object };
+
+	const tool = toolPayload(object);
+	const id = toolIdFromEvent(object);
+	const name = toolNameFromEvent(object);
+	const input = toolInputFromEvent(object);
+	const status = toolStatusFromEvent(object);
+	const isError = toolIsErrorFromEvent(object);
+	const success = typeof object.success === "boolean" ? object.success : undefined;
+	const hasRenderableToolData = !!(name || input || status || isError || success !== undefined || (id && type === "tool_call_end"));
+	if (!hasRenderableToolData) return null;
+
+	const sanitized = { type: object.type };
+	if (object.at) sanitized.at = object.at;
+	if (object.timestamp) sanitized.timestamp = object.timestamp;
+	if (id) sanitized.toolCallId = id;
+	if (name) sanitized.toolName = name;
+	if (input) sanitized.input = input;
+	if (status) sanitized.status = status;
+	if (isError) sanitized.isError = true;
+	if (success !== undefined) sanitized.success = success;
+	if (!sanitized.status && type === "tool_call_end") sanitized.status = isError || success === false ? "error" : "complete";
+	if (!sanitized.status && type === "tool_call_start") sanitized.status = "running";
+	return sanitized;
+}
+
+export function normalizeAgentSessionEvent(event, index = 0) {
+	const object = sanitizeAgentStreamEvent(event);
 	if (!object) return null;
 	const type = normalizeType(object.type);
 	if (!type) return null;
@@ -168,11 +199,9 @@ export function normalizeAgentSessionEvent(event, index = 0) {
 		id: toolIdFromEvent(object),
 		name: toolNameFromEvent(object),
 		input: toolInputFromEvent(object),
-		output: toolOutputFromEvent(object),
-		error: toolErrorFromEvent(object),
 		isError: toolIsErrorFromEvent(object),
 		success: typeof object.success === "boolean" ? object.success : undefined,
-		status: firstString(object.status, asObject(toolPayload(object))?.status),
+		status: toolStatusFromEvent(object),
 		raw: object,
 		index,
 	};
@@ -229,9 +258,6 @@ export function assembleAgentSession(events = []) {
 				id,
 				name: normalized.name || "tool",
 				input: "",
-				updates: [],
-				output: "",
-				error: "",
 				status: normalized.type === "tool_call_end" ? "complete" : "running",
 				startedAt: normalized.at,
 				updatedAt: normalized.at,
@@ -272,18 +298,18 @@ export function assembleAgentSession(events = []) {
 			}
 			continue;
 		}
+		if (!normalized.name && !normalized.input && (!normalized.id || !toolsById.has(normalized.id))) {
+			ignoredCount += 1;
+			continue;
+		}
 		const item = getTool(normalized);
 		item.eventTypes.push(normalized.type);
 		item.updatedAt = normalized.at || item.updatedAt;
 		if (normalized.name && (!item.name || item.name === "tool")) item.name = normalized.name;
 		if (normalized.input && !item.input) item.input = normalized.input;
-		if (normalized.type === "tool_call_update" && normalized.output) item.updates.push({ at: normalized.at, text: normalized.output });
 		if (normalized.isError) item.status = "error";
 		if (normalized.type === "tool_call_end") {
-			if (normalized.output) item.output = normalized.output;
-			if (normalized.error) item.error = normalized.error;
-			if (normalized.isError && !item.error) item.error = "Tool returned an error.";
-			item.status = normalized.error || normalized.isError || normalized.success === false ? "error" : (normalized.status || "complete");
+			item.status = normalized.isError || normalized.success === false ? "error" : (normalized.status || "complete");
 			item.endedAt = normalized.at || item.updatedAt;
 		} else if (normalized.status && !normalized.isError) {
 			item.status = normalized.status;
