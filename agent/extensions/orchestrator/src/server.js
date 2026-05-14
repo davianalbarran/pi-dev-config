@@ -477,6 +477,16 @@ export class OrchestratorServer {
 			}
 		}
 
+		const projectRefreshMatch = pathname.match(/^\/api\/projects\/([^/]+)\/refresh$/);
+		if (projectRefreshMatch && req.method === "POST") {
+			try {
+				const id = decodeURIComponent(projectRefreshMatch[1]);
+				return sendJson(res, 200, await this.store.refreshProjectGitState(id));
+			} catch (error) {
+				return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+			}
+		}
+
 		const projectMatch = pathname.match(/^\/api\/projects\/([^/]+)(?:\/(delete))?$/);
 		if (projectMatch && req.method === "POST") {
 			try {

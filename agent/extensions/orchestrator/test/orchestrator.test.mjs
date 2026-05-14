@@ -67,6 +67,20 @@ async function git(args, cwd) {
 	return execFileAsync("git", args, { cwd, maxBuffer: 1024 * 1024 });
 }
 
+async function initGitRepoWithMain(repo) {
+	try {
+		await git(["init", "-b", "main"], repo);
+	} catch {
+		await git(["init"], repo);
+		await git(["checkout", "-B", "main"], repo);
+	}
+	await git(["config", "user.email", "test@example.local"], repo);
+	await git(["config", "user.name", "Test User"], repo);
+	await fsp.writeFile(path.join(repo, "README.md"), "initial\n", "utf-8");
+	await git(["add", "README.md"], repo);
+	await git(["commit", "-m", "initial"], repo);
+}
+
 function dashboardNotificationTestSource() {
 	const start = DASHBOARD_JS_SOURCE.indexOf("const HUMAN_INTERVENTION_LANES = new Set");
 	const end = DASHBOARD_JS_SOURCE.indexOf("function resetSpecWriterState()", start);
@@ -92,7 +106,7 @@ function dashboardBacklogSuggestionTestSource(html) {
 }
 
 function dashboardProjectTestSource(html) {
-	return `${dashboardDraftTestSource(html)}\nglobalThis.__dashboardProject = {\n\tsetProjects(nextProjects) { projects = nextProjects; state = { ...state, projects: nextProjects }; },\n\tsetProfiles(nextProfiles) { profiles = nextProfiles; },\n\tselectProject(id) { selectedProjectId = id; },\n\tsetIssueFormMode(mode) { issueFormMode = mode; },\n\tsetBranchMode(mode) { branchMode = mode; },\n\tget branchMode() { return branchMode; },\n\tget selectedProfileId() { return selectedProfileId; },\n\tget agentSettingsDirtyByUser() { return agentSettingsDirtyByUser; },\n\trenderGitBranchControls,\n\trenderAgentSettingsControls,\n\trenderProfileSelect,\n\trenderProjectProfileSelect,\n\tprojectConfiguredProfile,\n\tapplyProjectAgentSettingsDefault,\n\tapplyAgentSettings,\n\tmarkAgentSettingsDirtyByUser,\n\tselectAgentSettingsProfile(id) { selectedProfileId = id; renderProfileSelect(); applyAgentSettings(profileById(selectedProfileId).agentSettings); markAgentSettingsDirtyByUser(); },\n\tcurrentAgentSettingsFromDom,\n\tupdateBranchValidationMessage,\n\tsaveProjectFromForm,\n\tsaveInlineProject,\n};\n`;
+	return `${dashboardDraftTestSource(html)}\nglobalThis.__dashboardProject = {\n\tsetProjects(nextProjects) { projects = nextProjects; state = { ...state, projects: nextProjects }; },\n\tsetProfiles(nextProfiles) { profiles = nextProfiles; },\n\tselectProject(id) { selectedProjectId = id; },\n\tsetIssueFormMode(mode) { issueFormMode = mode; },\n\tsetBranchMode(mode) { branchMode = mode; },\n\tget branchMode() { return branchMode; },\n\tget selectedProfileId() { return selectedProfileId; },\n\tget agentSettingsDirtyByUser() { return agentSettingsDirtyByUser; },\n\tgetProject(id) { return projectById(id); },\n\tisProjectRefreshing,\n\tprojectRefreshError,\n\tpopulateLinkedDirectoryOptions,\n\trefreshSelectedProjectGitState,\n\trenderGitBranchControls,\n\trenderAgentSettingsControls,\n\trenderProfileSelect,\n\trenderProjectProfileSelect,\n\tprojectConfiguredProfile,\n\tapplyProjectAgentSettingsDefault,\n\tapplyAgentSettings,\n\tmarkAgentSettingsDirtyByUser,\n\tselectAgentSettingsProfile(id) { selectedProfileId = id; renderProfileSelect(); applyAgentSettings(profileById(selectedProfileId).agentSettings); markAgentSettingsDirtyByUser(); },\n\tcurrentAgentSettingsFromDom,\n\tupdateBranchValidationMessage,\n\tsaveProjectFromForm,\n\tsaveInlineProject,\n};\n`;
 }
 
 function dashboardProjectVmContext(ids = []) {
@@ -706,6 +720,8 @@ test("dashboard renderer injects runtime data", async () => {
 	assert.match(source, /function setSpecWriterLoading\(loading\)/);
 	assert.match(source, /function renderImprovedSpec\(\)/);
 	assert.match(source, /function projectById\(id\)/);
+	assert.match(source, /async function refreshSelectedProjectGitState\(projectId = selectedProjectId\)/);
+	assert.match(source, /\/api\/projects\/" \+ encodeURIComponent\(id\) \+ "\/refresh/);
 	assert.match(source, /function populateLinkedDirectoryOptions\(\)/);
 	assert.match(source, /function renderProjectProfileSelect\(selectedId = "", elementId = "projectFormAgentSettingsProfileId"\)/);
 	assert.match(source, /function projectConfiguredProfile\(project\)/);
@@ -713,6 +729,8 @@ test("dashboard renderer injects runtime data", async () => {
 	assert.match(source, /function projectGitStatusMessage\(project\)/);
 	assert.match(source, /function newBranchValidationError\(project, branchName, baseBranch\)/);
 	assert.match(source, /Selected Project is no longer configured\. Choose another Project before submitting\./);
+	assert.match(source, /Refreshing Git branches…/);
+	assert.match(source, /Git branch refresh failed:/);
 	assert.match(source, /Git branch controls unavailable:/);
 	assert.match(source, /Branch already exists: /);
 	assert.match(source, /projectSelect"\)\.addEventListener\("change"/);
@@ -1057,6 +1075,102 @@ test("dashboard clears hidden new-branch validation when Project branch controls
 	assert.equal(result.baseDisabled, true);
 	assert.equal(result.existingDisabled, true);
 	assert.equal(result.branchMode, "existing");
+});
+
+test("dashboard refreshes Project branches before showing branch controls", async () => {
+	const html = await renderDashboardHtml("test-token");
+	const context = dashboardProjectVmContext([
+		"projectSelect",
+		"linkedDirectory",
+		"selectedProjectSummary",
+		"git-branch-controls",
+		"branch-validation-message",
+		"existingBaseBranch",
+		"newBranchBase",
+		"newBranchName",
+		"new-branch-panel",
+	]);
+	const result = await vm.runInNewContext(`${dashboardProjectTestSource(html)}
+		(async () => {
+			const staleProject = { id: "git", name: "Git Project", path: "/tmp/git", isGitRepository: true, git: { branches: ["main"], defaultBranch: "main" } };
+			const refreshedProject = { ...staleProject, git: { branches: ["main", "feature/fresh"], defaultBranch: "main" } };
+			let resolveRefresh;
+			const urls = [];
+			api = async (url, options) => {
+				urls.push(url);
+				return new Promise((resolve) => { resolveRefresh = resolve; });
+			};
+			__dashboardProject.setProjects([staleProject]);
+			__dashboardProject.selectProject("git");
+			__dashboardProject.populateLinkedDirectoryOptions();
+			const refreshPromise = __dashboardProject.refreshSelectedProjectGitState("git");
+			const during = {
+				refreshing: __dashboardProject.isProjectRefreshing("git"),
+				summary: document.getElementById("selectedProjectSummary").textContent,
+				controlsHidden: document.getElementById("git-branch-controls").hidden,
+				existingOptions: document.getElementById("existingBaseBranch").options.map((option) => option.value),
+			};
+			resolveRefresh({ project: refreshedProject, projects: [refreshedProject] });
+			await refreshPromise;
+			const after = {
+				refreshing: __dashboardProject.isProjectRefreshing("git"),
+				summary: document.getElementById("selectedProjectSummary").textContent,
+				controlsHidden: document.getElementById("git-branch-controls").hidden,
+				existingOptions: document.getElementById("existingBaseBranch").options.map((option) => option.value),
+				branches: __dashboardProject.getProject("git").git.branches,
+			};
+			return { urls, during, after };
+		})()
+	`, context);
+
+	assert.equal(result.urls.length, 1);
+	assert.equal(result.urls[0], "/api/projects/git/refresh");
+	assert.equal(result.during.refreshing, true);
+	assert.match(result.during.summary, /Refreshing Git branches/);
+	assert.equal(result.during.controlsHidden, true);
+	assert.equal(result.during.existingOptions.length, 0);
+	assert.equal(result.after.refreshing, false);
+	assert.equal(result.after.controlsHidden, false);
+	assert.equal(result.after.branches.length, 2);
+	assert.ok(result.after.branches.includes("main"));
+	assert.ok(result.after.branches.includes("feature/fresh"));
+	assert.ok(result.after.existingOptions.includes("feature/fresh"));
+});
+
+test("dashboard shows Project branch refresh failures and suppresses stale branch options", async () => {
+	const html = await renderDashboardHtml("test-token");
+	const context = dashboardProjectVmContext([
+		"projectSelect",
+		"linkedDirectory",
+		"selectedProjectSummary",
+		"git-branch-controls",
+		"branch-validation-message",
+		"existingBaseBranch",
+		"newBranchBase",
+		"newBranchName",
+		"new-branch-panel",
+	]);
+	const result = await vm.runInNewContext(`${dashboardProjectTestSource(html)}
+		(async () => {
+			const staleProject = { id: "git", name: "Git Project", path: "/tmp/git", isGitRepository: true, git: { branches: ["main", "stale/missing"], defaultBranch: "main" } };
+			api = async () => { throw new Error("repository access denied"); };
+			__dashboardProject.setProjects([staleProject]);
+			__dashboardProject.selectProject("git");
+			__dashboardProject.populateLinkedDirectoryOptions();
+			await __dashboardProject.refreshSelectedProjectGitState("git");
+			return {
+				error: __dashboardProject.projectRefreshError("git"),
+				summary: document.getElementById("selectedProjectSummary").textContent,
+				controlsHidden: document.getElementById("git-branch-controls").hidden,
+				existingOptions: document.getElementById("existingBaseBranch").options.map((option) => option.value),
+			};
+		})()
+	`, context);
+
+	assert.equal(result.error, "repository access denied");
+	assert.match(result.summary, /Git branch refresh failed: repository access denied/);
+	assert.equal(result.controlsHidden, true);
+	assert.equal(result.existingOptions.length, 0);
 });
 
 test("dashboard keeps Project dialog open when duplicate path reuses an existing Project", async () => {
@@ -2121,6 +2235,7 @@ test("server routes run events only to matching per-run streams", async () => {
 test("server exposes authenticated project API", async () => {
 	const root = await tempDir();
 	const linked = await tempDir();
+	await initGitRepoWithMain(linked);
 	const store = new IssueStore({ dataRoot: root });
 	await store.init();
 	const reject = async () => {
@@ -2165,11 +2280,23 @@ test("server exposes authenticated project API", async () => {
 		assert.equal(resolvedBody.reused, true);
 		assert.equal(resolvedBody.project.id, createdBody.project.id);
 
+		await git(["branch", "server-fresh"], linked);
+		const refreshed = await fetch(`${base}/api/projects/${encodeURIComponent(createdBody.project.id)}/refresh?token=project-token`, { method: "POST", body: "{}" });
+		assert.equal(refreshed.status, 200);
+		const refreshedBody = await refreshed.json();
+		assert.ok(refreshedBody.project.git.branches.includes("server-fresh"));
+
 		const list = await fetch(`${base}/api/projects?token=project-token`);
 		assert.equal(list.status, 200);
 		const listBody = await list.json();
 		assert.equal(listBody.projects.length, 1);
 		assert.deepEqual(listBody.counts[createdBody.project.id], { active: 0, completed: 0 });
+
+		await fsp.rm(linked, { recursive: true, force: true });
+		const failedRefresh = await fetch(`${base}/api/projects/${encodeURIComponent(createdBody.project.id)}/refresh?token=project-token`, { method: "POST", body: "{}" });
+		assert.equal(failedRefresh.status, 400);
+		const failedRefreshBody = await failedRefresh.json();
+		assert.match(failedRefreshBody.error, /Project path is not accessible/);
 	} finally {
 		await server.stop();
 	}
@@ -3066,6 +3193,49 @@ test("issue store persists optional Project Agent Settings profiles and rejects 
 	assert.equal(duplicate.reused, true);
 	assert.equal(duplicate.project.id, withProfile.project.id);
 	assert.equal(duplicate.project.agentSettingsProfileId, profileId);
+});
+
+test("issue store refreshes stale Project git branches when relinking", async () => {
+	const root = await tempDir();
+	const repo = await tempDir();
+	await initGitRepoWithMain(repo);
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+
+	const saved = await store.saveProject({ path: repo });
+	assert.deepEqual(saved.project.git.branches, ["main"]);
+
+	await git(["branch", "feature/linked-after-save"], repo);
+	const ensured = await store.ensureProjectForPath(`${repo}/`);
+	assert.equal(ensured.reused, true);
+	assert.equal(ensured.project.id, saved.project.id);
+	assert.ok(ensured.project.git.branches.includes("feature/linked-after-save"));
+
+	const duplicate = await store.saveProject({ name: "Duplicate", path: repo });
+	assert.equal(duplicate.reused, true);
+	assert.ok(duplicate.project.git.branches.includes("feature/linked-after-save"));
+});
+
+test("issue creation refreshes selected Project git metadata before storing git requests", async () => {
+	const root = await tempDir();
+	const repo = await tempDir();
+	await initGitRepoWithMain(repo);
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+
+	const saved = await store.saveProject({ path: repo });
+	assert.deepEqual(saved.project.git.branches, ["main"]);
+	await git(["branch", "feature/new-base"], repo);
+
+	const issue = await store.createIssue({
+		title: "Use freshly linked base",
+		spec: "Use the branch that was added after Project save.",
+		projectId: saved.project.id,
+		gitRequest: { mode: "existing", baseBranch: "feature/new-base" },
+	});
+	assert.equal(issue.metadata.gitRequest.baseBranch, "feature/new-base");
+	const [refreshedProject] = await store.listProjects();
+	assert.ok(refreshedProject.git.branches.includes("feature/new-base"));
 });
 
 test("issue store backfills Projects from legacy linked-directory tickets", async () => {

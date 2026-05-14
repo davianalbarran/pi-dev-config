@@ -169,6 +169,32 @@ export class IssueStore {
 		return this.readProjectsRaw();
 	}
 
+	async refreshProjectGitState(projectOrId) {
+		await this.init();
+		await this.backfillProjectsFromIssues();
+		const requestedId = typeof projectOrId === "object" && projectOrId
+			? String(projectOrId.id || "").trim()
+			: String(projectOrId || "").trim();
+		if (!requestedId) throw new Error("Project is required.");
+		const projects = await this.readProjectsRaw();
+		const project = projects.find((item) => item.id === requestedId);
+		if (!project) throw new Error("Project is no longer configured.");
+		await this.validateProjectPath(project.path);
+		const gitMetadata = await this.projectGitMetadata(project.path);
+		const refreshedProject = this.normalizeProject({
+			...project,
+			...gitMetadata,
+			updatedAt: nowIso(),
+		});
+		const nextProjects = [refreshedProject, ...projects.filter((item) => item.id !== refreshedProject.id)].sort((a, b) => a.name.localeCompare(b.name) || a.path.localeCompare(b.path));
+		await this.writeProjects(nextProjects);
+		if (JSON.stringify(this.projectSnapshot(project)) !== JSON.stringify(this.projectSnapshot(refreshedProject))) {
+			await this.updateIssueProjectSnapshots(refreshedProject);
+		}
+		this.emitChange({ type: "project_git_refreshed", id: refreshedProject.id });
+		return { project: refreshedProject, projects: nextProjects };
+	}
+
 	async saveProject({ id, name, title, path: projectPath, linkedDirectory, agentSettingsProfileId } = {}) {
 		await this.init();
 		await this.backfillProjectsFromIssues();
@@ -178,7 +204,8 @@ export class IssueStore {
 		const requestedId = String(id || "").trim();
 		const duplicate = projects.find((project) => project.path === normalizedPath && project.id !== requestedId);
 		if (duplicate) {
-			return { project: duplicate, projects, reused: true, message: `Using existing Project for ${normalizedPath}.` };
+			const refreshed = await this.refreshProjectGitState(duplicate.id);
+			return { ...refreshed, reused: true, message: `Using existing Project for ${normalizedPath}.` };
 		}
 		const now = nowIso();
 		const existing = requestedId ? projects.find((project) => project.id === requestedId) : null;
@@ -211,16 +238,22 @@ export class IssueStore {
 		const normalizedPath = this.normalizeProjectPath(projectPath);
 		const projects = await this.readProjectsRaw();
 		const existing = projects.find((project) => project.path === normalizedPath);
-		if (existing) return { project: existing, projects, reused: true, message: `Using existing Project for ${normalizedPath}.` };
+		if (existing) {
+			const refreshed = await this.refreshProjectGitState(existing.id);
+			return { ...refreshed, reused: true, message: `Using existing Project for ${normalizedPath}.` };
+		}
 		return this.saveProject({ name: name ?? title, path: normalizedPath });
 	}
 
 	async resolveProject(input = {}) {
 		if (input.projectId) {
-			const projects = await this.listProjects();
-			const project = projects.find((item) => item.id === String(input.projectId));
-			if (!project) throw new Error("Selected Project is no longer configured.");
-			return { project, reused: true };
+			try {
+				const refreshed = await this.refreshProjectGitState(input.projectId);
+				return { project: refreshed.project, reused: true };
+			} catch (error) {
+				if (String(error?.message || error).includes("no longer configured")) throw new Error("Selected Project is no longer configured.");
+				throw error;
+			}
 		}
 		if (input.projectPath || input.path || input.linkedDirectory) {
 			return this.ensureProjectForPath(input.projectPath || input.path || input.linkedDirectory, { name: input.projectName || input.name });

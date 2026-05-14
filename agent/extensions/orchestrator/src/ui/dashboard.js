@@ -20,6 +20,10 @@ let projects = [];
 let projectCounts = {};
 let selectedProjectId = "";
 let branchMode = "existing";
+const refreshingProjectIds = new Set();
+const projectRefreshErrors = new Map();
+const projectRefreshTokens = new Map();
+let projectRefreshSequence = 0;
 let profiles = [];
 let selectedProfileId = DEFAULT_PROFILE_ID;
 let agentSettingsDirtyByUser = false;
@@ -635,6 +639,51 @@ function projectById(id) {
   return projects.find((project) => project.id === id) || null;
 }
 
+function isProjectRefreshing(projectId) {
+  return !!projectId && refreshingProjectIds.has(projectId);
+}
+
+function projectRefreshError(projectId) {
+  return projectId ? (projectRefreshErrors.get(projectId) || "") : "";
+}
+
+function applyProjectRefreshResult(result = {}) {
+  const refreshedProject = result.project || null;
+  if (Array.isArray(result.projects)) {
+    projects = result.projects;
+  } else if (refreshedProject) {
+    const found = projects.some((project) => project.id === refreshedProject.id);
+    projects = found ? projects.map((project) => project.id === refreshedProject.id ? refreshedProject : project) : [refreshedProject, ...projects];
+  }
+  state = { ...state, projects };
+  if (refreshedProject) projectRefreshErrors.delete(refreshedProject.id);
+}
+
+async function refreshSelectedProjectGitState(projectId = selectedProjectId) {
+  const id = String(projectId || "").trim();
+  if (!id) return null;
+  const token = ++projectRefreshSequence;
+  projectRefreshTokens.set(id, token);
+  refreshingProjectIds.add(id);
+  projectRefreshErrors.delete(id);
+  populateLinkedDirectoryOptions();
+  try {
+    const result = await api("/api/projects/" + encodeURIComponent(id) + "/refresh", { method: "POST", body: "{}" });
+    if (projectRefreshTokens.get(id) !== token) return null;
+    applyProjectRefreshResult(result);
+    return result;
+  } catch (error) {
+    if (projectRefreshTokens.get(id) === token) projectRefreshErrors.set(id, error?.message || String(error));
+    return null;
+  } finally {
+    if (projectRefreshTokens.get(id) === token) {
+      projectRefreshTokens.delete(id);
+      refreshingProjectIds.delete(id);
+      populateLinkedDirectoryOptions();
+    }
+  }
+}
+
 function projectLabel(project) {
   if (!project) return "Project no longer configured";
   return project.name + " — " + compactPath(project.path || "");
@@ -677,6 +726,9 @@ function branchOptions(project, selected) {
 
 function projectGitStatusMessage(project) {
   if (!project) return "";
+  if (isProjectRefreshing(project.id)) return " Refreshing Git branches…";
+  const refreshError = projectRefreshError(project.id);
+  if (refreshError) return " Git branch refresh failed: " + refreshError;
   if (!project.isGitRepository) return " Branch controls are hidden because this Project is not a git repository.";
   if (project.git?.error) return " Git branch controls unavailable: " + project.git.error;
   if (!(project.git?.branches || []).length) return " Git branch controls unavailable: no local branches were detected.";
@@ -687,7 +739,8 @@ function renderGitBranchControls(project) {
   const controls = document.getElementById("git-branch-controls");
   if (!controls) return;
   const branches = project?.git?.branches || [];
-  const hasBranchControls = !!(project?.isGitRepository && project?.git && !project.git.error && branches.length);
+  const refreshError = projectRefreshError(project?.id);
+  const hasBranchControls = !!(project?.isGitRepository && project?.git && !project.git.error && !isProjectRefreshing(project.id) && !refreshError && branches.length);
   controls.hidden = !hasBranchControls;
   const validation = document.getElementById("branch-validation-message");
   const existing = document.getElementById("existingBaseBranch");
@@ -697,8 +750,16 @@ function renderGitBranchControls(project) {
   if (validation) validation.textContent = "";
   if (!hasBranchControls) {
     if (newBranchName?.setCustomValidity) newBranchName.setCustomValidity("");
-    if (existing) existing.disabled = true;
-    if (base) base.disabled = true;
+    if (existing) {
+      existing.innerHTML = "";
+      existing.value = "";
+      existing.disabled = true;
+    }
+    if (base) {
+      base.innerHTML = "";
+      base.value = "";
+      base.disabled = true;
+    }
     if (newBranchName) newBranchName.disabled = true;
     if (newBranchPanel) newBranchPanel.hidden = true;
     branchMode = "existing";
@@ -970,6 +1031,7 @@ function fillIssueForm(issue) {
   document.getElementById("spec").value = issue?.spec || "";
   populateDependencyOptions({ excludeId: issue?.id || null, selectedId: getDependencyIssueId(issue) });
   populateLinkedDirectoryOptions();
+  if (selectedProjectId) refreshSelectedProjectGitState(selectedProjectId).catch(() => {});
   applyAgentSettings(issue?.agentSettings || profileById(selectedProfileId).agentSettings);
 }
 
@@ -1173,6 +1235,7 @@ async function saveProjectFromForm() {
   const payload = { name: nameInput.value, path: pathInput.value, agentSettingsProfileId: profileSelect?.value || null };
   const url = id ? "/api/projects/" + encodeURIComponent(id) : "/api/projects";
   const result = await api(url, { method: "POST", body: JSON.stringify(payload) });
+  applyProjectRefreshResult(result);
   const message = document.getElementById("project-form-message");
   if (result.reused) {
     document.getElementById("projectFormId").value = result.project?.id || "";
@@ -1199,6 +1262,7 @@ async function saveInlineProject() {
     })
   });
   selectedProjectId = result.project.id;
+  applyProjectRefreshResult(result);
   if (message) message.textContent = result.reused ? "Existing Project selected for that path." : "Project created and selected.";
   await load();
   applyProjectAgentSettingsDefault(projectById(selectedProjectId));
@@ -2222,6 +2286,7 @@ document.getElementById("projectSelect").addEventListener("change", (event) => {
   branchMode = "existing";
   populateLinkedDirectoryOptions();
   applyProjectAgentSettingsDefault(projectById(selectedProjectId));
+  if (selectedProjectId) refreshSelectedProjectGitState(selectedProjectId).catch(() => {});
 });
 
 document.getElementById("toggle-inline-project").addEventListener("click", () => {
@@ -2276,6 +2341,15 @@ document.getElementById("issue-form").addEventListener("submit", async (event) =
   const project = projectById(selectedProjectId || form.get("projectId"));
   if (!project) {
     alert("Select or create a Project before submitting the ticket.");
+    return;
+  }
+  if (isProjectRefreshing(project.id)) {
+    alert("Wait for Git branches to finish refreshing before submitting.");
+    return;
+  }
+  const refreshError = projectRefreshError(project.id);
+  if (refreshError) {
+    alert("Git branch refresh failed: " + refreshError);
     return;
   }
   const gitRequest = project.isGitRepository && !project.git?.error ? (branchMode === "new"
