@@ -332,7 +332,11 @@ export class OrchestratorServer {
 		}
 
 		if (pathname === "/api/state" && req.method === "GET") {
-			return sendJson(res, 200, await this.store.getBoardState());
+			const state = await this.store.getBoardState();
+			if (this.actions.getBacklogSuggestionState) {
+				state.backlogSuggestions = await this.actions.getBacklogSuggestionState();
+			}
+			return sendJson(res, 200, state);
 		}
 
 		if (pathname === "/api/share" && req.method === "GET") {
@@ -402,6 +406,14 @@ export class OrchestratorServer {
 			try {
 				const body = await readJsonBody(req);
 				return sendJson(res, 200, await this.actions.improveSpec(body));
+			} catch (error) {
+				return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+			}
+		}
+
+		if (pathname === "/api/backlog/suggestions" && req.method === "POST") {
+			try {
+				return sendJson(res, 202, await this.actions.startBacklogSuggestions());
 			} catch (error) {
 				return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
 			}

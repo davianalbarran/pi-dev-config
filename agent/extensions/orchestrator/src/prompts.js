@@ -36,6 +36,8 @@ export const PLAN_REPORT_START = "BEGIN_PLAN_REVIEW_REPORT";
 export const PLAN_REPORT_END = "END_PLAN_REVIEW_REPORT";
 export const REVIEW_REPORT_START = "BEGIN_REVIEW_REPORT";
 export const REVIEW_REPORT_END = "END_REVIEW_REPORT";
+export const FEATURE_SUGGESTIONS_START = "BEGIN_FEATURE_SUGGESTIONS_JSON";
+export const FEATURE_SUGGESTIONS_END = "END_FEATURE_SUGGESTIONS_JSON";
 
 export function parseMergerOutput(text) {
 	const source = String(text || "").trim();
@@ -75,6 +77,69 @@ export function parseFinalReviewerOutput(text) {
 	return {
 		report: (report.found ? report.content : source).trim(),
 	};
+}
+
+function summarizeExistingBacklogIssues(existingBacklogIssues = []) {
+	const issues = Array.isArray(existingBacklogIssues) ? existingBacklogIssues : [];
+	if (!issues.length) return "(none)";
+	return issues
+		.map((issue, index) => {
+			const title = String(issue?.title || issue?.metadata?.title || "Untitled backlog item").trim();
+			const spec = String(issue?.spec || "").trim().replace(/\s+/g, " ").slice(0, 500);
+			return `${index + 1}. ${title}${spec ? ` — ${spec}` : ""}`;
+		})
+		.join("\n");
+}
+
+export function buildFeatureSuggestorPrompt({ project, existingBacklogIssues } = {}) {
+	const safeProject = project || {};
+	return [
+		"You are the feature-suggestor agent for a local Pi Orchestrator project.",
+		"Inspect the assigned project and propose concrete, actionable backlog tickets for features, fixes, cleanup, or improvements.",
+		"Do not modify files, create commits, move tickets, or implement changes. Use read-only project investigation only.",
+		"Avoid vague ideas. Avoid duplicate tickets, especially when the existing backlog context already covers the same work.",
+		"If you do not find useful actionable work, return an empty JSON array in the required delimiters.",
+		"Each suggestion must include enough detail for a later planner/worker agent to act without follow-up.",
+		"The spec should describe the problem or opportunity, intended outcome, relevant files/areas/evidence, acceptance criteria or validation ideas, and assumptions or uncertainty where applicable.",
+		"",
+		"Return only this exact structure, with no Markdown fences or commentary outside the delimiters:",
+		FEATURE_SUGGESTIONS_START,
+		"[{\"title\":\"Short backlog ticket title\",\"spec\":\"Backlog-ready ticket spec\"}]",
+		FEATURE_SUGGESTIONS_END,
+		"",
+		"Assigned project:",
+		`- ID: ${String(safeProject.id || "(unknown)")}`,
+		`- Name: ${String(safeProject.name || "(unnamed project)")}`,
+		`- Path: ${String(safeProject.path || safeProject.linkedDirectory || "(unknown path)")}`,
+		"",
+		"Existing backlog items for this project (avoid duplicating these):",
+		summarizeExistingBacklogIssues(existingBacklogIssues),
+	].join("\n");
+}
+
+export function parseFeatureSuggestorOutput(text) {
+	const block = extractDelimitedBlock(text, FEATURE_SUGGESTIONS_START, FEATURE_SUGGESTIONS_END);
+	if (!block.found) throw new Error("Feature suggestor output is missing the suggestions JSON delimiters.");
+	let parsed;
+	try {
+		parsed = JSON.parse(block.content || "[]");
+	} catch (error) {
+		throw new Error(`Feature suggestor output contains invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
+	}
+	if (!Array.isArray(parsed)) throw new Error("Feature suggestor output must be a JSON array.");
+	const suggestions = [];
+	const seen = new Set();
+	for (const item of parsed) {
+		if (!item || typeof item !== "object") continue;
+		const title = String(item.title || "").trim();
+		const spec = String(item.spec || "").trim();
+		if (!title || !spec) continue;
+		const key = `${title}\0${spec}`;
+		if (seen.has(key)) continue;
+		seen.add(key);
+		suggestions.push({ title, spec });
+	}
+	return suggestions;
 }
 
 export function buildSpecWriterPrompt({ spec, suggestions } = {}) {

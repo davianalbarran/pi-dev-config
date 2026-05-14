@@ -54,6 +54,7 @@ let improvedSpecText = "";
 let specWriterSuggestions = [];
 let specImproveRequestId = 0;
 let cleanupCompletedLoading = false;
+let backlogSuggestionStarting = false;
 const expandedDiffFiles = new Set();
 const pendingResumeIssueIds = new Set();
 state.projects = [];
@@ -984,7 +985,62 @@ function matchingBacklogIssues() {
   });
 }
 
+function backlogSuggestionIsActive() {
+  return !!state.backlogSuggestions?.active || state.backlogSuggestions?.status === "running";
+}
+
+function backlogSuggestionStatusText() {
+  const run = state.backlogSuggestions;
+  if (backlogSuggestionStarting) return "Starting backlog suggestion generation…";
+  if (!projects.length) return "Add at least one Project to generate backlog suggestions.";
+  if (!run || run.status === "idle") return "";
+  const total = run.totalProjects || run.projects?.length || 0;
+  const done = (run.projects || []).filter((project) => project.status === "completed" || project.status === "failed").length;
+  const created = run.createdCount || 0;
+  const failed = run.failedCount || 0;
+  if (run.status === "running") return "Generating suggestions for " + total + " Project" + (total === 1 ? "" : "s") + "… " + done + "/" + total + " finished.";
+  if (run.status === "completed") return "Suggestion generation completed. Created " + created + " backlog ticket" + (created === 1 ? "" : "s") + ".";
+  if (run.status === "partial-failed") return "Suggestion generation completed with " + failed + " Project failure" + (failed === 1 ? "" : "s") + ". Created " + created + " backlog ticket" + (created === 1 ? "" : "s") + ".";
+  if (run.status === "failed") return run.error || "Suggestion generation failed for all Projects.";
+  return "";
+}
+
+function updateBacklogSuggestionControls() {
+  const button = document.getElementById("suggest-backlog");
+  const status = document.getElementById("backlog-suggestion-status");
+  const active = backlogSuggestionIsActive() || backlogSuggestionStarting;
+  if (button) {
+    button.disabled = active || !projects.length;
+    button.textContent = active ? "Suggesting…" : "Suggest Backlog Items";
+    button.title = !projects.length ? "Add a Project before generating backlog suggestions." : "Run one feature-suggestor agent for each configured Project.";
+  }
+  if (status) status.textContent = backlogSuggestionStatusText();
+}
+
+async function startBacklogSuggestions() {
+  if (backlogSuggestionStarting || backlogSuggestionIsActive()) return;
+  if (!projects.length) {
+    document.getElementById("status").textContent = "Add a Project before generating backlog suggestions.";
+    updateBacklogSuggestionControls();
+    return;
+  }
+  backlogSuggestionStarting = true;
+  updateBacklogSuggestionControls();
+  document.getElementById("status").textContent = "Starting backlog suggestion generation…";
+  try {
+    state = { ...state, backlogSuggestions: await api("/api/backlog/suggestions", { method: "POST", body: "{}" }) };
+    document.getElementById("status").textContent = "Backlog suggestion generation started.";
+    await load();
+  } catch (error) {
+    document.getElementById("status").textContent = "Backlog suggestion generation failed to start: " + (error.message || "Unknown error");
+  } finally {
+    backlogSuggestionStarting = false;
+    updateBacklogSuggestionControls();
+  }
+}
+
 function renderBacklog() {
+  updateBacklogSuggestionControls();
   const list = document.getElementById("backlog-list");
   if (!list) return;
   const issues = matchingBacklogIssues();
@@ -2245,6 +2301,11 @@ document.getElementById("project-pick-directory").addEventListener("click", asyn
   }
 });
 document.getElementById("open-create").addEventListener("click", openCreateDrawer);
+document.getElementById("suggest-backlog").addEventListener("click", () => {
+  startBacklogSuggestions().catch((error) => {
+    document.getElementById("status").textContent = "Backlog suggestion generation failed to start: " + (error.message || "Unknown error");
+  });
+});
 document.getElementById("open-backlog-create").addEventListener("click", () => { activeView = "backlog"; openCreateDrawer(); });
 document.getElementById("close-create").addEventListener("click", closeCreateDrawer);
 document.getElementById("drawer-backdrop").addEventListener("click", closeCreateDrawer);

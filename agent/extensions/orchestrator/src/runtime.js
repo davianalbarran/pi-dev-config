@@ -1,7 +1,7 @@
 import * as crypto from "node:crypto";
 import * as fsp from "node:fs/promises";
-import { DEFAULT_CONFIG } from "./constants.js";
-import { buildMergerPrompt, buildSpecWriterPrompt, parseMergerOutput } from "./prompts.js";
+import { DEFAULT_CONFIG, LANE } from "./constants.js";
+import { buildFeatureSuggestorPrompt, buildMergerPrompt, buildSpecWriterPrompt, parseFeatureSuggestorOutput, parseMergerOutput } from "./prompts.js";
 import { RpcAgentRunner } from "./rpc-runner.js";
 import { OrchestratorScheduler } from "./scheduler.js";
 import { OrchestratorServer } from "./server.js";
@@ -54,6 +54,21 @@ function mergeTargetKey(metadata) {
 
 function mergeTargetError(metadata) {
 	return new Error(`Another merge is already active for ${metadata.git.baseBranch} in ${metadata.git.repoRoot}.`);
+}
+
+function safeFeatureSuggestorScope(projectId) {
+	const raw = String(projectId || "project").trim() || "project";
+	if (/^[A-Za-z0-9_-]+$/.test(raw)) return raw;
+	const slug = raw
+		.replace(/[^A-Za-z0-9_-]+/g, "-")
+		.replace(/^-+|-+$/g, "")
+		.slice(0, 48) || "project";
+	const digest = crypto.createHash("sha256").update(raw).digest("hex").slice(0, 12);
+	return `${slug}-${digest}`;
+}
+
+function featureSuggestorIssueId(projectId) {
+	return `feature-suggestor-${safeFeatureSuggestorScope(projectId)}`;
 }
 
 function isActiveMerger(metadata) {
@@ -110,6 +125,7 @@ export class OrchestratorRuntime {
 		this.issueCount = 0;
 		this.unsubscribe = null;
 		this.activeMergeKeys = new Set();
+		this.backlogSuggestionRun = null;
 	}
 
 	async start(ctx = null) {
@@ -264,6 +280,169 @@ export class OrchestratorRuntime {
 		return this.store.loadIssue(id);
 	}
 
+	backlogSuggestionProjectState(project) {
+		return {
+			projectId: project.id,
+			projectName: project.name,
+			projectPath: project.path,
+			status: "pending",
+			runId: null,
+			createdCount: 0,
+			skippedCount: 0,
+			error: null,
+		};
+	}
+
+	copyBacklogSuggestionRun() {
+		const run = this.backlogSuggestionRun;
+		if (!run) return { active: false, status: "idle", projects: [] };
+		return {
+			id: run.id,
+			active: run.status === "running",
+			status: run.status,
+			startedAt: run.startedAt,
+			completedAt: run.completedAt || null,
+			error: run.error || null,
+			totalProjects: run.totalProjects,
+			createdCount: run.projects.reduce((total, project) => total + (project.createdCount || 0), 0),
+			skippedCount: run.projects.reduce((total, project) => total + (project.skippedCount || 0), 0),
+			failedCount: run.projects.filter((project) => project.status === "failed").length,
+			projects: run.projects.map((project) => ({ ...project })),
+		};
+	}
+
+	getBacklogSuggestionState() {
+		return this.copyBacklogSuggestionRun();
+	}
+
+	broadcastBacklogSuggestionRun() {
+		this.server?.broadcast({ type: "backlog_suggestions", backlogSuggestions: this.getBacklogSuggestionState() });
+	}
+
+	async startBacklogSuggestions() {
+		if (this.backlogSuggestionRun?.status === "running") {
+			throw new Error("Backlog suggestion generation is already running.");
+		}
+		const runId = `backlog-suggestions-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+		this.backlogSuggestionRun = {
+			id: runId,
+			status: "running",
+			startedAt: nowIso(),
+			completedAt: null,
+			error: null,
+			totalProjects: 0,
+			projects: [],
+		};
+		this.broadcastBacklogSuggestionRun();
+
+		let projects;
+		try {
+			projects = await this.store.listProjects();
+		} catch (error) {
+			if (this.backlogSuggestionRun?.id === runId) {
+				this.backlogSuggestionRun.status = "failed";
+				this.backlogSuggestionRun.completedAt = nowIso();
+				this.backlogSuggestionRun.error = errorMessage(error);
+				this.broadcastBacklogSuggestionRun();
+			}
+			throw error;
+		}
+		if (!projects.length) {
+			if (this.backlogSuggestionRun?.id === runId) {
+				this.backlogSuggestionRun = null;
+				this.broadcastBacklogSuggestionRun();
+			}
+			throw new Error("No projects configured. Add a Project before suggesting backlog items.");
+		}
+		if (this.backlogSuggestionRun?.id !== runId) throw new Error("Backlog suggestion generation was interrupted.");
+		this.backlogSuggestionRun.totalProjects = projects.length;
+		this.backlogSuggestionRun.projects = projects.map((project) => this.backlogSuggestionProjectState(project));
+		this.broadcastBacklogSuggestionRun();
+		void this.runBacklogSuggestions(runId, projects);
+		return this.getBacklogSuggestionState();
+	}
+
+	backlogSuggestionProjectEntry(runId, projectId) {
+		if (this.backlogSuggestionRun?.id !== runId) return null;
+		return this.backlogSuggestionRun.projects.find((entry) => entry.projectId === projectId) || null;
+	}
+
+	updateBacklogSuggestionProject(runId, projectId, updates) {
+		const entry = this.backlogSuggestionProjectEntry(runId, projectId);
+		if (!entry) return;
+		Object.assign(entry, updates);
+		this.broadcastBacklogSuggestionRun();
+	}
+
+	async existingBacklogIssuesForProject(projectId) {
+		const issues = await this.store.listIssues();
+		return issues.filter((issue) => issue.metadata.projectId === projectId && issue.metadata.lane === LANE.BACKLOG);
+	}
+
+	async runBacklogSuggestionsForProject(runId, project, seenSuggestions) {
+		this.updateBacklogSuggestionProject(runId, project.id, { status: "running", error: null });
+		const existingBefore = await this.existingBacklogIssuesForProject(project.id);
+		const result = await this.runner.run({
+			issueId: featureSuggestorIssueId(project.id),
+			role: "feature-suggestor",
+			cwd: project.path,
+			prompt: buildFeatureSuggestorPrompt({ project, existingBacklogIssues: existingBefore }),
+			agentSettings: null,
+			internal: true,
+			onRunStarted: (startedRunId) => {
+				this.updateBacklogSuggestionProject(runId, project.id, { runId: startedRunId });
+			},
+		});
+		const suggestions = parseFeatureSuggestorOutput(result?.text || "");
+		const existingNow = await this.existingBacklogIssuesForProject(project.id);
+		const existingTitles = new Set(existingNow.map((issue) => String(issue.metadata.title || "").trim()).filter(Boolean));
+		let createdCount = 0;
+		let skippedCount = 0;
+		for (const suggestion of suggestions) {
+			const duplicateKey = `${project.id}\0${suggestion.title}\0${suggestion.spec}`;
+			if (seenSuggestions.has(duplicateKey) || existingTitles.has(suggestion.title)) {
+				skippedCount += 1;
+				continue;
+			}
+			seenSuggestions.add(duplicateKey);
+			await this.store.createIssue({
+				title: suggestion.title,
+				spec: suggestion.spec,
+				projectId: project.id,
+				backlog: true,
+			});
+			existingTitles.add(suggestion.title);
+			createdCount += 1;
+		}
+		this.updateBacklogSuggestionProject(runId, project.id, {
+			status: "completed",
+			runId: result?.runId || this.backlogSuggestionProjectEntry(runId, project.id)?.runId || null,
+			createdCount,
+			skippedCount,
+			error: null,
+		});
+	}
+
+	async runBacklogSuggestions(runId, projects) {
+		const seenSuggestions = new Set();
+		await Promise.all(projects.map(async (project) => {
+			try {
+				await this.runBacklogSuggestionsForProject(runId, project, seenSuggestions);
+			} catch (error) {
+				this.updateBacklogSuggestionProject(runId, project.id, {
+					status: "failed",
+					error: errorMessage(error),
+				});
+			}
+		}));
+		if (this.backlogSuggestionRun?.id !== runId) return;
+		const failedCount = this.backlogSuggestionRun.projects.filter((project) => project.status === "failed").length;
+		this.backlogSuggestionRun.status = failedCount === 0 ? "completed" : failedCount === projects.length ? "failed" : "partial-failed";
+		this.backlogSuggestionRun.completedAt = nowIso();
+		this.backlogSuggestionRun.error = failedCount ? `${failedCount} project${failedCount === 1 ? "" : "s"} failed during backlog suggestion generation.` : null;
+		this.broadcastBacklogSuggestionRun();
+	}
+
 	async runReviewMerge(id) {
 		let runId = null;
 		let mergeKey = null;
@@ -348,6 +527,8 @@ export class OrchestratorRuntime {
 
 	createActions() {
 		return {
+			getBacklogSuggestionState: async () => this.getBacklogSuggestionState(),
+			startBacklogSuggestions: async () => this.startBacklogSuggestions(),
 			improveSpec: async (body = {}) => {
 				const spec = String(body.spec || "").trim();
 				if (!spec) throw new Error("Spec is required to improve it.");

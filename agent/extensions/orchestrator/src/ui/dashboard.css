@@ -312,6 +312,8 @@ legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
   margin-bottom: 12px;
 }
 .backlog-header h2 { margin: 0 0 4px; }
+.backlog-header-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.backlog-suggestion-status { margin: -4px 0 12px; color: var(--muted); }
 .backlog-list { display: grid; gap: 10px; max-width: 980px; }
 .backlog-item {
   border: 1px solid var(--line);

@@ -53,8 +53,12 @@
         <h2>Backlog</h2>
         <div class="small">Saved ticket ideas stay here until you send them to the agent.</div>
       </div>
-      <button type="button" id="open-backlog-create" class="secondary">Add Backlog Issue</button>
+      <div class="backlog-header-actions">
+        <button type="button" id="suggest-backlog" class="secondary">Suggest Backlog Items</button>
+        <button type="button" id="open-backlog-create" class="secondary">Add Backlog Issue</button>
+      </div>
     </div>
+    <div class="backlog-suggestion-status small" id="backlog-suggestion-status" role="status"></div>
     <div class="backlog-list" id="backlog-list"></div>
   </section>
   <section class="projects-view" id="projects-view" aria-label="Projects" hidden>

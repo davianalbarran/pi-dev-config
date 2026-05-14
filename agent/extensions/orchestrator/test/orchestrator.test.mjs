@@ -18,9 +18,13 @@ import {
 	PLAN_START,
 	REVIEW_REPORT_END,
 	REVIEW_REPORT_START,
+	FEATURE_SUGGESTIONS_END,
+	FEATURE_SUGGESTIONS_START,
+	buildFeatureSuggestorPrompt,
 	buildFinalReviewerPrompt,
 	buildMergerPrompt,
 	buildSpecWriterPrompt,
+	parseFeatureSuggestorOutput,
 	parseFinalReviewerOutput,
 	parseMergerOutput,
 	parsePlannerOutput,
@@ -81,6 +85,10 @@ function dashboardDraftTestSource() {
 
 function dashboardCleanupTestSource(html) {
 	return `${dashboardDraftTestSource(html)}\nglobalThis.__dashboardCleanup = { cleanCompletedTickets, updateCleanCompletedButton, get loading() { return cleanupCompletedLoading; } };\n`;
+}
+
+function dashboardBacklogSuggestionTestSource(html) {
+	return `${dashboardDraftTestSource(html)}\nglobalThis.__dashboardBacklogSuggestions = {\n\tsetState(nextState) { state = nextState; projects = Array.isArray(nextState.projects) ? nextState.projects : []; },\n\tsetProjects(nextProjects) { projects = nextProjects; state = { ...state, projects: nextProjects }; },\n\tupdateBacklogSuggestionControls,\n\tstartBacklogSuggestions,\n\tstatusText: backlogSuggestionStatusText,\n\tisActive: backlogSuggestionIsActive,\n};\n`;
 }
 
 function dashboardProjectTestSource(html) {
@@ -479,12 +487,58 @@ test("orchestrator constants distinguish valid lanes from Kanban lanes", () => {
 	]);
 });
 
-test("spec writer role has read-only tool and default model config", () => {
+test("spec writer and feature suggestor roles have read-only tool and default model config", () => {
 	assert.equal(ROLE_TOOLS["spec-writer"], "read,grep,find,ls");
 	assert.deepEqual(ROLE_DEFAULTS["spec-writer"], {
 		model: ROLE_DEFAULTS.planner.model,
 		thinking: "medium",
 	});
+	assert.equal(ROLE_TOOLS["feature-suggestor"], "read,grep,find,ls");
+	assert.deepEqual(ROLE_DEFAULTS["feature-suggestor"], {
+		model: ROLE_DEFAULTS.planner.model,
+		thinking: "medium",
+	});
+});
+
+test("feature suggestor prompt includes project details and existing backlog context", () => {
+	const prompt = buildFeatureSuggestorPrompt({
+		project: { id: "project-app", name: "App", path: "/work/app" },
+		existingBacklogIssues: [{ title: "Existing idea", spec: "Already improve the dashboard." }],
+	});
+
+	assert.match(prompt, /feature-suggestor/);
+	assert.match(prompt, /Do not modify files/);
+	assert.match(prompt, new RegExp(FEATURE_SUGGESTIONS_START));
+	assert.match(prompt, new RegExp(FEATURE_SUGGESTIONS_END));
+	assert.match(prompt, /- ID: project-app/);
+	assert.match(prompt, /- Name: App/);
+	assert.match(prompt, /- Path: \/work\/app/);
+	assert.match(prompt, /Existing idea/);
+	assert.match(prompt, /Already improve the dashboard/);
+});
+
+test("feature suggestor output parser validates delimiters, drops empty items, and deduplicates exact suggestions", () => {
+	const valid = [
+		"preamble is ignored inside strict delimiter parsing only when outside block",
+		FEATURE_SUGGESTIONS_START,
+		JSON.stringify([
+			{ title: "  Add health check  ", spec: "  Create a status endpoint.  " },
+			{ title: "", spec: "Missing title." },
+			{ title: "Missing spec", spec: "" },
+			{ title: "Add health check", spec: "Create a status endpoint." },
+			{ title: "Fix docs", spec: "Document setup." },
+		]),
+		FEATURE_SUGGESTIONS_END,
+	].join("\n");
+
+	assert.deepEqual(parseFeatureSuggestorOutput(valid), [
+		{ title: "Add health check", spec: "Create a status endpoint." },
+		{ title: "Fix docs", spec: "Document setup." },
+	]);
+	assert.deepEqual(parseFeatureSuggestorOutput(`${FEATURE_SUGGESTIONS_START}\n[]\n${FEATURE_SUGGESTIONS_END}`), []);
+	assert.throws(() => parseFeatureSuggestorOutput("[]"), /missing the suggestions JSON delimiters/);
+	assert.throws(() => parseFeatureSuggestorOutput(`${FEATURE_SUGGESTIONS_START}\nnot-json\n${FEATURE_SUGGESTIONS_END}`), /invalid JSON/);
+	assert.throws(() => parseFeatureSuggestorOutput(`${FEATURE_SUGGESTIONS_START}\n{}\n${FEATURE_SUGGESTIONS_END}`), /must be a JSON array/);
 });
 
 test("LAN address selection returns first external IPv4 address", () => {
@@ -590,6 +644,12 @@ test("dashboard renderer injects runtime data", async () => {
 	assert.match(source, />Kanban<\/button>/);
 	assert.match(source, />Backlog<\/button>/);
 	assert.match(source, /id="backlog-view"/);
+	assert.match(source, /id="suggest-backlog"/);
+	assert.match(source, /Suggest Backlog Items/);
+	assert.match(source, /id="backlog-suggestion-status"/);
+	assert.match(source, /\/api\/backlog\/suggestions/);
+	assert.match(source, /function updateBacklogSuggestionControls\(\)/);
+	assert.match(source, /function startBacklogSuggestions\(\)/);
 	assert.match(source, /Add to Backlog/);
 	assert.match(source, /Edit Issue/);
 	assert.match(source, /Send to Agent/);
@@ -1127,6 +1187,106 @@ test("dashboard clears only consumed feedback drafts after successful submission
 	assert.equal(result.calls[0].apiPath, "/api/issues/PI-A/request-plan-changes");
 	assert.deepEqual(JSON.parse(JSON.stringify(result.calls[0].body)), { text: "please revise the plan" });
 	assert.equal(result.calls[1].apiPath, "/api/state");
+});
+
+test("dashboard backlog suggestion controls reflect no-project and active-run states", async () => {
+	const html = await renderDashboardHtml("test-token");
+	const elements = new Map();
+	class FakeElement {
+		constructor(id) {
+			this.id = id;
+			this.disabled = false;
+			this.textContent = "";
+			this.title = "";
+		}
+	}
+	for (const id of ["suggest-backlog", "backlog-suggestion-status", "status"]) elements.set(id, new FakeElement(id));
+	const context = {
+		DEFAULT_PROFILE_ID,
+		LANE,
+		ROLE_DEFAULTS,
+		THINKING_LEVELS: ["low", "medium", "high", "xhigh"],
+		document: { getElementById: (id) => elements.get(id) || null, querySelectorAll: () => [], querySelector: () => null, body: { classList: { add() {}, remove() {} } }, documentElement: { clientWidth: 1200 } },
+		window: { innerWidth: 1200, matchMedia: () => ({ matches: false }) },
+		getComputedStyle: () => ({ getPropertyValue: () => "" }),
+		alert(message) { throw new Error(message); },
+	};
+	const result = await vm.runInNewContext(`${dashboardBacklogSuggestionTestSource(html)}
+		(() => {
+			__dashboardBacklogSuggestions.setState({ issues: [], lanes: {}, projects: [], backlogSuggestions: { active: false, status: "idle", projects: [] } });
+			__dashboardBacklogSuggestions.updateBacklogSuggestionControls();
+			const noProject = {
+				disabled: document.getElementById("suggest-backlog").disabled,
+				buttonText: document.getElementById("suggest-backlog").textContent,
+				statusText: document.getElementById("backlog-suggestion-status").textContent,
+			};
+			__dashboardBacklogSuggestions.setState({ issues: [], lanes: {}, projects: [{ id: "p1", name: "App", path: "/app" }], backlogSuggestions: { active: true, status: "running", totalProjects: 1, projects: [{ status: "running" }] } });
+			__dashboardBacklogSuggestions.updateBacklogSuggestionControls();
+			return {
+				noProject,
+				activeDisabled: document.getElementById("suggest-backlog").disabled,
+				activeButtonText: document.getElementById("suggest-backlog").textContent,
+				activeStatusText: document.getElementById("backlog-suggestion-status").textContent,
+			};
+		})()
+	`, context);
+
+	assert.equal(result.noProject.disabled, true);
+	assert.equal(result.noProject.buttonText, "Suggest Backlog Items");
+	assert.match(result.noProject.statusText, /Add at least one Project/);
+	assert.equal(result.activeDisabled, true);
+	assert.equal(result.activeButtonText, "Suggesting…");
+	assert.match(result.activeStatusText, /Generating suggestions/);
+});
+
+test("dashboard backlog suggestion action calls endpoint and reloads", async () => {
+	const html = await renderDashboardHtml("test-token");
+	const elements = new Map();
+	class FakeElement {
+		constructor(id) {
+			this.id = id;
+			this.disabled = false;
+			this.textContent = "";
+			this.title = "";
+		}
+	}
+	for (const id of ["suggest-backlog", "backlog-suggestion-status", "status"]) elements.set(id, new FakeElement(id));
+	const context = {
+		DEFAULT_PROFILE_ID,
+		LANE,
+		ROLE_DEFAULTS,
+		THINKING_LEVELS: ["low", "medium", "high", "xhigh"],
+		document: { getElementById: (id) => elements.get(id) || null, querySelectorAll: () => [], querySelector: () => null, body: { classList: { add() {}, remove() {} } }, documentElement: { clientWidth: 1200 } },
+		window: { innerWidth: 1200, matchMedia: () => ({ matches: false }) },
+		getComputedStyle: () => ({ getPropertyValue: () => "" }),
+		alert(message) { throw new Error(message); },
+	};
+	const result = await vm.runInNewContext(`${dashboardBacklogSuggestionTestSource(html)}
+		(async () => {
+			const calls = [];
+			let loadCalls = 0;
+			api = async (apiPath, options = {}) => {
+				calls.push({ apiPath, options });
+				return { active: true, status: "running", totalProjects: 1, projects: [] };
+			};
+			load = async () => { loadCalls += 1; };
+			__dashboardBacklogSuggestions.setState({ issues: [], lanes: {}, projects: [{ id: "p1", name: "App", path: "/app" }], backlogSuggestions: { active: false, status: "idle", projects: [] } });
+			await __dashboardBacklogSuggestions.startBacklogSuggestions();
+			return {
+				calls,
+				loadCalls,
+				status: document.getElementById("status").textContent,
+				buttonDisabled: document.getElementById("suggest-backlog").disabled,
+			};
+		})()
+	`, context);
+
+	assert.equal(result.calls.length, 1);
+	assert.equal(result.calls[0].apiPath, "/api/backlog/suggestions");
+	assert.equal(result.calls[0].options.method, "POST");
+	assert.equal(result.loadCalls, 1);
+	assert.equal(result.status, "Backlog suggestion generation started.");
+	assert.equal(result.buttonDisabled, true);
 });
 
 test("dashboard clean completed tickets action calls cleanup endpoint and reloads", async () => {
@@ -1971,6 +2131,107 @@ test("server routes backlog create, update, delete, and send actions", async () 
 	}
 });
 
+test("server exposes authenticated backlog suggestion API and state", async () => {
+	const root = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const calls = [];
+	const reject = async () => {
+		throw new Error("not used");
+	};
+	const server = new OrchestratorServer({
+		store,
+		token: "suggest-token",
+		config: { host: "127.0.0.1", port: 0 },
+		actions: {
+			startBacklogSuggestions: async () => {
+				calls.push("start");
+				return { active: true, status: "running", totalProjects: 1, projects: [] };
+			},
+			getBacklogSuggestionState: async () => ({ active: true, status: "running", totalProjects: 1, projects: [] }),
+			createIssue: reject,
+			comment: reject,
+			updateBacklogIssue: reject,
+			sendBacklogIssueToAgent: reject,
+			deleteBacklogIssue: reject,
+			approvePlan: reject,
+			requestPlanChanges: reject,
+			approveReview: reject,
+			approveReviewAndMerge: reject,
+			requestReviewChanges: reject,
+			resumeBlockedIssue: reject,
+			improveSpec: reject,
+		},
+	});
+	const url = await server.start();
+	const base = url.split("?")[0].replace(/\/$/, "");
+	try {
+		const denied = await fetch(`${base}/api/backlog/suggestions`, { method: "POST", body: "{}" });
+		assert.equal(denied.status, 401);
+
+		const response = await fetch(`${base}/api/backlog/suggestions?token=suggest-token`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: "{}",
+		});
+		assert.equal(response.status, 202);
+		assert.deepEqual(await response.json(), { active: true, status: "running", totalProjects: 1, projects: [] });
+		assert.deepEqual(calls, ["start"]);
+
+		const stateResponse = await fetch(`${base}/api/state?token=suggest-token`);
+		assert.equal(stateResponse.status, 200);
+		const stateBody = await stateResponse.json();
+		assert.deepEqual(stateBody.backlogSuggestions, { active: true, status: "running", totalProjects: 1, projects: [] });
+	} finally {
+		await server.stop();
+	}
+});
+
+test("server returns backlog suggestion action errors with existing error shape", async () => {
+	const root = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const reject = async () => {
+		throw new Error("not used");
+	};
+	const server = new OrchestratorServer({
+		store,
+		token: "suggest-error-token",
+		config: { host: "127.0.0.1", port: 0 },
+		actions: {
+			startBacklogSuggestions: async () => {
+				throw new Error("No projects configured.");
+			},
+			getBacklogSuggestionState: async () => ({ active: false, status: "idle", projects: [] }),
+			createIssue: reject,
+			comment: reject,
+			updateBacklogIssue: reject,
+			sendBacklogIssueToAgent: reject,
+			deleteBacklogIssue: reject,
+			approvePlan: reject,
+			requestPlanChanges: reject,
+			approveReview: reject,
+			approveReviewAndMerge: reject,
+			requestReviewChanges: reject,
+			resumeBlockedIssue: reject,
+			improveSpec: reject,
+		},
+	});
+	const url = await server.start();
+	const base = url.split("?")[0].replace(/\/$/, "");
+	try {
+		const response = await fetch(`${base}/api/backlog/suggestions?token=suggest-error-token`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: "{}",
+		});
+		assert.equal(response.status, 400);
+		assert.deepEqual(await response.json(), { error: "No projects configured." });
+	} finally {
+		await server.stop();
+	}
+});
+
 test("server exposes authenticated completed ticket cleanup API", async () => {
 	const root = await tempDir();
 	const linked = await tempDir();
@@ -2183,6 +2444,197 @@ test("runtime improves specs through spec-writer subagent", async () => {
 	await assert.rejects(() => actions.improveSpec({ spec: "  " }), /Spec is required/);
 	runtime.runner = { run: async () => ({ text: "  " }) };
 	await assert.rejects(() => actions.improveSpec({ spec: "Draft" }), /empty spec/);
+});
+
+test("runtime rejects backlog suggestion runs when no Projects are configured", async () => {
+	const root = await tempDir();
+	const runtime = createOrchestratorRuntime({ dataRoot: root });
+	await runtime.store.init();
+
+	await assert.rejects(() => runtime.createActions().startBacklogSuggestions(), /No projects configured/);
+	assert.deepEqual(runtime.getBacklogSuggestionState(), { active: false, status: "idle", projects: [] });
+});
+
+test("runtime spawns one feature suggestor per Project and stores suggestions in the correct backlog", async () => {
+	const root = await tempDir();
+	const firstDir = await tempDir();
+	const secondDir = await tempDir();
+	const runtime = createOrchestratorRuntime({ dataRoot: root });
+	await runtime.store.init();
+	const firstProject = (await runtime.store.saveProject({ name: "First", path: firstDir })).project;
+	const secondProject = (await runtime.store.saveProject({ name: "Second", path: secondDir })).project;
+	const calls = [];
+	runtime.runner = {
+		run: async (request) => {
+			calls.push(request);
+			await request.onRunStarted?.(`run-${calls.length}`);
+			return {
+				runId: `run-${calls.length}`,
+				text: [
+					FEATURE_SUGGESTIONS_START,
+					JSON.stringify([{ title: `Improve ${path.basename(request.cwd)}`, spec: `Do useful work in ${request.cwd}.` }]),
+					FEATURE_SUGGESTIONS_END,
+				].join("\n"),
+			};
+		},
+	};
+
+	const started = await runtime.createActions().startBacklogSuggestions();
+	assert.equal(started.active, true);
+	assert.equal(started.totalProjects, 2);
+	await waitFor(() => runtime.getBacklogSuggestionState().active === false);
+
+	assert.equal(calls.length, 2);
+	assert.deepEqual(calls.map((call) => call.role), ["feature-suggestor", "feature-suggestor"]);
+	assert.deepEqual(new Set(calls.map((call) => call.cwd)), new Set([firstDir, secondDir]));
+	assert.deepEqual(new Set(calls.map((call) => call.issueId)), new Set([`feature-suggestor-${firstProject.id}`, `feature-suggestor-${secondProject.id}`]));
+	assert.equal(calls.every((call) => call.internal === true), true);
+	assert.match(calls[0].prompt, /Existing backlog items for this project/);
+
+	const state = runtime.getBacklogSuggestionState();
+	assert.equal(state.status, "completed");
+	assert.equal(state.createdCount, 2);
+	assert.equal(state.projects.every((project) => project.status === "completed"), true);
+
+	const board = await runtime.store.getBoardState();
+	const created = board.issues.filter((issue) => issue.lane === LANE.BACKLOG);
+	assert.equal(created.length, 2);
+	assert.deepEqual(new Set(created.map((issue) => issue.projectId)), new Set([firstProject.id, secondProject.id]));
+});
+
+test("runtime backlog suggestion run records partial failure and continues other Projects", async () => {
+	const root = await tempDir();
+	const goodDir = await tempDir();
+	const badDir = await tempDir();
+	const runtime = createOrchestratorRuntime({ dataRoot: root });
+	await runtime.store.init();
+	const goodProject = (await runtime.store.saveProject({ name: "Good", path: goodDir })).project;
+	const badProject = (await runtime.store.saveProject({ name: "Bad", path: badDir })).project;
+	runtime.runner = {
+		run: async (request) => {
+			if (request.cwd === badDir) throw new Error("scan failed");
+			return {
+				runId: "good-run",
+				text: `${FEATURE_SUGGESTIONS_START}\n${JSON.stringify([{ title: "Good idea", spec: "Create the good improvement." }])}\n${FEATURE_SUGGESTIONS_END}`,
+			};
+		},
+	};
+
+	await runtime.createActions().startBacklogSuggestions();
+	await waitFor(() => runtime.getBacklogSuggestionState().active === false);
+
+	const state = runtime.getBacklogSuggestionState();
+	assert.equal(state.status, "partial-failed");
+	assert.equal(state.failedCount, 1);
+	assert.equal(state.projects.find((project) => project.projectId === badProject.id).error, "scan failed");
+	assert.equal(state.projects.find((project) => project.projectId === goodProject.id).createdCount, 1);
+	const issues = (await runtime.store.getBoardState()).issues.filter((issue) => issue.lane === LANE.BACKLOG);
+	assert.equal(issues.length, 1);
+	assert.equal(issues[0].projectId, goodProject.id);
+});
+
+test("runtime prevents duplicate concurrent backlog suggestion runs", async () => {
+	const root = await tempDir();
+	const linked = await tempDir();
+	const runtime = createOrchestratorRuntime({ dataRoot: root });
+	await runtime.store.init();
+	await runtime.store.saveProject({ name: "App", path: linked });
+	const originalListProjects = runtime.store.listProjects.bind(runtime.store);
+	let releaseList;
+	let listCalls = 0;
+	const listGate = new Promise((resolve) => {
+		releaseList = resolve;
+	});
+	runtime.store.listProjects = async (...args) => {
+		listCalls += 1;
+		await listGate;
+		return originalListProjects(...args);
+	};
+	runtime.runner = {
+		run: async () => ({ text: `${FEATURE_SUGGESTIONS_START}\n[]\n${FEATURE_SUGGESTIONS_END}` }),
+	};
+
+	const firstStart = runtime.createActions().startBacklogSuggestions();
+	const secondStart = runtime.createActions().startBacklogSuggestions();
+	await assert.rejects(() => secondStart, /already running/);
+	assert.equal(listCalls, 1);
+	releaseList();
+	const started = await firstStart;
+	assert.equal(started.active, true);
+	await waitFor(() => runtime.getBacklogSuggestionState().active === false);
+});
+
+test("runtime sanitizes unsafe Project ids before starting internal feature suggestor runs", async () => {
+	const root = await tempDir();
+	const linked = await tempDir();
+	const runtime = createOrchestratorRuntime({ dataRoot: root });
+	await runtime.store.init();
+	await runtime.store.saveProject({ id: "team/../app", name: "Unsafe", path: linked });
+	const calls = [];
+	runtime.runner = {
+		run: async (request) => {
+			calls.push(request);
+			return { text: `${FEATURE_SUGGESTIONS_START}\n[]\n${FEATURE_SUGGESTIONS_END}` };
+		},
+	};
+
+	await runtime.createActions().startBacklogSuggestions();
+	await waitFor(() => runtime.getBacklogSuggestionState().active === false);
+
+	assert.equal(calls.length, 1);
+	assert.match(calls[0].issueId, /^feature-suggestor-team-app-[a-f0-9]{12}$/);
+	assert.equal(calls[0].issueId.includes("/"), false);
+	assert.equal(calls[0].issueId.includes("\\"), false);
+});
+
+test("runtime creates no backlog tickets for empty feature suggestion arrays", async () => {
+	const root = await tempDir();
+	const linked = await tempDir();
+	const runtime = createOrchestratorRuntime({ dataRoot: root });
+	await runtime.store.init();
+	await runtime.store.saveProject({ name: "App", path: linked });
+	runtime.runner = {
+		run: async () => ({ text: `${FEATURE_SUGGESTIONS_START}\n[]\n${FEATURE_SUGGESTIONS_END}` }),
+	};
+
+	await runtime.createActions().startBacklogSuggestions();
+	await waitFor(() => runtime.getBacklogSuggestionState().active === false);
+
+	const suggestionState = runtime.getBacklogSuggestionState();
+	assert.equal(suggestionState.status, "completed");
+	assert.equal(suggestionState.createdCount, 0);
+	assert.equal(suggestionState.skippedCount, 0);
+	const issues = (await runtime.store.getBoardState()).issues.filter((issue) => issue.lane === LANE.BACKLOG);
+	assert.equal(issues.length, 0);
+});
+
+test("runtime skips exact existing backlog title duplicates for feature suggestions", async () => {
+	const root = await tempDir();
+	const linked = await tempDir();
+	const runtime = createOrchestratorRuntime({ dataRoot: root });
+	await runtime.store.init();
+	const project = (await runtime.store.saveProject({ name: "App", path: linked })).project;
+	await runtime.store.createIssue({ title: "Existing idea", spec: "Already present.", projectId: project.id, backlog: true });
+	runtime.runner = {
+		run: async (request) => {
+			assert.match(request.prompt, /Existing idea/);
+			return {
+				text: `${FEATURE_SUGGESTIONS_START}\n${JSON.stringify([
+					{ title: "Existing idea", spec: "Duplicate should be skipped." },
+					{ title: "New idea", spec: "Create new backlog work." },
+				])}\n${FEATURE_SUGGESTIONS_END}`,
+			};
+		},
+	};
+
+	await runtime.createActions().startBacklogSuggestions();
+	await waitFor(() => runtime.getBacklogSuggestionState().active === false);
+
+	const suggestionState = runtime.getBacklogSuggestionState();
+	assert.equal(suggestionState.createdCount, 1);
+	assert.equal(suggestionState.skippedCount, 1);
+	const titles = (await runtime.store.getBoardState()).issues.filter((issue) => issue.projectId === project.id && issue.lane === LANE.BACKLOG).map((issue) => issue.title).sort();
+	assert.deepEqual(titles, ["Existing idea", "New idea"]);
 });
 
 test("runtime spec writer logs outside issues and does not create a synthetic board issue", async () => {
