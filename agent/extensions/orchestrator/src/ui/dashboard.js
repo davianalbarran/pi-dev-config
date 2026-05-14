@@ -22,6 +22,8 @@ let selectedProjectId = "";
 let branchMode = "existing";
 let profiles = [];
 let selectedProfileId = DEFAULT_PROFILE_ID;
+let agentSettingsDirtyByUser = false;
+let applyingAgentSettingsProgrammatically = false;
 let selectedId = null;
 const feedbackDraftsByIssueId = new Map();
 let detailTab = "report";
@@ -771,6 +773,26 @@ function hasProfile(id) {
   return profiles.some((profile) => profile.id === id);
 }
 
+function validProjectProfileId(id) {
+  const profileId = String(id || "").trim();
+  return !!profileId && hasProfile(profileId);
+}
+
+function projectConfiguredProfile(project) {
+  const profileId = String(project?.agentSettingsProfileId || "").trim();
+  return validProjectProfileId(profileId) ? profileById(profileId) : null;
+}
+
+function renderProjectProfileSelect(selectedId = "", elementId = "projectFormAgentSettingsProfileId") {
+  const select = document.getElementById(elementId);
+  if (!select) return;
+  const selected = validProjectProfileId(selectedId) ? String(selectedId).trim() : "";
+  select.innerHTML = "<option value=''>No project default</option>" + profiles.map((profile) =>
+    "<option value='" + escapeHtml(profile.id) + "'>" + escapeHtml(profile.name) + "</option>"
+  ).join("");
+  select.value = selected;
+}
+
 function settingsEqual(a, b) {
   const left = normalizeAgentSettingsClient(a);
   const right = normalizeAgentSettingsClient(b);
@@ -790,11 +812,16 @@ function currentAgentSettingsFromDom() {
 
 function applyAgentSettings(settings) {
   const normalized = normalizeAgentSettingsClient(settings);
-  for (const role of PROFILE_ROLES) {
-    document.getElementById(role + "Model").value = normalized[role].model || "";
-    document.getElementById(role + "Thinking").value = normalized[role].thinking || (ROLE_DEFAULTS[role]?.thinking || "medium");
+  applyingAgentSettingsProgrammatically = true;
+  try {
+    for (const role of PROFILE_ROLES) {
+      document.getElementById(role + "Model").value = normalized[role].model || "";
+      document.getElementById(role + "Thinking").value = normalized[role].thinking || (ROLE_DEFAULTS[role]?.thinking || "medium");
+    }
+    updateProfileDirtyState();
+  } finally {
+    applyingAgentSettingsProgrammatically = false;
   }
-  updateProfileDirtyState();
 }
 
 function renderProfileSelect() {
@@ -826,6 +853,8 @@ function renderAgentSettingsControls() {
 function setDefaultAgentSettings() {
   renderProfileSelect();
   renderAgentSettingsControls();
+  renderProjectProfileSelect("", "projectFormAgentSettingsProfileId");
+  renderProjectProfileSelect("", "inlineProjectAgentSettingsProfileId");
   applyAgentSettings(profileById(selectedProfileId).agentSettings);
 }
 
@@ -849,6 +878,20 @@ function updateProfileDirtyState() {
   const actions = document.getElementById("profileActions");
   const profile = profileById(selectedProfileId);
   actions.hidden = settingsEqual(currentAgentSettingsFromDom(), profile.agentSettings);
+}
+
+function markAgentSettingsDirtyByUser() {
+  if (applyingAgentSettingsProgrammatically) return;
+  agentSettingsDirtyByUser = true;
+  updateProfileDirtyState();
+}
+
+function applyProjectAgentSettingsDefault(project) {
+  if (issueFormMode !== "create" || agentSettingsDirtyByUser) return;
+  const profile = projectConfiguredProfile(project);
+  selectedProfileId = profile?.id || DEFAULT_PROFILE_ID;
+  renderProfileSelect();
+  applyAgentSettings((profile || profileById(DEFAULT_PROFILE_ID)).agentSettings);
 }
 
 async function saveSelectedProfile() {
@@ -928,6 +971,7 @@ function openCreateDrawer(options = {}) {
   form.reset();
   resetSpecWriterState();
   selectedProfileId = DEFAULT_PROFILE_ID;
+  agentSettingsDirtyByUser = false;
   setDefaultAgentSettings();
   populateDependencyOptions();
   selectedProjectId = "";
@@ -1085,13 +1129,15 @@ function renderProjects() {
     const counts = projectCountsFor(project.id);
     const blocked = counts.active > 0;
     const git = project.isGitRepository ? ((project.git?.branches || []).length + " branch" + ((project.git?.branches || []).length === 1 ? "" : "es")) : "not a git repository";
+    const configuredProfile = projectConfiguredProfile(project);
+    const profileBadge = project.agentSettingsProfileId ? (configuredProfile ? "Agent settings: " + configuredProfile.name : "Agent settings profile missing") : "";
     return "<article class='backlog-item project-item' data-project-id='" + escapeHtml(project.id) + "'>" +
       "<div class='project-item-head'>" +
         "<div><div class='backlog-title'>" + escapeHtml(project.name) + "</div><div class='meta mono'>" + escapeHtml(project.path) + "</div></div>" +
         "<div class='actions'><button type='button' class='secondary' data-edit-project='" + escapeHtml(project.id) + "'>Edit</button>" +
         "<button type='button' class='bad' data-delete-project='" + escapeHtml(project.id) + "' " + (blocked ? "disabled title='Cannot delete while active tickets are associated with this Project.'" : "title='Delete Project and completed ticket history'") + ">Delete</button></div>" +
       "</div>" +
-      "<div class='card-badges'><span class='badge'>" + escapeHtml(git) + "</span><span class='badge'>" + escapeHtml(counts.active + " active") + "</span><span class='badge'>" + escapeHtml(counts.completed + " completed") + "</span></div>" +
+      "<div class='card-badges'><span class='badge'>" + escapeHtml(git) + "</span><span class='badge'>" + escapeHtml(counts.active + " active") + "</span><span class='badge'>" + escapeHtml(counts.completed + " completed") + "</span>" + (profileBadge ? "<span class='badge'>" + escapeHtml(profileBadge) + "</span>" : "") + "</div>" +
       (blocked ? "<div class='small'>Delete is unavailable because active tickets are associated with this Project.</div>" : "") +
     "</article>";
   }).join("");
@@ -1102,6 +1148,7 @@ function openProjectDialog(project = null) {
   document.getElementById("projectFormId").value = project?.id || "";
   document.getElementById("projectFormName").value = project?.name || "";
   document.getElementById("projectFormPath").value = project?.path || "";
+  renderProjectProfileSelect(project?.agentSettingsProfileId || "", "projectFormAgentSettingsProfileId");
   document.getElementById("project-form-message").textContent = "";
   document.getElementById("project-dialog").hidden = false;
   setTimeout(() => document.getElementById("projectFormName").focus(), 0);
@@ -1115,7 +1162,8 @@ async function saveProjectFromForm() {
   const id = document.getElementById("projectFormId").value;
   const nameInput = document.getElementById("projectFormName");
   const pathInput = document.getElementById("projectFormPath");
-  const payload = { name: nameInput.value, path: pathInput.value };
+  const profileSelect = document.getElementById("projectFormAgentSettingsProfileId");
+  const payload = { name: nameInput.value, path: pathInput.value, agentSettingsProfileId: profileSelect?.value || null };
   const url = id ? "/api/projects/" + encodeURIComponent(id) : "/api/projects";
   const result = await api(url, { method: "POST", body: JSON.stringify(payload) });
   const message = document.getElementById("project-form-message");
@@ -1123,6 +1171,7 @@ async function saveProjectFromForm() {
     document.getElementById("projectFormId").value = result.project?.id || "";
     nameInput.value = result.project?.name || nameInput.value;
     pathInput.value = result.project?.path || pathInput.value;
+    renderProjectProfileSelect(result.project?.agentSettingsProfileId || "", "projectFormAgentSettingsProfileId");
     message.textContent = "Existing Project reused for that path: " + (result.project?.name || "Unnamed Project") + ".";
     await load();
     return;
@@ -1136,11 +1185,16 @@ async function saveInlineProject() {
   const message = document.getElementById("inline-project-message");
   const result = await api("/api/projects", {
     method: "POST",
-    body: JSON.stringify({ name: document.getElementById("inlineProjectName").value, path: document.getElementById("inlineProjectPath").value })
+    body: JSON.stringify({
+      name: document.getElementById("inlineProjectName").value,
+      path: document.getElementById("inlineProjectPath").value,
+      agentSettingsProfileId: document.getElementById("inlineProjectAgentSettingsProfileId")?.value || null
+    })
   });
   selectedProjectId = result.project.id;
   if (message) message.textContent = result.reused ? "Existing Project selected for that path." : "Project created and selected.";
   await load();
+  applyProjectAgentSettingsDefault(projectById(selectedProjectId));
   document.getElementById("inline-project-panel").hidden = true;
 }
 
@@ -2160,6 +2214,7 @@ document.getElementById("projectSelect").addEventListener("change", (event) => {
   selectedProjectId = event.target.value || "";
   branchMode = "existing";
   populateLinkedDirectoryOptions();
+  applyProjectAgentSettingsDefault(projectById(selectedProjectId));
 });
 
 document.getElementById("toggle-inline-project").addEventListener("click", () => {
@@ -2266,6 +2321,8 @@ document.getElementById("issue-form").addEventListener("submit", async (event) =
     selectedProjectId = "";
     branchMode = "existing";
     resetSpecWriterState();
+    selectedProfileId = DEFAULT_PROFILE_ID;
+    agentSettingsDirtyByUser = false;
     setDefaultAgentSettings();
     populateDependencyOptions();
     populateLinkedDirectoryOptions();
@@ -2336,11 +2393,12 @@ for (const button of document.querySelectorAll("[data-view]")) {
 document.getElementById("profileSelect").addEventListener("change", (event) => {
   selectedProfileId = event.target.value || DEFAULT_PROFILE_ID;
   applyAgentSettings(profileById(selectedProfileId).agentSettings);
+  markAgentSettingsDirtyByUser();
 });
 for (const role of PROFILE_ROLES) {
-  document.getElementById(role + "Model").addEventListener("input", updateProfileDirtyState);
-  document.getElementById(role + "Model").addEventListener("change", updateProfileDirtyState);
-  document.getElementById(role + "Thinking").addEventListener("change", updateProfileDirtyState);
+  document.getElementById(role + "Model").addEventListener("input", markAgentSettingsDirtyByUser);
+  document.getElementById(role + "Model").addEventListener("change", markAgentSettingsDirtyByUser);
+  document.getElementById(role + "Thinking").addEventListener("change", markAgentSettingsDirtyByUser);
 }
 document.getElementById("saveSelectedProfile").addEventListener("click", () => {
   saveSelectedProfile().catch((error) => alert(error.message));

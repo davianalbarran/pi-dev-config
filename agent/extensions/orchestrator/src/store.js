@@ -94,12 +94,14 @@ export class IssueStore {
 		const now = nowIso();
 		const id = String(raw.id || "").trim() || this.projectIdForPath(normalizedPath);
 		const name = String(raw.name || raw.title || "").trim() || this.defaultProjectName(normalizedPath);
+		const agentSettingsProfileId = String(raw.agentSettingsProfileId || "").trim() || null;
 		return {
 			id,
 			name,
 			path: normalizedPath,
 			isGitRepository: !!raw.isGitRepository,
 			git: raw.git || null,
+			agentSettingsProfileId,
 			createdAt: raw.createdAt || now,
 			updatedAt: raw.updatedAt || raw.createdAt || now,
 		};
@@ -167,7 +169,7 @@ export class IssueStore {
 		return this.readProjectsRaw();
 	}
 
-	async saveProject({ id, name, title, path: projectPath, linkedDirectory } = {}) {
+	async saveProject({ id, name, title, path: projectPath, linkedDirectory, agentSettingsProfileId } = {}) {
 		await this.init();
 		await this.backfillProjectsFromIssues();
 		const normalizedPath = this.normalizeProjectPath(projectPath || linkedDirectory);
@@ -180,12 +182,20 @@ export class IssueStore {
 		}
 		const now = nowIso();
 		const existing = requestedId ? projects.find((project) => project.id === requestedId) : null;
+		const nextAgentSettingsProfileId = agentSettingsProfileId === undefined
+			? (existing?.agentSettingsProfileId || null)
+			: (String(agentSettingsProfileId || "").trim() || null);
+		if (nextAgentSettingsProfileId) {
+			const profiles = await this.listProfiles();
+			if (!profiles.some((profile) => profile.id === nextAgentSettingsProfileId)) throw new Error("Agent settings profile does not exist.");
+		}
 		const gitMetadata = await this.projectGitMetadata(normalizedPath);
 		const project = this.normalizeProject({
 			...(existing || {}),
 			id: requestedId || existing?.id || this.projectIdForPath(normalizedPath),
 			name: String(name ?? title ?? "").trim() || this.defaultProjectName(normalizedPath),
 			path: normalizedPath,
+			agentSettingsProfileId: nextAgentSettingsProfileId,
 			...gitMetadata,
 			createdAt: existing?.createdAt || now,
 			updatedAt: now,

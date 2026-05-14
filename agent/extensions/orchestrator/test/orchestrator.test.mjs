@@ -92,7 +92,7 @@ function dashboardBacklogSuggestionTestSource(html) {
 }
 
 function dashboardProjectTestSource(html) {
-	return `${dashboardDraftTestSource(html)}\nglobalThis.__dashboardProject = {\n\tsetProjects(nextProjects) { projects = nextProjects; state = { ...state, projects: nextProjects }; },\n\tselectProject(id) { selectedProjectId = id; },\n\tsetBranchMode(mode) { branchMode = mode; },\n\tget branchMode() { return branchMode; },\n\trenderGitBranchControls,\n\tupdateBranchValidationMessage,\n\tsaveProjectFromForm,\n};\n`;
+	return `${dashboardDraftTestSource(html)}\nglobalThis.__dashboardProject = {\n\tsetProjects(nextProjects) { projects = nextProjects; state = { ...state, projects: nextProjects }; },\n\tsetProfiles(nextProfiles) { profiles = nextProfiles; },\n\tselectProject(id) { selectedProjectId = id; },\n\tsetIssueFormMode(mode) { issueFormMode = mode; },\n\tsetBranchMode(mode) { branchMode = mode; },\n\tget branchMode() { return branchMode; },\n\tget selectedProfileId() { return selectedProfileId; },\n\tget agentSettingsDirtyByUser() { return agentSettingsDirtyByUser; },\n\trenderGitBranchControls,\n\trenderAgentSettingsControls,\n\trenderProfileSelect,\n\trenderProjectProfileSelect,\n\tprojectConfiguredProfile,\n\tapplyProjectAgentSettingsDefault,\n\tapplyAgentSettings,\n\tmarkAgentSettingsDirtyByUser,\n\tselectAgentSettingsProfile(id) { selectedProfileId = id; renderProfileSelect(); applyAgentSettings(profileById(selectedProfileId).agentSettings); markAgentSettingsDirtyByUser(); },\n\tcurrentAgentSettingsFromDom,\n\tupdateBranchValidationMessage,\n\tsaveProjectFromForm,\n\tsaveInlineProject,\n};\n`;
 }
 
 function dashboardProjectVmContext(ids = []) {
@@ -126,6 +126,7 @@ function dashboardProjectVmContext(ids = []) {
 		DEFAULT_PROFILE_ID,
 		LANE,
 		ROLE_DEFAULTS,
+		PROFILE_ROLES: ["planner", "worker", "reviewer"],
 		THINKING_LEVELS: ["low", "medium", "high", "xhigh"],
 		document: {
 			getElementById(id) {
@@ -219,6 +220,7 @@ function dashboardDraftVmContext() {
 		DEFAULT_PROFILE_ID,
 		LANE,
 		ROLE_DEFAULTS,
+		PROFILE_ROLES: ["planner", "worker", "reviewer"],
 		THINKING_LEVELS: ["low", "medium", "high", "xhigh"],
 		document,
 		window: { innerWidth: 1200, matchMedia: () => ({ matches: false }) },
@@ -686,6 +688,10 @@ test("dashboard renderer injects runtime data", async () => {
 	assert.match(source, /class="secondary desktop-directory-picker" id="pick-directory"/);
 	assert.match(source, /id="inlineProjectName"/);
 	assert.match(source, /id="inlineProjectPath"/);
+	assert.match(source, /id="inlineProjectAgentSettingsProfileId"/);
+	assert.match(source, /id="projectFormAgentSettingsProfileId"/);
+	assert.match(source, /Default Agent Settings profile \(optional\)/);
+	assert.match(source, /No project default/);
 	assert.match(source, /id="git-branch-controls"/);
 	assert.match(source, /id="spec-wand"/);
 	assert.match(source, /Improve spec with Spec Writer/);
@@ -701,6 +707,9 @@ test("dashboard renderer injects runtime data", async () => {
 	assert.match(source, /function renderImprovedSpec\(\)/);
 	assert.match(source, /function projectById\(id\)/);
 	assert.match(source, /function populateLinkedDirectoryOptions\(\)/);
+	assert.match(source, /function renderProjectProfileSelect\(selectedId = "", elementId = "projectFormAgentSettingsProfileId"\)/);
+	assert.match(source, /function projectConfiguredProfile\(project\)/);
+	assert.match(source, /function applyProjectAgentSettingsDefault\(project\)/);
 	assert.match(source, /function projectGitStatusMessage\(project\)/);
 	assert.match(source, /function newBranchValidationError\(project, branchName, baseBranch\)/);
 	assert.match(source, /Selected Project is no longer configured\. Choose another Project before submitting\./);
@@ -1087,6 +1096,116 @@ test("dashboard keeps Project dialog open when duplicate path reuses an existing
 	assert.equal(result.nameValue, "Existing App");
 	assert.equal(result.pathValue, "/work/app");
 	assert.equal(result.loadCalls, 1);
+});
+
+test("dashboard submits Project Agent Settings profile and defaults issue settings from selected Project", async () => {
+	const html = await renderDashboardHtml("test-token");
+	const context = dashboardProjectVmContext([
+		"projectFormId",
+		"projectFormName",
+		"projectFormPath",
+		"projectFormAgentSettingsProfileId",
+		"project-form-message",
+		"project-dialog",
+		"inlineProjectName",
+		"inlineProjectPath",
+		"inlineProjectAgentSettingsProfileId",
+		"inline-project-message",
+		"inline-project-panel",
+		"profileSelect",
+		"profileActions",
+		"modelSuggestions",
+		"plannerModel",
+		"plannerThinking",
+		"workerModel",
+		"workerThinking",
+		"reviewerModel",
+		"reviewerThinking",
+	]);
+	const result = await vm.runInNewContext(`${dashboardProjectTestSource(html)}
+		(async () => {
+			const profilesFixture = [
+				{ id: DEFAULT_PROFILE_ID, name: "Default", agentSettings: normalizeAgentSettingsClient({}) },
+				{ id: "profile-fast", name: "Fast", agentSettings: normalizeAgentSettingsClient({ planner: { model: "fast-plan", thinking: "low" }, worker: { model: "fast-work", thinking: "low" }, reviewer: { model: "fast-review", thinking: "low" } }) },
+				{ id: "profile-deep", name: "Deep", agentSettings: normalizeAgentSettingsClient({ planner: { model: "deep-plan", thinking: "high" }, worker: { model: "deep-work", thinking: "xhigh" }, reviewer: { model: "deep-review", thinking: "high" } }) },
+			];
+			__dashboardProject.setProfiles(profilesFixture);
+			__dashboardProject.renderAgentSettingsControls();
+			__dashboardProject.renderProfileSelect();
+			__dashboardProject.renderProjectProfileSelect("profile-fast", "projectFormAgentSettingsProfileId");
+			document.getElementById("projectFormName").value = "Configured";
+			document.getElementById("projectFormPath").value = "/work/configured";
+			let postedPayload = null;
+			api = async (url, options) => {
+				postedPayload = JSON.parse(options.body);
+				return { reused: false, project: { id: "configured", name: "Configured", path: "/work/configured", agentSettingsProfileId: postedPayload.agentSettingsProfileId } };
+			};
+			load = async () => {};
+			await __dashboardProject.saveProjectFromForm();
+
+			document.getElementById("inlineProjectName").value = "Inline";
+			document.getElementById("inlineProjectPath").value = "/work/inline";
+			document.getElementById("inlineProjectAgentSettingsProfileId").value = "profile-deep";
+			let inlinePayload = null;
+			api = async (url, options) => {
+				inlinePayload = JSON.parse(options.body);
+				return { reused: false, project: { id: "inline", name: "Inline", path: "/work/inline", agentSettingsProfileId: inlinePayload.agentSettingsProfileId } };
+			};
+			load = async () => { __dashboardProject.setProjects([{ id: "inline", name: "Inline", path: "/work/inline", agentSettingsProfileId: inlinePayload.agentSettingsProfileId }]); };
+			__dashboardProject.setIssueFormMode("create");
+			agentSettingsDirtyByUser = false;
+			await __dashboardProject.saveInlineProject();
+			const inlineDefaultProfileId = __dashboardProject.selectedProfileId;
+
+			const projectWithProfile = { id: "configured", name: "Configured", path: "/work/configured", agentSettingsProfileId: "profile-fast" };
+			const projectWithoutProfile = { id: "plain", name: "Plain", path: "/work/plain", agentSettingsProfileId: null };
+			const projectWithStaleProfile = { id: "stale", name: "Stale", path: "/work/stale", agentSettingsProfileId: "missing-profile" };
+			__dashboardProject.setIssueFormMode("create");
+			agentSettingsDirtyByUser = false;
+			__dashboardProject.applyProjectAgentSettingsDefault(projectWithProfile);
+			const configuredDefault = { selectedProfileId: __dashboardProject.selectedProfileId, settings: __dashboardProject.currentAgentSettingsFromDom() };
+
+			__dashboardProject.selectAgentSettingsProfile("profile-deep");
+			__dashboardProject.applyProjectAgentSettingsDefault(projectWithoutProfile);
+			const afterUserOverrideProjectChange = { selectedProfileId: __dashboardProject.selectedProfileId, settings: __dashboardProject.currentAgentSettingsFromDom(), dirty: __dashboardProject.agentSettingsDirtyByUser };
+
+			agentSettingsDirtyByUser = false;
+			__dashboardProject.applyProjectAgentSettingsDefault(projectWithoutProfile);
+			const noProfileDefault = { selectedProfileId: __dashboardProject.selectedProfileId, settings: __dashboardProject.currentAgentSettingsFromDom() };
+
+			selectedProfileId = "profile-fast";
+			__dashboardProject.applyAgentSettings(profileById(selectedProfileId).agentSettings);
+			agentSettingsDirtyByUser = false;
+			__dashboardProject.applyProjectAgentSettingsDefault(projectWithStaleProfile);
+			const staleProfileDefault = { selectedProfileId: __dashboardProject.selectedProfileId, settings: __dashboardProject.currentAgentSettingsFromDom(), configuredProfile: __dashboardProject.projectConfiguredProfile(projectWithStaleProfile) };
+
+			return {
+				postedPayload,
+				inlinePayload,
+				inlineDefaultProfileId,
+				projectOptions: document.getElementById("projectFormAgentSettingsProfileId").options.map((option) => option.value),
+				configuredDefault,
+				afterUserOverrideProjectChange,
+				noProfileDefault,
+				staleProfileDefault,
+			};
+		})()
+	`, context);
+
+	assert.equal(result.postedPayload.agentSettingsProfileId, "profile-fast");
+	assert.equal(result.inlinePayload.agentSettingsProfileId, "profile-deep");
+	assert.equal(result.inlineDefaultProfileId, "profile-deep");
+	assert.deepEqual(result.projectOptions, ["", DEFAULT_PROFILE_ID, "profile-fast", "profile-deep"]);
+	assert.equal(result.configuredDefault.selectedProfileId, "profile-fast");
+	assert.equal(result.configuredDefault.settings.worker.model, "fast-work");
+	assert.equal(result.afterUserOverrideProjectChange.selectedProfileId, "profile-deep");
+	assert.equal(result.afterUserOverrideProjectChange.settings.worker.model, "deep-work");
+	assert.equal(result.afterUserOverrideProjectChange.dirty, true);
+	assert.equal(result.noProfileDefault.selectedProfileId, DEFAULT_PROFILE_ID);
+	assert.equal(result.noProfileDefault.settings.worker.model, ROLE_DEFAULTS.worker.model);
+	assert.equal(result.staleProfileDefault.selectedProfileId, DEFAULT_PROFILE_ID);
+	assert.equal(result.staleProfileDefault.settings.worker.model, ROLE_DEFAULTS.worker.model);
+	assert.equal(result.staleProfileDefault.configuredProfile, null);
 });
 
 test("dashboard preserves unsent feedback drafts across unrelated ticket refreshes", async () => {
@@ -1683,8 +1802,13 @@ test("server renders token-gated dashboard html", async () => {
 		assert.match(source, /projectSelect/);
 		assert.match(source, /class="secondary desktop-directory-picker" id="pick-directory"/);
 		assert.match(source, /inlineProjectPath/);
+		assert.match(source, /inlineProjectAgentSettingsProfileId/);
+		assert.match(source, /projectFormAgentSettingsProfileId/);
+		assert.match(source, /No project default/);
 		assert.match(source, /function projectById\(id\)/);
 		assert.match(source, /populateLinkedDirectoryOptions\(\);/);
+		assert.match(source, /applyProjectAgentSettingsDefault\(projectById\(selectedProjectId\)\);/);
+		assert.match(source, /let agentSettingsDirtyByUser = false;/);
 		assert.match(source, /minimizedIssueIds\.has\(id\)/);
 		assert.match(source, /let issueLaneById = new Map\(\);/);
 		assert.match(source, /function syncCompletedTicketMinimization\(nextState\)/);
@@ -2899,15 +3023,49 @@ test("issue store creates and reuses Projects with default names", async () => {
 	assert.equal(saved.reused, false);
 	assert.equal(saved.project.name, path.basename(linked));
 	assert.equal(saved.project.path, linked);
+	assert.equal(saved.project.agentSettingsProfileId, null);
 
 	const duplicate = await store.saveProject({ name: "Duplicate", path: linked });
 	assert.equal(duplicate.reused, true);
 	assert.equal(duplicate.project.id, saved.project.id);
+	assert.equal(duplicate.project.agentSettingsProfileId, null);
 
 	const issue = await store.createIssue({ title: "Use project", spec: "Work.", projectId: saved.project.id });
 	assert.equal(issue.metadata.projectId, saved.project.id);
 	assert.equal(issue.metadata.linkedDirectory, linked);
 	assert.deepEqual(issue.metadata.project, { id: saved.project.id, name: saved.project.name, path: linked, isGitRepository: false });
+});
+
+test("issue store persists optional Project Agent Settings profiles and rejects missing profiles", async () => {
+	const root = await tempDir();
+	const linked = await tempDir();
+	const duplicateDir = await tempDir();
+	const missingProfileDir = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+
+	const profileResult = await store.saveProfile({
+		name: "Project default",
+		agentSettings: { worker: { model: "project-worker", thinking: "high" } },
+	});
+	const profileId = profileResult.profile.id;
+
+	const withoutProfile = await store.saveProject({ name: "No preset", path: linked, agentSettingsProfileId: "  " });
+	assert.equal(withoutProfile.project.agentSettingsProfileId, null);
+
+	const withProfile = await store.saveProject({ name: "With preset", path: duplicateDir, agentSettingsProfileId: ` ${profileId} ` });
+	assert.equal(withProfile.project.agentSettingsProfileId, profileId);
+	assert.equal((await store.listProjects()).find((project) => project.id === withProfile.project.id).agentSettingsProfileId, profileId);
+
+	await assert.rejects(
+		() => store.saveProject({ name: "Missing preset", path: missingProfileDir, agentSettingsProfileId: "does-not-exist" }),
+		/Agent settings profile does not exist\./,
+	);
+
+	const duplicate = await store.saveProject({ name: "Duplicate no overwrite", path: duplicateDir, agentSettingsProfileId: DEFAULT_PROFILE_ID });
+	assert.equal(duplicate.reused, true);
+	assert.equal(duplicate.project.id, withProfile.project.id);
+	assert.equal(duplicate.project.agentSettingsProfileId, profileId);
 });
 
 test("issue store backfills Projects from legacy linked-directory tickets", async () => {

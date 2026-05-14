@@ -99,6 +99,9 @@
           <input id="inlineProjectPath" placeholder="/absolute/path/to/project">
           <button type="button" class="secondary desktop-directory-picker" id="pick-directory">Choose</button>
         </div>
+        <label for="inlineProjectAgentSettingsProfileId">Default Agent Settings profile (optional)</label>
+        <select id="inlineProjectAgentSettingsProfileId"></select>
+        <div class="small">Choose an existing profile to pre-select when new issues use this Project.</div>
         <div class="small" id="inline-project-message"></div>
         <div class="actions"><button type="button" class="secondary" id="save-inline-project">Save Project</button></div>
       </div>
@@ -208,6 +211,9 @@
         <input id="projectFormPath" required placeholder="/absolute/path/to/project">
         <button type="button" class="secondary desktop-directory-picker" id="project-pick-directory">Choose</button>
       </div>
+      <label for="projectFormAgentSettingsProfileId">Default Agent Settings profile (optional)</label>
+      <select id="projectFormAgentSettingsProfileId"></select>
+      <div class="small">Choose an existing profile to pre-select when new issues use this Project.</div>
       <div class="small" id="project-form-message"></div>
       <div class="actions"><button type="submit" id="save-project-submit">Save Project</button></div>
     </form>
