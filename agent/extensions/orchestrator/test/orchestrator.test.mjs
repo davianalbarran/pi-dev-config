@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { readFileSync } from "node:fs";
+import * as http from "node:http";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -65,6 +66,38 @@ async function tempDir() {
 
 async function git(args, cwd) {
 	return execFileAsync("git", args, { cwd, maxBuffer: 1024 * 1024 });
+}
+
+async function rawHttpRequest(base, requestPath, { method = "GET", headers = {}, body } = {}) {
+	const target = new URL(base);
+	const payload = body === undefined ? null : String(body);
+	const requestHeaders = { ...headers };
+	if (payload !== null) requestHeaders["content-length"] = Buffer.byteLength(payload);
+	return new Promise((resolve, reject) => {
+		const req = http.request({
+			protocol: target.protocol,
+			hostname: target.hostname,
+			port: target.port,
+			method,
+			path: requestPath,
+			headers: requestHeaders,
+		}, (res) => {
+			let text = "";
+			res.setEncoding("utf8");
+			res.on("data", (chunk) => { text += chunk; });
+			res.on("end", () => {
+				resolve({
+					status: res.statusCode,
+					headers: res.headers,
+					text,
+					json: text ? JSON.parse(text) : null,
+				});
+			});
+		});
+		req.on("error", reject);
+		if (payload !== null) req.write(payload);
+		req.end();
+	});
 }
 
 async function initGitRepoWithMain(repo) {
@@ -2163,6 +2196,9 @@ test("server exposes authenticated agent session API", async () => {
 		assert.equal(body.session.messages[0].content, "persisted");
 		const traversal = await fetch(`${base}/api/issues/${encodeURIComponent(issue.metadata.id)}/runs/${encodeURIComponent("../run-api")}?token=session-token`);
 		assert.equal(traversal.status, 400);
+		const invalidIssue = await fetch(`${base}/api/issues/${encodeURIComponent("../bad")}/runs/run-api?token=session-token`);
+		assert.equal(invalidIssue.status, 400);
+		assert.match((await invalidIssue.json()).error, /Invalid issue id/);
 	} finally {
 		await server.stop();
 	}
@@ -2209,6 +2245,10 @@ test("server routes run events only to matching per-run streams", async () => {
 		})();
 		return Promise.race([read, timeout]);
 	}
+	const invalidStreamResponse = await fetch(`${base}/api/issues/${encodeURIComponent("bad\\id")}/runs/run-sse/events?token=stream-token`);
+	assert.equal(invalidStreamResponse.status, 400);
+	assert.match((await invalidStreamResponse.json()).error, /Invalid issue id/);
+	assert.equal(server.streamClients.size, 0);
 	const globalResponse = await fetch(`${base}/api/events?token=stream-token`);
 	const streamResponse = await fetch(`${base}/api/issues/${encodeURIComponent(issue.metadata.id)}/runs/run-sse/events?token=stream-token`);
 	assert.equal(globalResponse.status, 200);
@@ -2377,6 +2417,69 @@ test("server routes backlog create, update, delete, and send actions", async () 
 		});
 		assert.equal(deleted.status, 200);
 		assert.deepEqual(calls[3], ["delete", "PI-backlog"]);
+	} finally {
+		await server.stop();
+	}
+});
+
+test("server validates issue ids before comment actions", async () => {
+	const root = await tempDir();
+	const store = new IssueStore({ dataRoot: root });
+	await store.init();
+	const calls = [];
+	const reject = async () => {
+		throw new Error("not used");
+	};
+	const server = new OrchestratorServer({
+		store,
+		token: "comment-token",
+		config: { host: "127.0.0.1", port: 0 },
+		actions: {
+			createIssue: reject,
+			comment: async (id, body) => {
+				calls.push([id, body]);
+				return { metadata: { id }, comment: body };
+			},
+			updateBacklogIssue: reject,
+			sendBacklogIssueToAgent: reject,
+			deleteBacklogIssue: reject,
+			approvePlan: reject,
+			requestPlanChanges: reject,
+			approveReview: reject,
+			approveReviewAndMerge: reject,
+			requestReviewChanges: reject,
+			resumeBlockedIssue: reject,
+			improveSpec: reject,
+		},
+	});
+	const url = await server.start();
+	const base = url.split("?")[0].replace(/\/$/, "");
+	try {
+		const invalidCommentPaths = [
+			`/api/issues/${encodeURIComponent("/")}/comment`,
+			`/api/issues/${encodeURIComponent("\\")}/comment`,
+			"/api/issues/%2E/comment",
+			"/api/issues/%2E%2E/comment",
+			"/api/issues//comment",
+		];
+		for (const apiPath of invalidCommentPaths) {
+			const invalid = await rawHttpRequest(base, `${apiPath}?token=comment-token`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ text: "must not call" }),
+			});
+			assert.equal(invalid.status, 400, apiPath);
+			assert.match(invalid.json.error, /Invalid issue id/);
+		}
+		assert.deepEqual(calls, []);
+
+		const valid = await fetch(`${base}/api/issues/PI-comment/comment?token=comment-token`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ text: "ok" }),
+		});
+		assert.equal(valid.status, 200);
+		assert.deepEqual(calls, [["PI-comment", { text: "ok" }]]);
 	} finally {
 		await server.stop();
 	}
@@ -3053,6 +3156,19 @@ test("server exposes authenticated issue diffs API", async () => {
 		assert.equal(body.issueId, issue.metadata.id);
 		assert.equal(body.available, true);
 		assert.equal(body.files.some((file) => file.path === "README.md" && file.status === "modified"), true);
+
+		const invalidDiffPaths = [
+			`/api/issues/${encodeURIComponent("/")}/diffs`,
+			`/api/issues/${encodeURIComponent("\\")}/diffs`,
+			"/api/issues/%2E/diffs",
+			"/api/issues/%2E%2E/diffs",
+			"/api/issues//diffs",
+		];
+		for (const apiPath of invalidDiffPaths) {
+			const invalid = await rawHttpRequest(base, `${apiPath}?token=diff-token`);
+			assert.equal(invalid.status, 400, apiPath);
+			assert.match(invalid.json.error, /Invalid issue id/);
+		}
 	} finally {
 		await server.stop();
 	}

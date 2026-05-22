@@ -8,7 +8,7 @@ import { DEFAULT_CONFIG } from "./constants.js";
 import { getIssueDiffs } from "./diffs.js";
 import { renderQrSvg } from "./qr.js";
 import { renderDashboardHtml } from "./ui.js";
-import { assertSafeRunPathSegment } from "./store.js";
+import { assertSafeIssueId, assertSafeRunPathSegment } from "./store.js";
 
 const execFileAsync = promisify(execFile);
 const dashboardCssUrl = new URL("./ui/dashboard.css", import.meta.url);
@@ -45,6 +45,15 @@ function isLoopbackHost(host) {
 function hostForUrl(host) {
 	const normalized = String(host || "127.0.0.1").replace(/^\[|\]$/g, "");
 	return normalized.includes(":") ? `[${normalized}]` : normalized;
+}
+
+function rawPathnameFromRequestUrl(reqUrl = "/") {
+	const raw = String(reqUrl || "/");
+	const queryIndex = raw.indexOf("?");
+	const hashIndex = raw.indexOf("#");
+	const endIndexes = [queryIndex, hashIndex].filter((index) => index >= 0);
+	const endIndex = endIndexes.length ? Math.min(...endIndexes) : raw.length;
+	return raw.slice(0, endIndex) || "/";
 }
 
 function dashboardUrl(host, port, token) {
@@ -216,6 +225,26 @@ function sendText(res, status, text, contentType = "text/plain; charset=utf-8") 
 	res.end(text);
 }
 
+function decodeIssueIdPathSegment(value) {
+	let decoded;
+	try {
+		decoded = decodeURIComponent(value);
+	} catch {
+		throw new Error("Invalid issue id.");
+	}
+	return assertSafeIssueId(decoded);
+}
+
+function decodeRunIdPathSegment(value) {
+	let decoded;
+	try {
+		decoded = decodeURIComponent(value);
+	} catch {
+		throw new Error("Invalid run id.");
+	}
+	return assertSafeRunPathSegment(decoded);
+}
+
 export class OrchestratorServer {
 	constructor({ store, token, actions, config = {} }) {
 		this.store = store;
@@ -306,8 +335,7 @@ export class OrchestratorServer {
 	}
 
 	async handle(req, res) {
-		const url = new URL(req.url || "/", `http://${req.headers.host || "127.0.0.1"}`);
-		const pathname = url.pathname;
+		const pathname = rawPathnameFromRequestUrl(req.url || "/");
 
 		if (pathname === "/" && req.method === "GET") {
 			if (!isAuthorized(req.url || "/", req.headers, this.token)) {
@@ -433,19 +461,25 @@ export class OrchestratorServer {
 			return sendJson(res, 200, await this.store.cleanCompletedTickets());
 		}
 
-		const diffMatch = pathname.match(/^\/api\/issues\/([^/]+)\/diffs$/);
+		const diffMatch = pathname.match(/^\/api\/issues\/([^/]*)\/diffs$/);
 		if (diffMatch && req.method === "GET") {
-			const issue = await this.store.loadIssue(decodeURIComponent(diffMatch[1]));
+			let id;
+			try {
+				id = decodeIssueIdPathSegment(diffMatch[1]);
+			} catch (error) {
+				return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+			}
+			const issue = await this.store.loadIssue(id);
 			return sendJson(res, 200, await getIssueDiffs(issue));
 		}
 
-		const runEventsMatch = pathname.match(/^\/api\/issues\/([^/]+)\/runs\/([^/]+)\/events$/);
+		const runEventsMatch = pathname.match(/^\/api\/issues\/([^/]*)\/runs\/([^/]+)\/events$/);
 		if (runEventsMatch && req.method === "GET") {
-			const id = decodeURIComponent(runEventsMatch[1]);
-			const runId = decodeURIComponent(runEventsMatch[2]);
+			let id;
+			let runId;
 			try {
-				assertSafeRunPathSegment(id, "issue id");
-				assertSafeRunPathSegment(runId);
+				id = decodeIssueIdPathSegment(runEventsMatch[1]);
+				runId = decodeRunIdPathSegment(runEventsMatch[2]);
 			} catch (error) {
 				return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
 			}
@@ -460,13 +494,13 @@ export class OrchestratorServer {
 			return;
 		}
 
-		const runMatch = pathname.match(/^\/api\/issues\/([^/]+)\/runs\/([^/]+)$/);
+		const runMatch = pathname.match(/^\/api\/issues\/([^/]*)\/runs\/([^/]+)$/);
 		if (runMatch && req.method === "GET") {
-			const id = decodeURIComponent(runMatch[1]);
-			const runId = decodeURIComponent(runMatch[2]);
+			let id = "";
+			let runId = "";
 			try {
-				assertSafeRunPathSegment(id, "issue id");
-				assertSafeRunPathSegment(runId);
+				id = decodeIssueIdPathSegment(runMatch[1]);
+				runId = decodeRunIdPathSegment(runMatch[2]);
 			} catch (error) {
 				return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error), issueId: id, runId, events: [], session: { items: [], messages: [], tools: [], incomplete: false, ignoredCount: 0 } });
 			}
@@ -499,11 +533,11 @@ export class OrchestratorServer {
 			}
 		}
 
-		const match = pathname.match(/^\/api\/issues\/([^/]+)\/([^/]+)$/);
+		const match = pathname.match(/^\/api\/issues\/([^/]*)\/([^/]+)$/);
 		if (!match || req.method !== "POST") return sendJson(res, 404, { error: "Not found." });
 
 		try {
-			const id = decodeURIComponent(match[1]);
+			const id = decodeIssueIdPathSegment(match[1]);
 			const action = match[2];
 			const body = await readJsonBody(req);
 			if (action === "comment") return sendJson(res, 200, await this.actions.comment(id, body));

@@ -50,6 +50,10 @@ export function assertSafeRunPathSegment(value, label = "run id") {
 	return segment;
 }
 
+export function assertSafeIssueId(value) {
+	return assertSafeRunPathSegment(value, "issue id");
+}
+
 export class IssueStore {
 	constructor(options = {}) {
 		this.dataRoot = options.dataRoot || DEFAULT_DATA_ROOT;
