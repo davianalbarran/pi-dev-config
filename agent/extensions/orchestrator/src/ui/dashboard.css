@@ -86,6 +86,8 @@ button {
 button.secondary { background: var(--surface-2); color: var(--text); border-color: var(--line); }
 button.ghost { background: transparent; color: var(--text-soft); border-color: var(--line); }
 button.warn { background: var(--warn); color: #211800; }
+.kick-agent { letter-spacing: .01em; transition: transform 120ms ease, filter 120ms ease; }
+.kick-agent:not(:disabled):hover { transform: translateY(-1px); filter: brightness(1.06); }
 button.bad { background: var(--bad); color: #210000; }
 button:disabled { opacity: .5; cursor: not-allowed; }
 button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible, .issue-card:focus-visible {

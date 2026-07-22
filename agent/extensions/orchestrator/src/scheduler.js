@@ -8,7 +8,7 @@ import {
 	parsePlannerOutput,
 } from "./prompts.js";
 import { nowIso } from "./utils.js";
-import { ensureIssueWorkspace } from "./workspace.js";
+import { recoverIssueWorkspace } from "./workspace.js";
 import { dependencyLabel, getDependencyIssueId, isDependencyResolved, parseDecision } from "./workflow.js";
 
 function buildPlanningExhaustedReport(issue, message) {
@@ -58,6 +58,7 @@ export class OrchestratorScheduler {
 		this.config = { ...DEFAULT_CONFIG, ...config };
 		this.onEvent = onEvent;
 		this.running = new Map();
+		this.kicking = new Set();
 		this.timer = null;
 		this.unsubscribe = null;
 		this.tickQueued = false;
@@ -81,6 +82,7 @@ export class OrchestratorScheduler {
 		this.unsubscribe = null;
 		for (const run of this.running.values()) run.controller.abort();
 		this.running.clear();
+		this.kicking.clear();
 		await this.runner.stopAll();
 	}
 
@@ -108,6 +110,7 @@ export class OrchestratorScheduler {
 			const issues = await this.store.listIssues();
 			for (const issue of issues) {
 				const metadata = issue.metadata;
+				if (this.kicking.has(metadata.id)) continue;
 				if (this.running.has(metadata.id)) continue;
 				if (metadata.automation?.paused || metadata.automation?.activeRunId) continue;
 
@@ -166,8 +169,10 @@ export class OrchestratorScheduler {
 
 	startIssueRun(issueId, group, fn) {
 		const controller = new AbortController();
-		this.running.set(issueId, { group, controller });
-		void fn(controller.signal)
+		const record = { group, controller, done: null };
+		this.running.set(issueId, record);
+		record.done = Promise.resolve()
+			.then(() => fn(controller.signal))
 			.catch((error) => {
 				if (!this.stopping) return this.failIssue(issueId, error);
 				return this.store.appendEvent(issueId, {
@@ -179,6 +184,29 @@ export class OrchestratorScheduler {
 				this.running.delete(issueId);
 				if (!this.stopping) this.queueTick();
 			});
+	}
+
+	async coordinateKick(issueId, operation) {
+		if (this.kicking.has(issueId)) throw new Error("A kick request is already in flight for this ticket.");
+		this.kicking.add(issueId);
+		let interrupted = false;
+		const interrupt = async () => {
+			if (interrupted) return;
+			interrupted = true;
+			const run = this.running.get(issueId);
+			if (!run) return;
+			run.controller.abort();
+			await run.done;
+		};
+		let completed = false;
+		try {
+			const result = await operation({ interrupt });
+			completed = true;
+			return result;
+		} finally {
+			this.kicking.delete(issueId);
+			if (completed && !this.stopping) this.queueTick();
+		}
 	}
 
 	agentSettingsFor(issue, role) {
@@ -217,21 +245,51 @@ export class OrchestratorScheduler {
 				(metadata.lane === LANE.PLANNING || metadata.lane === LANE.IN_PROGRESS) &&
 				/Agent run aborted|automation_interrupted/i.test(pausedError);
 			if (!activeRunId && !recoverableAbort) continue;
+			const supportsStageRecovery = metadata.lane === LANE.PLANNING || metadata.lane === LANE.IN_PROGRESS;
+			if (!supportsStageRecovery) {
+				await this.store.updateMetadata(metadata.id, (current) => ({
+					...current,
+					automation: {
+						...current.automation,
+						activeRunId: null,
+						activeRole: null,
+					},
+				}));
+				await this.store.appendEvent(metadata.id, { type: "interrupted_run_recovered", role: activeRole, runId: activeRunId });
+				continue;
+			}
 
+			const target = await this.store.findRecoveryTarget(issue);
+			let recoveryError = null;
+			try {
+				await recoverIssueWorkspace(this.store, issue);
+			} catch (error) {
+				recoveryError = error instanceof Error ? error.message : String(error);
+			}
 			await this.store.updateMetadata(metadata.id, (current) => ({
 				...current,
 				automation: {
 					...current.automation,
 					activeRunId: null,
 					activeRole: null,
-					paused: false,
-					error: null,
+					paused: !!recoveryError,
+					error: recoveryError,
+					recovery: recoveryError ? current.automation?.recovery || null : {
+						role: target.role,
+						sourceRunId: target.runId,
+						sessionFile: target.sessionFile,
+						mode: target.sessionAvailable ? "resume" : "restart",
+						requestedAt: nowIso(),
+					},
 				},
 			}));
 			await this.store.appendEvent(metadata.id, {
 				type: "interrupted_run_recovered",
 				role: activeRole,
 				runId: activeRunId,
+				recoveryRole: target.role,
+				mode: target.sessionAvailable ? "resume" : "restart",
+				...(recoveryError ? { error: recoveryError } : {}),
 			});
 		}
 	}
@@ -265,11 +323,71 @@ export class OrchestratorScheduler {
 		this.onEvent({ type: "automation_failed", issueId, error: message });
 	}
 
+	async runAgentStage(issueId, role, prompt, signal, recovery = null) {
+		let issue = await this.store.loadIssue(issueId);
+		const stageRecovery = recovery?.role === role ? recovery : null;
+		const sessionFile = stageRecovery?.mode === "resume" ? stageRecovery.sessionFile : null;
+		await this.markActive(issueId, role, "starting");
+		return this.runner.run({
+			issueId,
+			role,
+			cwd: issue.metadata.workspace.path,
+			prompt,
+			signal,
+			agentSettings: this.agentSettingsFor(issue, role),
+			...(sessionFile ? { sessionFile } : {}),
+			onRunStarted: async (runId) => {
+				await this.markRunStarted(issueId, role, runId);
+				if (!stageRecovery) return;
+				await this.store.updateMetadata(issueId, (metadata) => ({
+					...metadata,
+					automation: {
+						...metadata.automation,
+						recovery: null,
+						resumeSessionFile: null,
+						resumeRunId: null,
+					},
+				}));
+				await this.store.appendEvent(issueId, {
+					type: "agent_recovery_started",
+					role,
+					runId,
+					sourceRunId: stageRecovery.sourceRunId,
+					mode: stageRecovery.mode,
+				});
+				if (sessionFile) {
+					await this.store.appendEvent(issueId, {
+						type: "agent_session_resumed",
+						role,
+						runId,
+						sourceRunId: stageRecovery.sourceRunId,
+						sessionFile,
+					});
+					if (role === "worker") {
+						await this.store.appendEvent(issueId, {
+							type: "implementation_resume_started",
+							runId,
+							resumeRunId: stageRecovery.sourceRunId,
+							resumeSessionFile: sessionFile,
+						});
+					}
+				}
+			},
+		});
+	}
+
 	async runPlanning(issueId, signal) {
 		let issue = await this.store.loadIssue(issueId);
 		if (!(await this.ensureDependenciesResolved(issue))) return;
 		issue = await this.store.loadIssue(issueId);
-		if ((issue.metadata.automation?.planningAttempts || 0) >= MAX_PLANNING_ATTEMPTS && issue.metadata.lane !== LANE.CREATED) {
+		const storedRecovery = issue.metadata.automation?.recovery?.role === "planner" ? issue.metadata.automation.recovery : null;
+		const recoveryTarget = storedRecovery ? await this.store.findRecoveryTarget(issue) : null;
+		const recovery = storedRecovery ? {
+			...storedRecovery,
+			mode: recoveryTarget.sessionAvailable ? "resume" : "restart",
+			sessionFile: recoveryTarget.sessionFile,
+		} : null;
+		if (!recovery && (issue.metadata.automation?.planningAttempts || 0) >= MAX_PLANNING_ATTEMPTS && issue.metadata.lane !== LANE.CREATED) {
 			const message = `Planning loop limit reached after ${MAX_PLANNING_ATTEMPTS} attempts.`;
 			await this.store.writePlanReport(issueId, buildPlanningExhaustedReport(issue, message));
 			await this.clearActive(issueId, {
@@ -288,27 +406,24 @@ export class OrchestratorScheduler {
 			lane: LANE.PLANNING,
 			automation: {
 				...metadata.automation,
-				planningAttempts: (metadata.automation?.planningAttempts || 0) + 1,
+				planningAttempts: recovery
+					? Math.max(metadata.automation?.planningAttempts || 0, 1)
+					: (metadata.automation?.planningAttempts || 0) + 1,
 				paused: false,
 				error: null,
 			},
 		}));
-		await this.store.appendEvent(issueId, { type: "planning_started" });
-
-		issue = await this.store.loadIssue(issueId);
-		await ensureIssueWorkspace(this.store, issue);
-		issue = await this.store.loadIssue(issueId);
-
-		await this.markActive(issueId, "planner", "starting");
-		const result = await this.runner.run({
-			issueId,
-			role: "planner",
-			cwd: issue.metadata.workspace.path,
-			prompt: buildPlannerPrompt(issue),
-			signal,
-			agentSettings: this.agentSettingsFor(issue, "planner"),
-			onRunStarted: (runId) => this.markRunStarted(issueId, "planner", runId),
+		await this.store.appendEvent(issueId, {
+			type: recovery ? "planning_recovery_attempt_started" : "planning_started",
+			mode: recovery?.mode,
+			sourceRunId: recovery?.sourceRunId,
 		});
+
+		issue = await this.store.loadIssue(issueId);
+		await recoverIssueWorkspace(this.store, issue);
+		issue = await this.store.loadIssue(issueId);
+
+		const result = await this.runAgentStage(issueId, "planner", buildPlannerPrompt(issue), signal, recovery);
 		const parsed = parsePlannerOutput(result.text);
 		await this.store.writePlan(issueId, parsed.plan);
 		await this.store.writePlanReport(issueId, parsed.report);
@@ -330,101 +445,92 @@ export class OrchestratorScheduler {
 	async runImplementation(issueId, signal) {
 		let issue = await this.store.loadIssue(issueId);
 		if (!(await this.ensureDependenciesResolved(issue))) return;
-		let feedback = "";
-		while (true) {
-			issue = await this.store.loadIssue(issueId);
-			const resumeSessionFile = issue.metadata.automation?.resumeSessionFile || null;
-			const resumeRunId = issue.metadata.automation?.resumeRunId || null;
-			const currentAttempts = issue.metadata.automation?.implementationAttempts || 0;
-			const nextAttempt = resumeSessionFile && currentAttempts > 0 ? currentAttempts : currentAttempts + 1;
-			if (!resumeSessionFile && nextAttempt > MAX_IMPLEMENTATION_ATTEMPTS) {
-				await this.pauseImplementationExhausted(issueId, feedback);
-				return;
-			}
-
+		issue = await this.store.loadIssue(issueId);
+		const storedRecovery = issue.metadata.automation?.recovery || null;
+		const recoveryTarget = storedRecovery ? await this.store.findRecoveryTarget(issue) : null;
+		let recovery = storedRecovery ? {
+			...storedRecovery,
+			mode: recoveryTarget.sessionAvailable ? "resume" : "restart",
+			sessionFile: recoveryTarget.sessionFile,
+		} : null;
+		if (recovery && !(issue.metadata.automation?.implementationAttempts > 0)) {
 			await this.store.updateMetadata(issueId, (metadata) => ({
 				...metadata,
-				lane: LANE.IN_PROGRESS,
-				automation: {
-					...metadata.automation,
-					implementationAttempts: nextAttempt,
-					paused: false,
-					error: null,
-				},
+				automation: { ...metadata.automation, implementationAttempts: 1 },
 			}));
-			await this.store.appendEvent(issueId, {
-				type: resumeSessionFile ? "implementation_resume_attempt_started" : "implementation_attempt_started",
-				attempt: nextAttempt,
-				resumeRunId,
-			});
-
 			issue = await this.store.loadIssue(issueId);
-			await ensureIssueWorkspace(this.store, issue);
-			issue = await this.store.loadIssue(issueId);
+		}
+		let stage = ["worker", "reviewer", "final-reviewer"].includes(recovery?.role) ? recovery.role : "worker";
+		let feedback = "";
+		let workerOutput = stage === "worker" ? "" : await this.store.findLatestRoleOutput(issueId, "worker");
+		let reviewOutput = stage === "final-reviewer" ? await this.store.findLatestRoleOutput(issueId, "reviewer") : "";
+		while (true) {
+			if (stage === "worker") {
+				issue = await this.store.loadIssue(issueId);
+				const recoveringWorker = recovery?.role === "worker";
+				const currentAttempts = issue.metadata.automation?.implementationAttempts || 0;
+				const nextAttempt = recoveringWorker ? Math.max(currentAttempts, 1) : currentAttempts + 1;
+				if (!recoveringWorker && nextAttempt > MAX_IMPLEMENTATION_ATTEMPTS) {
+					await this.pauseImplementationExhausted(issueId, feedback);
+					return;
+				}
+				await this.store.updateMetadata(issueId, (metadata) => ({
+					...metadata,
+					lane: LANE.IN_PROGRESS,
+					automation: {
+						...metadata.automation,
+						implementationAttempts: nextAttempt,
+						paused: false,
+						error: null,
+					},
+				}));
+				await this.store.appendEvent(issueId, {
+					type: recoveringWorker
+						? (recovery.mode === "resume" ? "implementation_resume_attempt_started" : "implementation_recovery_attempt_started")
+						: "implementation_attempt_started",
+					attempt: nextAttempt,
+					resumeRunId: recovery?.sourceRunId,
+				});
+				issue = await this.store.loadIssue(issueId);
+				await recoverIssueWorkspace(this.store, issue);
+				issue = await this.store.loadIssue(issueId);
+				const worker = await this.runAgentStage(issueId, "worker", buildWorkerPrompt(issue, feedback), signal, recoveringWorker ? recovery : null);
+				workerOutput = worker.text;
+				await this.store.appendEvent(issueId, { type: "worker_finished", runId: worker.runId });
+				recovery = null;
+				stage = "reviewer";
+			}
 
-			await this.markActive(issueId, "worker", "starting");
-			const worker = await this.runner.run({
-				issueId,
-				role: "worker",
-				cwd: issue.metadata.workspace.path,
-				prompt: buildWorkerPrompt(issue, feedback),
-				signal,
-				agentSettings: this.agentSettingsFor(issue, "worker"),
-				sessionFile: resumeSessionFile,
-				onRunStarted: async (runId) => {
-					await this.markRunStarted(issueId, "worker", runId);
-					if (!resumeSessionFile) return;
-					await this.store.updateMetadata(issueId, (metadata) => ({
-						...metadata,
-						automation: {
-							...metadata.automation,
-							resumeSessionFile: null,
-							resumeRunId: null,
-						},
-					}));
-					await this.store.appendEvent(issueId, {
-						type: "implementation_resume_started",
-						runId,
-						resumeRunId,
-						resumeSessionFile,
-					});
-				},
-			});
-			await this.store.appendEvent(issueId, { type: "worker_finished", runId: worker.runId });
-
-			issue = await this.store.loadIssue(issueId);
-			await this.markActive(issueId, "reviewer", "starting");
-			const review = await this.runner.run({
-				issueId,
-				role: "reviewer",
-				cwd: issue.metadata.workspace.path,
-				prompt: buildReviewerPrompt(issue, worker.text),
-				signal,
-				agentSettings: this.agentSettingsFor(issue, "reviewer"),
-				onRunStarted: (runId) => this.markRunStarted(issueId, "reviewer", runId),
-			});
-			await this.store.appendEvent(issueId, {
-				type: "reviewer_finished",
-				runId: review.runId,
-				decision: parseDecision(review.text),
-			});
-
-			if (parseDecision(review.text) !== "PASS") {
-				feedback = review.text;
-				continue;
+			if (stage === "reviewer") {
+				issue = await this.store.loadIssue(issueId);
+				await recoverIssueWorkspace(this.store, issue);
+				issue = await this.store.loadIssue(issueId);
+				const recoveringReviewer = recovery?.role === "reviewer";
+				const review = await this.runAgentStage(issueId, "reviewer", buildReviewerPrompt(issue, workerOutput), signal, recoveringReviewer ? recovery : null);
+				reviewOutput = review.text;
+				const reviewDecision = parseDecision(review.text);
+				await this.store.appendEvent(issueId, { type: "reviewer_finished", runId: review.runId, decision: reviewDecision });
+				recovery = null;
+				if (reviewDecision !== "PASS") {
+					feedback = review.text;
+					stage = "worker";
+					continue;
+				}
+				stage = "final-reviewer";
 			}
 
 			issue = await this.store.loadIssue(issueId);
-			await this.markActive(issueId, "final-reviewer", "starting");
-			const finalReview = await this.runner.run({
+			await recoverIssueWorkspace(this.store, issue);
+			issue = await this.store.loadIssue(issueId);
+			const recoveringFinalReviewer = recovery?.role === "final-reviewer";
+			const finalReview = await this.runAgentStage(
 				issueId,
-				role: "final-reviewer",
-				cwd: issue.metadata.workspace.path,
-				prompt: buildFinalReviewerPrompt(issue, `${worker.text}\n\n${review.text}`),
+				"final-reviewer",
+				buildFinalReviewerPrompt(issue, `${workerOutput}\n\n${reviewOutput}`),
 				signal,
-				agentSettings: this.agentSettingsFor(issue, "final-reviewer"),
-				onRunStarted: (runId) => this.markRunStarted(issueId, "final-reviewer", runId),
-			});
+				recoveringFinalReviewer ? recovery : null,
+			);
+			recovery = null;
 			const finalDecision = parseDecision(finalReview.text);
 			await this.store.appendEvent(issueId, {
 				type: "final_reviewer_finished",
@@ -452,6 +558,7 @@ export class OrchestratorScheduler {
 			}
 
 			feedback = finalReview.text;
+			stage = "worker";
 		}
 	}
 

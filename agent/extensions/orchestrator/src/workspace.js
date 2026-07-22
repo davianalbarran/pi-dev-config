@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import { promisify } from "node:util";
 import { LANE } from "./constants.js";
@@ -125,6 +126,110 @@ export async function detectWorkspace(linkedDirectory, { baseRef = null } = {}) 
 	if (repoCheck.code !== 0) return { kind: "directory" };
 	const git = await getGitRepositoryInfo(linkedDirectory, { baseRef });
 	return { kind: "git", git };
+}
+
+async function directoryExists(candidate) {
+	try {
+		return (await fsp.stat(candidate)).isDirectory();
+	} catch {
+		return false;
+	}
+}
+
+export async function inspectIssueWorkspace(metadata) {
+	const linkedDirectory = String(metadata?.linkedDirectory || "").trim();
+	if (!linkedDirectory || !(await directoryExists(linkedDirectory))) {
+		return {
+			canRecover: false,
+			needsRepair: false,
+			reason: `Linked directory is unavailable: ${linkedDirectory || "(not configured)"}`,
+		};
+	}
+
+	const workspace = metadata?.workspace || null;
+	if (!workspace?.path) return { canRecover: true, needsRepair: true, reason: "", kind: "unprepared" };
+	if (workspace.kind === "directory") {
+		if (!(await directoryExists(workspace.path))) {
+			return { canRecover: false, needsRepair: false, reason: `Workspace directory is unavailable: ${workspace.path}` };
+		}
+		const [actualPath, linkedPath] = await Promise.all([fsp.realpath(workspace.path), fsp.realpath(linkedDirectory)]);
+		if (actualPath !== linkedPath) {
+			return { canRecover: false, needsRepair: false, reason: `Workspace directory does not match the linked directory: ${workspace.path}` };
+		}
+		return { canRecover: true, needsRepair: false, reason: "", kind: "directory" };
+	}
+
+	if (workspace.kind !== "git-worktree" || !metadata.git?.repoRoot || !metadata.git?.branchName) {
+		return { canRecover: false, needsRepair: false, reason: "Git worktree metadata is incomplete." };
+	}
+	const repoRoot = String(metadata.git.repoRoot);
+	const branchName = String(metadata.git.branchName);
+	if (!(await directoryExists(repoRoot))) {
+		return { canRecover: false, needsRepair: false, reason: `Git repository is unavailable: ${repoRoot}` };
+	}
+	if (!(await branchExists(repoRoot, branchName))) {
+		return { canRecover: false, needsRepair: false, reason: `Issue branch is unavailable: ${branchName}` };
+	}
+
+	if (!(await pathExists(workspace.path))) {
+		return { canRecover: true, needsRepair: true, reason: "", kind: "git-worktree" };
+	}
+	if (!(await directoryExists(workspace.path))) {
+		return { canRecover: false, needsRepair: false, reason: `Workspace path is not a directory: ${workspace.path}` };
+	}
+
+	try {
+		const worktreeRoot = (await execGit(["-C", workspace.path, "rev-parse", "--show-toplevel"], workspace.path)).stdout.trim();
+		const currentBranch = (await execGit(["-C", workspace.path, "branch", "--show-current"], workspace.path)).stdout.trim();
+		const actualCommonDir = (await execGit(["-C", workspace.path, "rev-parse", "--git-common-dir"], workspace.path)).stdout.trim();
+		const expectedCommonDir = (await execGit(["-C", repoRoot, "rev-parse", "--git-common-dir"], repoRoot)).stdout.trim();
+		const [actualRoot, expectedRoot, actualCommon, expectedCommon] = await Promise.all([
+			fsp.realpath(worktreeRoot),
+			fsp.realpath(workspace.path),
+			fsp.realpath(path.resolve(workspace.path, actualCommonDir)),
+			fsp.realpath(path.resolve(repoRoot, expectedCommonDir)),
+		]);
+		if (actualRoot !== expectedRoot) {
+			return { canRecover: false, needsRepair: false, reason: `Workspace path points at a different git checkout: ${workspace.path}` };
+		}
+		if (actualCommon !== expectedCommon) {
+			return { canRecover: false, needsRepair: false, reason: `Workspace path belongs to a different git repository: ${workspace.path}` };
+		}
+		if (currentBranch !== branchName) {
+			return { canRecover: false, needsRepair: false, reason: `Workspace is on ${currentBranch || "a detached HEAD"}, expected ${branchName}.` };
+		}
+	} catch (error) {
+		return {
+			canRecover: false,
+			needsRepair: false,
+			reason: `Workspace validation failed: ${error instanceof Error ? error.message : String(error)}`,
+		};
+	}
+	return { canRecover: true, needsRepair: false, reason: "", kind: "git-worktree" };
+}
+
+export async function recoverIssueWorkspace(store, issue) {
+	const inspection = await inspectIssueWorkspace(issue.metadata);
+	if (!inspection.canRecover) throw new Error(inspection.reason || "The issue workspace cannot be recovered safely.");
+	if (!inspection.needsRepair) return issue.metadata.workspace;
+	if (!issue.metadata.workspace?.path) return ensureIssueWorkspace(store, issue);
+
+	const { workspace, git } = issue.metadata;
+	if (workspace.kind !== "git-worktree" || !git?.repoRoot || !git?.branchName) {
+		throw new Error("Only a missing git worktree can be recreated automatically.");
+	}
+	if (!(await branchExists(git.repoRoot, git.branchName))) {
+		throw new Error(`Issue branch is unavailable: ${git.branchName}`);
+	}
+	await ensureDir(path.dirname(workspace.path));
+	await execGit(["-C", git.repoRoot, "worktree", "prune"], git.repoRoot);
+	await execGit(["-C", git.repoRoot, "worktree", "add", workspace.path, git.branchName], git.repoRoot);
+	await store.appendEvent(issue.metadata.id, {
+		type: "workspace_recovered",
+		workspace,
+		branchName: git.branchName,
+	});
+	return workspace;
 }
 
 export async function ensureIssueWorkspace(store, issue) {

@@ -20,6 +20,21 @@ export function createAutomationState() {
 		error: null,
 		activeRunId: null,
 		activeRole: null,
+		recovery: null,
+	};
+}
+
+export function normalizeRecoveryCheckpoint(recovery) {
+	if (!recovery || typeof recovery !== "object") return null;
+	const role = String(recovery.role || "").trim();
+	if (!["planner", "worker", "reviewer", "final-reviewer"].includes(role)) return null;
+	const mode = recovery.mode === "resume" && recovery.sessionFile ? "resume" : "restart";
+	return {
+		role,
+		sourceRunId: String(recovery.sourceRunId || "").trim() || null,
+		sessionFile: mode === "resume" ? String(recovery.sessionFile || "").trim() || null : null,
+		mode,
+		requestedAt: recovery.requestedAt || nowIso(),
 	};
 }
 
@@ -52,6 +67,16 @@ export function normalizeMetadata(metadata) {
 		...createAutomationState(),
 		...(normalized.automation || {}),
 	};
+	const legacyResumeSession = String(normalized.automation.resumeSessionFile || "").trim() || null;
+	normalized.automation.recovery = normalizeRecoveryCheckpoint(
+		normalized.automation.recovery || (legacyResumeSession ? {
+			role: "worker",
+			sourceRunId: normalized.automation.resumeRunId || null,
+			sessionFile: legacyResumeSession,
+			mode: "resume",
+			requestedAt: normalized.updatedAt || normalized.createdAt,
+		} : null),
+	);
 	normalized.approvals = {
 		...createApprovalState(),
 		...(normalized.approvals || {}),
@@ -113,6 +138,20 @@ export function canRequestResume(metadata, options = {}) {
 	return !resumeBlockedReason(metadata, options);
 }
 
+export function kickIssueReason(metadata, { hasUnresolvedDependency = false, kickPending = false, workspaceReason = "" } = {}) {
+	if (![LANE.PLANNING, LANE.IN_PROGRESS].includes(metadata?.lane)) {
+		return "Only Planning and In Progress tickets can be kicked awake.";
+	}
+	if (hasUnresolvedDependency) return "This ticket is waiting on an unresolved dependency.";
+	if (kickPending) return "A kick request is already in flight for this ticket.";
+	if (workspaceReason) return workspaceReason;
+	return "";
+}
+
+export function canKickIssue(metadata, options = {}) {
+	return !kickIssueReason(metadata, options);
+}
+
 export function approvePlan(metadata, at = nowIso()) {
 	if (!canApprovePlan(metadata)) {
 		throw new Error("Plan can only be approved from Plan in review when no run is active.");
@@ -125,6 +164,7 @@ export function approvePlan(metadata, at = nowIso()) {
 			...metadata.automation,
 			paused: false,
 			error: null,
+			recovery: null,
 		},
 		approvals: {
 			...metadata.approvals,
@@ -147,6 +187,7 @@ export function requestPlanChanges(metadata, at = nowIso()) {
 			...metadata.automation,
 			paused: exhausted,
 			error: exhausted ? `Planning loop limit reached after ${MAX_PLANNING_ATTEMPTS} attempts.` : null,
+			recovery: null,
 		},
 		approvals: {
 			...metadata.approvals,
@@ -170,6 +211,9 @@ export function requestReviewChanges(metadata, at = nowIso()) {
 			error: null,
 			activeRunId: null,
 			activeRole: null,
+			recovery: null,
+			resumeSessionFile: null,
+			resumeRunId: null,
 		},
 		approvals: {
 			...metadata.approvals,
@@ -190,6 +234,7 @@ export function approveReview(metadata, at = nowIso()) {
 			...metadata.automation,
 			paused: false,
 			error: null,
+			recovery: null,
 		},
 		approvals: {
 			...metadata.approvals,

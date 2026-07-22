@@ -6,13 +6,14 @@ import { RpcAgentRunner } from "./rpc-runner.js";
 import { OrchestratorScheduler } from "./scheduler.js";
 import { OrchestratorServer } from "./server.js";
 import { IssueStore } from "./store.js";
-import { commitIssueWorktree, execGit } from "./workspace.js";
+import { commitIssueWorktree, execGit, inspectIssueWorkspace, recoverIssueWorkspace } from "./workspace.js";
 import { nowIso } from "./utils.js";
 import {
 	approvePlan,
 	approveReview,
 	getDependencyIssueId,
 	isDependencyResolved,
+	kickIssueReason,
 	requestPlanChanges,
 	requestReviewChanges,
 	resumeBlockedReason,
@@ -277,18 +278,65 @@ export class OrchestratorRuntime {
 	}
 
 	async resumeBlockedIssue(id) {
-		const issue = await this.store.loadIssue(id);
-		const hasUnresolvedDependency = await this.hasUnresolvedDependency(issue);
-		const reason = resumeBlockedReason(issue.metadata, { hasUnresolvedDependency });
-		if (reason) throw new Error(reason);
+		return this.scheduler.coordinateKick(id, async () => {
+			let issue = await this.store.loadIssue(id);
+			const hasUnresolvedDependency = await this.hasUnresolvedDependency(issue);
+			const reason = resumeBlockedReason(issue.metadata, { hasUnresolvedDependency });
+			if (reason) throw new Error(reason);
+			const resume = await this.store.findLatestResumableWorkerSession(id);
+			if (!resume.canResume) throw new Error(resume.reason || "No resumable worker session is available for this ticket.");
+			const workspace = await inspectIssueWorkspace(issue.metadata);
+			if (!workspace.canRecover) throw new Error(workspace.reason);
+			await recoverIssueWorkspace(this.store, issue);
+			issue = await this.store.loadIssue(id);
+			await this.store.updateMetadata(id, (metadata) => {
+				const currentReason = resumeBlockedReason(metadata, { hasUnresolvedDependency });
+				if (currentReason) throw new Error(currentReason);
+				return {
+					...metadata,
+					automation: {
+						...metadata.automation,
+						paused: false,
+						error: null,
+						activeRunId: null,
+						activeRole: null,
+						resumeSessionFile: resume.sessionFile,
+						resumeRunId: resume.runId,
+						recovery: {
+							role: "worker",
+							sourceRunId: resume.runId,
+							sessionFile: resume.sessionFile,
+							mode: "resume",
+							requestedAt: nowIso(),
+						},
+					},
+				};
+			});
+			await this.store.appendEvent(id, { type: "blocked_issue_resume_requested", resumeRunId: resume.runId });
+			return this.store.loadIssue(id);
+		});
+	}
 
-		const resume = await this.store.findLatestResumableWorkerSession(id);
-		if (!resume.canResume) throw new Error(resume.reason || "No resumable worker session is available for this ticket.");
+	async kickIssue(id) {
+		return this.scheduler.coordinateKick(id, async ({ interrupt }) => {
+			let issue = await this.store.loadIssue(id);
+			let hasUnresolvedDependency = await this.hasUnresolvedDependency(issue);
+			const workspace = await inspectIssueWorkspace(issue.metadata);
+			const reason = kickIssueReason(issue.metadata, {
+				hasUnresolvedDependency,
+				workspaceReason: workspace.canRecover ? "" : workspace.reason,
+			});
+			if (reason) throw new Error(reason);
+			const target = await this.store.findRecoveryTarget(issue);
+			const interruptedRunId = issue.metadata.automation?.activeRunId || target.runId || null;
+			await interrupt();
 
-		await this.store.updateMetadata(id, (metadata) => {
-			const currentReason = resumeBlockedReason(metadata, { hasUnresolvedDependency });
+			issue = await this.store.loadIssue(id);
+			hasUnresolvedDependency = await this.hasUnresolvedDependency(issue);
+			const currentReason = kickIssueReason(issue.metadata, { hasUnresolvedDependency });
 			if (currentReason) throw new Error(currentReason);
-			return {
+			await recoverIssueWorkspace(this.store, issue);
+			await this.store.updateMetadata(id, (metadata) => ({
 				...metadata,
 				automation: {
 					...metadata.automation,
@@ -296,17 +344,25 @@ export class OrchestratorRuntime {
 					error: null,
 					activeRunId: null,
 					activeRole: null,
-					resumeSessionFile: resume.sessionFile,
-					resumeRunId: resume.runId,
+					resumeSessionFile: null,
+					resumeRunId: null,
+					recovery: {
+						role: target.role,
+						sourceRunId: target.runId,
+						sessionFile: target.sessionFile,
+						mode: target.sessionAvailable ? "resume" : "restart",
+						requestedAt: nowIso(),
+					},
 				},
-			};
+			}));
+			await this.store.appendEvent(id, {
+				type: "issue_kick_requested",
+				role: target.role,
+				interruptedRunId,
+				mode: target.sessionAvailable ? "resume" : "restart",
+			});
+			return this.store.loadIssue(id);
 		});
-		await this.store.appendEvent(id, {
-			type: "blocked_issue_resume_requested",
-			resumeRunId: resume.runId,
-		});
-		this.scheduler.queueTick();
-		return this.store.loadIssue(id);
 	}
 
 	backlogSuggestionProjectState(project) {
@@ -649,6 +705,7 @@ export class OrchestratorRuntime {
 				this.scheduler.queueTick();
 				return this.store.loadIssue(id);
 			},
+			kickIssue: async (id) => this.kickIssue(id),
 			resumeBlockedIssue: async (id) => this.resumeBlockedIssue(id),
 		};
 	}

@@ -62,7 +62,7 @@ let specImproveRequestId = 0;
 let cleanupCompletedLoading = false;
 let backlogSuggestionStarting = false;
 const expandedDiffFiles = new Set();
-const pendingResumeIssueIds = new Set();
+const pendingKickIssueIds = new Set();
 state.projects = [];
 
 function cssPixelValue(name, fallback) {
@@ -507,31 +507,29 @@ function needsReview(issue) {
   return issue.lane === LANE.PLAN_REVIEW || issue.lane === LANE.IN_REVIEW;
 }
 
-function resumeEligibility(issue) {
-  if (!issue || issue.lane !== LANE.IN_PROGRESS || !isBlocked(issue)) return { visible: false, canResume: false, reason: "" };
-  const resume = issue.resume || {};
-  const pending = pendingResumeIssueIds.has(issue.id);
+function kickEligibility(issue) {
+  if (!issue || ![LANE.PLANNING, LANE.IN_PROGRESS].includes(issue.lane)) return { visible: false, canKick: false, reason: "" };
+  const kick = issue.kick || {};
+  const pending = pendingKickIssueIds.has(issue.id);
   const dependencyBlocked = hasUnresolvedDependency(issue);
   return {
-    visible: true,
-    canResume: !!resume.canResume && !pending && !dependencyBlocked,
+    visible: kick.visible !== false,
+    canKick: kick.canKick !== false && !pending && !dependencyBlocked,
     pending,
-    reason: pending ? "Resume request is already in flight." : (dependencyBlocked ? "This ticket is waiting on an unresolved dependency." : (resume.reason || (resume.canResume ? "" : "No verified worker session is available."))),
+    role: kick.role || (issue.lane === LANE.PLANNING ? "planner" : "worker"),
+    sessionAvailable: !!kick.sessionAvailable,
+    reason: pending ? "A kick request is already in flight." : (dependencyBlocked ? "This ticket is waiting on an unresolved dependency." : (kick.reason || "")),
   };
 }
 
-function resumeDisabledReason(issue) {
-  const eligibility = resumeEligibility(issue);
-  return eligibility.canResume ? "" : eligibility.reason;
-}
-
-function renderResumeAction(issue, { id = "resume-blocked", compact = false } = {}) {
-  const eligibility = resumeEligibility(issue);
+function renderKickAction(issue, { id = "kick-agent" } = {}) {
+  const eligibility = kickEligibility(issue);
   if (!eligibility.visible) return "";
-  const title = resumeDisabledReason(issue);
-  const pending = pendingResumeIssueIds.has(issue.id);
-  const label = pending ? "Resuming…" : (compact ? "Resume" : "Resume from last session");
-  return "<button type='button' id='" + escapeHtml(id) + "' data-resume-issue='" + escapeHtml(issue.id) + "' class='warn' " + (eligibility.canResume ? "" : "disabled") + (title ? " title='" + escapeHtml(title) + "'" : "") + ">" + escapeHtml(label) + "</button>";
+  const title = eligibility.canKick
+    ? "Restart the " + eligibility.role + (eligibility.sessionAvailable ? " from its saved Pi session." : " in a fresh Pi session.")
+    : eligibility.reason;
+  const label = eligibility.pending ? "Kicking…" : "↻ Kick agent awake";
+  return "<button type='button' id='" + escapeHtml(id) + "' data-kick-issue='" + escapeHtml(issue.id) + "' class='warn kick-agent' " + (eligibility.canKick ? "" : "disabled") + (title ? " title='" + escapeHtml(title) + "'" : "") + ">" + escapeHtml(label) + "</button>";
 }
 
 function issueState(issue) {
@@ -1914,8 +1912,8 @@ function renderDetail() {
   const activeMerge = activeMergeForIssue(issue);
   const hasGitMetadata = !!(issue.git?.repoRoot && issue.git?.branchName && issue.git?.baseBranch);
   const actionButtons = [];
-  const resumeAction = renderResumeAction(issue);
-  if (resumeAction) actionButtons.push(resumeAction);
+  const kickAction = renderKickAction(issue);
+  if (kickAction) actionButtons.push(kickAction);
   if (issue.lane === LANE.PLAN_REVIEW) {
     actionButtons.push("<button id='approve-plan' " + (activeRunId ? "disabled" : "") + ">Approve Plan</button>");
     actionButtons.push("<button id='change-plan' class='warn'>Request Plan Changes</button>");
@@ -2075,7 +2073,7 @@ function bindDetailActions(issue) {
   bindOptionalClick("approve-review", () => postAction(issue.id, "approve-review", {}));
   bindOptionalClick("change-plan", () => postAction(issue.id, "request-plan-changes", { text: feedbackText() }));
   bindOptionalClick("change-review", () => postAction(issue.id, "request-review-changes", { text: feedbackText() }));
-  bindOptionalClick("resume-blocked", () => postResumeIssue(issue.id));
+  bindOptionalClick("kick-agent", () => postKickIssue(issue));
   document.getElementById("add-comment").onclick = () => postAction(issue.id, "comment", { text: feedbackText(), phase: "general" });
 }
 
@@ -2099,18 +2097,24 @@ async function postAction(id, action, body) {
   }
 }
 
-async function postResumeIssue(id) {
-  if (pendingResumeIssueIds.has(id)) return;
-  pendingResumeIssueIds.add(id);
+async function postKickIssue(issue) {
+  const id = issue.id;
+  if (pendingKickIssueIds.has(id)) return;
+  if (issue.automation?.activeRunId) {
+    const role = issue.automation.activeRole || issue.kick?.role || "agent";
+    const ok = confirm("Stop the active " + role + " and kick this ticket awake from its saved state?");
+    if (!ok) return;
+  }
+  pendingKickIssueIds.add(id);
   renderBoard();
   renderDetail();
   try {
-    await api("/api/issues/" + encodeURIComponent(id) + "/resume", { method: "POST", body: "{}" });
+    await api("/api/issues/" + encodeURIComponent(id) + "/kick", { method: "POST", body: "{}" });
     await load();
   } catch (error) {
-    alert("Resume request failed: " + (error.message || "Try again from the blocked ticket."));
+    alert("Kick request failed: " + (error.message || "Try again from the ticket inspector."));
   } finally {
-    pendingResumeIssueIds.delete(id);
+    pendingKickIssueIds.delete(id);
     renderBoard();
     renderDetail();
   }

@@ -549,6 +549,7 @@ export class OrchestratorServer {
 			if (action === "approve-review") return sendJson(res, 200, await this.actions.approveReview(id));
 			if (action === "approve-review-merge") return sendJson(res, 200, await this.actions.approveReviewAndMerge(id));
 			if (action === "request-review-changes") return sendJson(res, 200, await this.actions.requestReviewChanges(id, body));
+			if (action === "kick") return sendJson(res, 200, await this.actions.kickIssue(id));
 			if (action === "resume") return sendJson(res, 200, await this.actions.resumeBlockedIssue(id));
 			return sendJson(res, 404, { error: "Not found." });
 		} catch (error) {

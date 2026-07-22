@@ -22,11 +22,12 @@ import {
 	createAutomationState,
 	getDependencyIssueId,
 	isDependencyResolved,
+	kickIssueReason,
 	normalizeAgentSettings,
 	normalizeMetadata,
 	resumeBlockedReason,
 } from "./workflow.js";
-import { getGitProjectInfo } from "./workspace.js";
+import { getGitProjectInfo, inspectIssueWorkspace } from "./workspace.js";
 
 const MAX_DASHBOARD_RUN_EVENT_BYTES = 64 * 1024;
 
@@ -795,6 +796,117 @@ export class IssueStore {
 		return { issueId: id, runId, events, session: assembleAgentSession(events) };
 	}
 
+	async findSessionForRun(id, runId, events = null) {
+		const normalizedRunId = String(runId || "").trim();
+		if (!normalizedRunId || normalizedRunId === "starting") return { sessionFile: null, sessionAvailable: false };
+		const defaultSessionFile = path.join(this.sessionsRoot, id, `${normalizedRunId}.jsonl`);
+		try {
+			await fsp.access(defaultSessionFile);
+			return { sessionFile: defaultSessionFile, sessionAvailable: true };
+		} catch {
+			// Resumed runs keep writing to their source session file instead of a run-id-derived file.
+		}
+		const issueEvents = events || await readJsonLines(this.issuePath(id, "events.jsonl"));
+		for (let index = issueEvents.length - 1; index >= 0; index -= 1) {
+			const event = issueEvents[index];
+			const mapped =
+				(event?.type === "agent_session_resumed" && String(event.runId || "") === normalizedRunId) ||
+				(event?.type === "implementation_resume_started" && String(event.runId || "") === normalizedRunId);
+			if (!mapped) continue;
+			const sessionFile = String(event.sessionFile || event.resumeSessionFile || "").trim() || null;
+			if (!sessionFile) break;
+			try {
+				await fsp.access(sessionFile);
+				return { sessionFile, sessionAvailable: true };
+			} catch {
+				break;
+			}
+		}
+		return { sessionFile: null, sessionAvailable: false };
+	}
+
+	async findRecoveryTarget(issue) {
+		const { metadata, events = [] } = issue;
+		const checkpoint = metadata.automation?.recovery;
+		if (checkpoint) {
+			if (checkpoint.mode !== "resume" || !checkpoint.sessionFile) {
+				return { role: checkpoint.role, runId: checkpoint.sourceRunId, sessionFile: null, sessionAvailable: false };
+			}
+			let session = await this.findSessionForRun(metadata.id, checkpoint.sourceRunId, events);
+			if (!session.sessionAvailable && checkpoint.sessionFile) {
+				try {
+					await fsp.access(checkpoint.sessionFile);
+					session = { sessionFile: checkpoint.sessionFile, sessionAvailable: true };
+				} catch {
+					session = { sessionFile: null, sessionAvailable: false };
+				}
+			}
+			return { role: checkpoint.role, runId: checkpoint.sourceRunId, ...session };
+		}
+
+		const allowedRoles = metadata.lane === LANE.PLANNING
+			? new Set(["planner"])
+			: new Set(["worker", "reviewer", "final-reviewer"]);
+		let role = metadata.lane === LANE.PLANNING ? "planner" : "worker";
+		let runId = null;
+		for (const event of events) {
+			if (event?.type === "agent_run_started" && allowedRoles.has(event.role)) {
+				role = event.role;
+				runId = String(event.runId || "").trim() || null;
+				continue;
+			}
+			if (metadata.lane === LANE.PLANNING && event?.type === "planning_finished") {
+				role = "planner";
+				runId = null;
+				continue;
+			}
+			if (metadata.lane !== LANE.IN_PROGRESS) continue;
+			if (event?.type === "implementation_attempt_started" || event?.type === "implementation_resume_attempt_started") {
+				role = "worker";
+				runId = null;
+			} else if (event?.type === "worker_finished") {
+				role = "reviewer";
+				runId = null;
+			} else if (event?.type === "reviewer_finished") {
+				role = event.decision === "PASS" ? "final-reviewer" : "worker";
+				runId = null;
+			} else if (event?.type === "final_reviewer_finished") {
+				role = event.decision === "PASS" ? "final-reviewer" : "worker";
+				runId = event.decision === "PASS" ? String(event.runId || "").trim() || null : null;
+			}
+		}
+		if (allowedRoles.has(metadata.automation?.activeRole)) {
+			role = metadata.automation.activeRole;
+			runId = String(metadata.automation.activeRunId || "").trim() || null;
+		}
+		const session = await this.findSessionForRun(metadata.id, runId, events);
+		return { role, runId: runId === "starting" ? null : runId, ...session };
+	}
+
+	async findLatestRoleOutput(id, role) {
+		const finishType = {
+			worker: "worker_finished",
+			reviewer: "reviewer_finished",
+			"final-reviewer": "final_reviewer_finished",
+		}[role];
+		if (!finishType) return "";
+		const events = await readJsonLines(this.issuePath(id, "events.jsonl"));
+		for (let index = events.length - 1; index >= 0; index -= 1) {
+			const event = events[index];
+			if (event?.type !== finishType || !event.runId) continue;
+			try {
+				const payload = await this.getAgentSession(id, String(event.runId));
+				for (let messageIndex = payload.session.messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
+					const content = String(payload.session.messages[messageIndex]?.content || "").trim();
+					if (content) return content;
+				}
+			} catch {
+				return "";
+			}
+		}
+		return "";
+	}
+
 	async findLatestResumableWorkerSession(id) {
 		const events = await readJsonLines(this.issuePath(id, "events.jsonl"));
 		for (let index = events.length - 1; index >= 0; index -= 1) {
@@ -870,6 +982,14 @@ export class IssueStore {
 			const hasUnresolvedDependency = !!dependencyId && !issue.metadata.dependencies?.resolvedAt && (!dependency || !isDependencyResolved(dependency.metadata));
 			const statusReason = resumeBlockedReason(issue.metadata, { hasUnresolvedDependency });
 			const session = statusReason ? { canResume: false, runId: null, sessionFile: null, reason: statusReason } : await this.findLatestResumableWorkerSession(issue.metadata.id);
+			const recoveryTarget = [LANE.PLANNING, LANE.IN_PROGRESS].includes(issue.metadata.lane)
+				? await this.findRecoveryTarget(issue)
+				: null;
+			const workspace = recoveryTarget ? await inspectIssueWorkspace(issue.metadata) : { canRecover: true, reason: "" };
+			const kickReason = kickIssueReason(issue.metadata, {
+				hasUnresolvedDependency,
+				workspaceReason: workspace.canRecover ? "" : workspace.reason,
+			});
 			boardIssues.push({
 				...issue.metadata,
 				spec: issue.spec,
@@ -879,6 +999,13 @@ export class IssueStore {
 				comments: issue.comments,
 				recentEvents: issue.events.slice(-50),
 				resume: session,
+				kick: {
+					visible: [LANE.PLANNING, LANE.IN_PROGRESS].includes(issue.metadata.lane),
+					canKick: !kickReason,
+					role: recoveryTarget?.role || null,
+					sessionAvailable: !!recoveryTarget?.sessionAvailable,
+					reason: kickReason,
+				},
 			});
 		}
 		const projects = await this.listProjects({ skipBackfill: true });
